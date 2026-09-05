@@ -1,0 +1,24 @@
+[package]
+name = "genesis-mesh-sdk"
+version = "0.56.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Rust SDK for the Genesis Mesh Network Authority HTTP API."
+repository = "https://github.com/GenesisMeshLabs/sdk-rust"
+readme = "README.md"
+keywords = ["genesis-mesh", "trust", "sdk", "ed25519"]
+categories = ["api-bindings", "authentication"]
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ed25519-dalek = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
