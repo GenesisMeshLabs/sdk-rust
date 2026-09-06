@@ -1,8 +1,5 @@
-//! Rust SDK for the Genesis Mesh Network Authority HTTP API.
-//!
-//! This crate is an MVP client for the stable Trust API routes. It provides
-//! admin request signing, HTTP transport, typed SDK errors, and thin
-//! domain-specific clients over JSON request and response bodies.
+#![doc = include_str!("../README.md")]
+#![forbid(unsafe_code)]
 
 mod agreement;
 mod attestation;

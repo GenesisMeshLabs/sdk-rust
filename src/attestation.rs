@@ -22,6 +22,15 @@ impl AttestationClient {
 
     /// Revoke a membership attestation.
     pub async fn revoke(&self, attestation_id: &str, body: Option<Value>) -> Result<Value> {
+        if attestation_id.is_empty() || attestation_id == "." || attestation_id == ".." {
+            return Err(crate::GenesisMeshError::Configuration(
+                "attestation id must be a nonempty path segment".into(),
+            ));
+        }
+        let attestation_id = percent_encoding::utf8_percent_encode(
+            attestation_id,
+            percent_encoding::NON_ALPHANUMERIC,
+        );
         self.http
             .admin_post(
                 &format!("/admin/attestations/{attestation_id}/revoke"),

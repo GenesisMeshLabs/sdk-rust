@@ -1,0 +1,20 @@
+{
+  "payload": {
+    "body": {
+      "z": [
+        null,
+        true,
+        false,
+        {
+          "?": "????? ??\u007f\n\t\"\\"
+        }
+      ],
+      "a": -0.0
+    },
+    "key_id": "operator-local",
+    "nonce": "00000000-0000-4000-8000-000000000000",
+    "timestamp": "2026-09-05T00:00:00.000Z"
+  },
+  "canonical": "{\"body\":{\"a\":-0.0,\"z\":[null,true,false,{\"?\":\"????? ??\\u007f\\n\\t\\\"\\\\\"}]},\"key_id\":\"operator-local\",\"nonce\":\"00000000-0000-4000-8000-000000000000\",\"timestamp\":\"2026-09-05T00:00:00.000Z\"}",
+  "signature": "4LBFRAZ8m/DW8EEF16hqNsJKG7rrECLOTzaI8toRdSpzfKM+dgBswa4eu1w2ZHL1CdPzFX1CIQYT9bozD1GuAg=="
+}

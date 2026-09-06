@@ -20,8 +20,10 @@ cargo fetch
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+cargo test --locked --doc
+cargo package --locked
 ```
 
 ## Project Structure
@@ -48,3 +50,7 @@ docs(readme): add disclosure example
 ## Security
 
 Do not open public issues for vulnerabilities. Follow [SECURITY.md](SECURITY.md).
+
+The committed lockfile supports reproducible CI. Run `cargo update` with the
+MSRV-aware resolver and test Rust 1.85 before dependency updates. Python 3.11+
+is needed for `python scripts/check_release.py`.

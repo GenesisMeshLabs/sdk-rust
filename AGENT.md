@@ -66,12 +66,14 @@ Run before committing:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+cargo test --locked --doc
 ```
 
-The local Windows workstation may not have Rust installed. CI must remain the
-source of truth until local Rust tooling is available.
+Rust can be validated through Docker when native tooling is unavailable.
+Record the actual toolchain and platform used; Linux container checks do not
+establish Windows or macOS compatibility. CI covers all three platforms.
 
 ## Agent Behavior Rules
 

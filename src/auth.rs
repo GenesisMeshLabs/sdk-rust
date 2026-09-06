@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::fmt::Write;
 
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{SecondsFormat, Utc};
 use ed25519_dalek::{Signer, SigningKey};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::errors::{GenesisMeshError, Result};
@@ -40,29 +40,78 @@ pub fn load_signing_key(seed_base64: &str) -> Result<SigningKey> {
 /// Produce deterministic compact JSON matching Python
 /// `json.dumps(value, sort_keys=True, separators=(",",":"))`.
 pub fn canonical_json(value: &Value) -> Result<String> {
-    match value {
-        Value::Object(map) => canonical_object(map),
-        Value::Array(values) => {
-            let items = values
-                .iter()
-                .map(canonical_json)
-                .collect::<Result<Vec<_>>>()?;
-            Ok(format!("[{}]", items.join(",")))
-        }
-        _ => serde_json::to_string(value).map_err(GenesisMeshError::Json),
-    }
+    let mut output = String::new();
+    write_canonical(value, &mut output)?;
+    Ok(output)
 }
 
-fn canonical_object(map: &Map<String, Value>) -> Result<String> {
-    let sorted = map.iter().collect::<BTreeMap<_, _>>();
-    let mut parts = Vec::with_capacity(sorted.len());
-
-    for (key, value) in sorted {
-        let key_json = serde_json::to_string(key).map_err(GenesisMeshError::Json)?;
-        parts.push(format!("{key_json}:{}", canonical_json(value)?));
+fn write_canonical(value: &Value, output: &mut String) -> Result<()> {
+    match value {
+        Value::Object(map) => {
+            output.push('{');
+            // Sort explicitly even when a downstream crate enables preserve_order.
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                write_string(key, output)?;
+                output.push(':');
+                write_canonical(&map[key], output)?;
+            }
+            output.push('}');
+        }
+        Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                write_canonical(value, output)?;
+            }
+            output.push(']');
+        }
+        Value::String(value) => write_string(value, output)?,
+        Value::Number(number) if number.is_f64() => {
+            output.push_str(&python_float(number.as_f64().expect("JSON float")));
+        }
+        _ => output.push_str(&serde_json::to_string(value)?),
     }
+    Ok(())
+}
 
-    Ok(format!("{{{}}}", parts.join(",")))
+fn write_string(value: &str, output: &mut String) -> Result<()> {
+    // Python's default ensure_ascii=True also escapes DEL and uses UTF-16
+    // surrogate pairs for characters outside the basic multilingual plane.
+    for character in serde_json::to_string(value)?.chars() {
+        if character >= '\u{7f}' {
+            let mut units = [0; 2];
+            for unit in character.encode_utf16(&mut units) {
+                write!(output, "\\u{unit:04x}").expect("writing to String cannot fail");
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    Ok(())
+}
+
+fn python_float(value: f64) -> String {
+    // Rust's shortest float formatter supplies the digits. Python switches to
+    // scientific notation below 1e-4 and at 1e16, and pads exponent digits.
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific.split_once('e').expect("scientific float");
+    let exponent: i32 = exponent.parse().expect("float exponent");
+    if !(-4..16).contains(&exponent) {
+        format!("{mantissa}e{exponent:+03}")
+    } else {
+        let mut decimal = value.to_string();
+        if !decimal.contains('.') {
+            decimal.push_str(".0");
+        }
+        decimal
+    }
 }
 
 /// Build the four admin auth headers for an admin request body.

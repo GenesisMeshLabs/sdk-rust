@@ -1,199 +1,158 @@
-# sdk-rust
+# Genesis Mesh Rust SDK
 
-Rust SDK for the Genesis Mesh Network Authority HTTP API.
-
-**Rust >= 1.85 required. Async HTTP via `reqwest` with Rustls TLS.**
+Async Rust client for the Genesis Mesh Network Authority HTTP API, with
+Ed25519 admin authentication, shared connection pooling, Rustls TLS, and typed errors.
+Requires **Rust 1.85 or newer** and a Tokio runtime.
 
 ## Install
+
+Install from the source repository; commit your application's `Cargo.lock` to
+keep the selected revision reproducible:
 
 ```toml
 [dependencies]
 genesis-mesh-sdk = { git = "https://github.com/GenesisMeshLabs/sdk-rust" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-## Quick Start
+## Quick start: read the active policy
 
-```rust
-use genesis_mesh_sdk::{json, ClientOptions, GenesisMeshClient};
+This public route requires a running Network Authority with an active data usage
+policy. A server with no configured policy can return `NotFound`.
+
+```no_run
+use genesis_mesh_sdk::{ClientOptions, GenesisMeshClient};
 
 #[tokio::main]
-async fn main() -> genesis_mesh_sdk::Result<()> {
-    let client = GenesisMeshClient::new(
-        ClientOptions::new("http://127.0.0.1:9443")
-            .with_signing_key(std::env::var("OPERATOR_KEY").unwrap())
-            .with_key_id("operator-local"),
-    )?;
-
-    let decision = client
-        .boundary
-        .decide(json!({
-            "requesting_agent_id": "agent-a",
-            "capability": "transactions.read"
-        }))
-        .await?;
-
-    println!("{decision:#}");
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("NA_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:9443".into());
+    let client = GenesisMeshClient::new(ClientOptions::new(url))?;
+    let policy = client.data_usage.get_policy().await?;
+    println!("{policy:#}");
     Ok(())
 }
 ```
 
-## Sub-Clients
+Run the equivalent checked example with `cargo run --example get_policy`.
+Use HTTPS when connecting to a remote Network Authority.
 
-The MVP uses `serde_json::Value` for request and response bodies so it can cover
-the live Trust API quickly while preserving exact wire-format fields.
+## Admin requests
 
-### Agreement
+Register the operator public key with the Network Authority first. `OPERATOR_KEY`
+is the standard base64 encoding of the **32-byte Ed25519 seed**, with or without
+padding; PEM files and 64-byte keypairs are not accepted. Keep the seed in a secret
+store or environment variable, outside source control.
 
-```rust
-let offer = client.agreement.offer(json!({
-    "responder_sovereign_id": "BETA-NA",
-    "capabilities": ["read:data", "write:log"],
-    "valid_from": "2026-01-01T00:00:00Z",
-    "valid_until": "2026-12-31T00:00:00Z",
-    "expires_at": "2026-01-15T00:00:00Z"
-})).await?;
+```no_run
+use genesis_mesh_sdk::{json, ClientOptions, GenesisMeshClient};
 
-let agreement = client.agreement.accept(json!({ "offer": offer })).await?;
-let check = client.agreement.verify(json!({ "agreement": agreement })).await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = GenesisMeshClient::new(
+        ClientOptions::new(std::env::var("NA_URL")?)
+            .with_signing_key(std::env::var("OPERATOR_KEY")?)
+            .with_key_id("operator-local"),
+    )?;
+    let attestation = client.attestation.issue(json!({
+        "subject_id": "node-example",
+        "roles": ["role:client"],
+        "validity_hours": 24
+    })).await?;
+    println!("{attestation:#}");
+    Ok(())
+}
 ```
 
-### Boundary
+Run `cargo run --example issue_attestation` with `NA_URL`, `OPERATOR_KEY`, and
+optionally `OPERATOR_KEY_ID` set. This example creates an attestation on your NA.
 
-```rust
-let decision = client.boundary.decide(json!({
-    "agreement": agreement,
-    "requested_capability": "read:data"
-})).await?;
+## API coverage
 
-let verified = client.boundary.verify(json!({ "decision": decision })).await?;
-```
+Request and response bodies use `serde_json::Value` (also exported as `Value`),
+retaining the server's snake_case wire fields. This is a JSON-based SDK; it does
+not yet provide typed protocol models or local verification of server proofs.
+Public verification methods call the Network Authority.
 
-### Evidence
+| Client | Admin methods | Public methods |
+|---|---|---|
+| `agreement` | `offer`, `counter`, `accept` | `verify` |
+| `attestation` | `issue`, `revoke`, `save_policy` | |
+| `boundary` | `decide` | `verify` |
+| `consensus` | `vote`, `proof` | `verify` |
+| `data_usage` | `create_policy`, `create_intent` | `get_policy`, `verify` |
+| `disclosure` | `commit`, `nullifier` | `prove`, `verify` |
+| `evidence` | `build` | `verify` |
 
-```rust
-let evidence = client.evidence.build(json!({
-    "source_sovereign_id": "ALPHA",
-    "target_sovereign_id": "BETA",
-    "verdict": "allow",
-    "reason": "long-standing member"
-})).await?;
+`evidence.build(decision)` wraps its argument as `{"decision": decision}`.
+`attestation.revoke(id, None)` sends an empty JSON object; pass `Some(json!(...))`
+to include a reason. IDs are encoded as single URL path segments.
 
-let verified = client.evidence.verify(json!({ "evidence": evidence })).await?;
-```
+Consult the [Trust HTTP API contract](https://github.com/GenesisMeshLabs/genesismesh/blob/main/docs/api/trust-http.md)
+for complete request fields and prerequisites. In particular, boundary decisions
+require an `agreement` and `requested_capability`; agreement acceptance requires
+an active recognition treaty. Disclosure proofs require the original capability
+set, commitment, and prover identity.
 
-### Attestation
+## Transport and errors
 
-```rust
-let attestation = client.attestation.issue(json!({
-    "subject_id": "node-xyz",
-    "roles": ["role:client"],
-    "validity_hours": 8760
-})).await?;
+Construct one client and clone it for concurrent work. Clones and sub-clients share
+the connection pool and parsed signing key. No runtime is created by the SDK.
 
-client.attestation
-    .revoke("attestation-id", Some(json!({ "reason": "key compromised" })))
-    .await?;
+- The request timeout defaults to 10 seconds. Override it with
+  `ClientOptions::with_timeout(Duration::from_secs(30))`.
+- Key IDs must be ASCII header values without surrounding whitespace.
+- Base URLs must be absolute HTTP(S) URLs without embedded credentials, query
+  strings, or fragments. Reverse-proxy base paths are supported.
+- Redirects are returned as HTTP errors, so signed requests stay at their configured
+  endpoint. Set the final NA URL directly.
+- Requests are not automatically retried. A timed-out mutation may have completed
+  on the server; check its state before retrying.
+- `GenesisMeshError` distinguishes configuration, missing/invalid signing keys,
+  transport, JSON, and HTTP failures. HTTP 400, 401, 404, 422, and 429 map to
+  `BadRequest`, `Unauthorized`, `NotFound`, `Validation`, and `RateLimit`.
+  Other statuses retain their numeric code in `Http`.
+- Non-JSON error responses preserve the HTTP status and response text. Empty
+  successful responses deserialize from `{}`; malformed success JSON is an error.
 
-client.attestation.save_policy(json!({
-    "recognition_policy": {
-        "local_sovereign_id": "MY-NA",
-        "recognized_issuers": []
-    }
-})).await?;
-```
+For additional routes, `HttpTransport` exposes generic `admin_post`, `public_post`,
+and `public_get` methods. Route paths start with `/`.
 
-### Disclosure
+## Authentication contract
 
-```rust
-let commitment = client.disclosure.commit(json!({
-    "capabilities": ["read:data", "write:log"]
-})).await?;
-
-let proof = client.disclosure.prove(json!({
-    "commitment": commitment,
-    "capability": "read:data"
-})).await?;
-
-let verified = client.disclosure.verify(json!({ "proof": proof })).await?;
-```
-
-### Consensus
-
-```rust
-let vote = client.consensus.vote(json!({
-    "justification_proof": { "proof_id": "jp-001", "decision_id": "dec-001" },
-    "vote": true,
-    "reason": "evidence satisfactory"
-})).await?;
-
-let proof = client.consensus.proof(json!({
-    "votes": [vote],
-    "required_threshold": 1
-})).await?;
-
-let verified = client.consensus.verify(json!({ "proof": proof })).await?;
-```
-
-### Data Usage
-
-```rust
-let policy = client.data_usage.create_policy(json!({
-    "licensee_sovereign_id": "BETA",
-    "allowed_source_ids": ["src-a"],
-    "allowed_access_types": ["read", "aggregate"],
-    "valid_from": "2026-01-01T00:00:00Z",
-    "valid_until": "2026-12-31T00:00:00Z"
-})).await?;
-
-let intent = client.data_usage.create_intent(json!({
-    "sources": [{
-        "source_id": "src-a",
-        "source_type": "public",
-        "owner_sovereign_id": "MY-NA"
-    }],
-    "access_types": ["read"]
-})).await?;
-
-let verified = client.data_usage.verify(json!({ "intent": intent, "policy": policy })).await?;
-```
-
-## Raw Admin Headers
-
-For Network Authority routes not yet covered by a sub-client, use
-`build_admin_headers` directly:
-
-```rust
-use genesis_mesh_sdk::{build_admin_headers, json, load_signing_key};
-
-let body = json!({
-    "subject_sovereign_id": "BETA-NA",
-    "scope": { "allowed_roles": ["role:client"] },
-    "validity_hours": 24
-});
-let key = load_signing_key(&std::env::var("OPERATOR_KEY").unwrap())?;
-let headers = build_admin_headers(&body, "operator-local", &key)?;
-```
-
-## Admin Authentication
-
-Admin routes are authenticated with four HTTP headers built from an Ed25519
-operator key:
-
-| Header | Description |
+| Header | Value |
 |---|---|
-| `X-Admin-Key-Id` | Key identifier registered with the NA |
-| `X-Admin-Signature` | Ed25519 signature over `canonicalJSON({body, key_id, nonce, timestamp})` |
-| `X-Admin-Timestamp` | ISO 8601 UTC timestamp |
-| `X-Admin-Nonce` | UUID v4 replay-protection token |
+| `X-Admin-Key-Id` | Registered operator key identifier (default `operator-local`) |
+| `X-Admin-Signature` | Base64 Ed25519 signature over the canonical payload |
+| `X-Admin-Timestamp` | UTC ISO 8601 timestamp with milliseconds |
+| `X-Admin-Nonce` | Fresh UUID v4 for each signed request |
 
-## Build And Test
+The signed payload is `{body, key_id, nonce, timestamp}`, serialized to match the
+server's Python `json.dumps(..., sort_keys=True, separators=(",", ":"))`, including
+ASCII escaping and float formatting. Tests include Python-generated fixtures.
+Maintain an accurate system clock so the server accepts timestamps.
+
+`load_signing_key`, `canonical_json`, and `build_admin_headers` are available for
+custom integrations. When using raw headers, send the same JSON body that was
+signed. `ClientOptions` debug output redacts the seed.
+
+## Development and release
 
 ```sh
+python scripts/check_release.py
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+cargo test --locked --doc
+cargo doc --locked --no-deps
+cargo package --locked
 ```
+
+CI tests stable Rust on Linux, Windows, and macOS plus Rust 1.85 on Linux, checks
+release metadata and packaging, and audits dependencies with `cargo audit`.
+See [CONTRIBUTING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/CONTRIBUTING.md), [RELEASING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/RELEASING.md), and
+[SECURITY.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/SECURITY.md).
 
 ## License
 
-MIT
+[MIT](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/LICENSE)

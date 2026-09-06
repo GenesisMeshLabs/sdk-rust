@@ -6,6 +6,9 @@ pub type Result<T> = std::result::Result<T, GenesisMeshError>;
 /// Error type for Genesis Mesh SDK operations.
 #[derive(Debug, thiserror::Error)]
 pub enum GenesisMeshError {
+    /// Invalid client configuration or route.
+    #[error("configuration error: {0}")]
+    Configuration(String),
     /// The Network Authority rejected admin authentication.
     #[error("unauthorized: {message} [{code}]")]
     Unauthorized { message: String, code: String },
@@ -72,6 +75,12 @@ pub(crate) fn from_http_error(status: u16, body: &Value) -> GenesisMeshError {
 }
 
 fn extract_error(body: &Value) -> (String, String) {
+    if let Some(message) = body
+        .as_str()
+        .or_else(|| body.get("detail").and_then(Value::as_str))
+    {
+        return (message.to_owned(), "unknown".to_owned());
+    }
     if let Some(error) = body.get("error") {
         if let Some(object) = error.as_object() {
             return (
