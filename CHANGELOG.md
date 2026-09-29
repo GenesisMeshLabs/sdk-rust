@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.58.0 - 2026-09-29
+
+First release in the coordinated Genesis Mesh train (0.57 was skipped across the
+train; see the core `docs/development/versioning.md`).
+
+- CI and publishing now fail if this component's version is ahead of the Genesis Mesh core version.
 
 - Match server canonical JSON for Unicode, DEL, and floating-point values.
 - Reduce temporary allocations in canonical serialization and response decoding.
