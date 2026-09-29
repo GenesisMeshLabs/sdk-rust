@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.58.1 - 2026-09-29
+
+Coordinated Genesis Mesh v0.58.1 release. No functional changes; the core adds
+attestation-backed boundary evaluation, which this SDK does not wrap yet.
+
 ## 0.58.0 - 2026-09-29
 
 First release in the coordinated Genesis Mesh train (0.57 was skipped across the
