@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.59.1 - 2026-10-01
+
+Coordinated Genesis Mesh v0.59.1 release. No functional changes; the TypeScript
+SDK adds attestation-backed evaluation, the boundary policy lifecycle and the
+evidence store client. This SDK does not wrap them yet.
+
 ## 0.59.0 - 2026-10-01
 
 Coordinated Genesis Mesh v0.59.0 release. No functional changes; the core adds
