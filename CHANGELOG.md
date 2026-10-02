@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.62.0 - 2026-10-02
+
+Coordinated Genesis Mesh v0.62.0 release (v1 public contract and security
+review). No functional changes; this crate is classified beta in the v1
+contract.
+
 ## 0.61.1 - 2026-10-02
 
 Coordinated Genesis Mesh v0.61.1 release. No functional changes; the Go, .NET
