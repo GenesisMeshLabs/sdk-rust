@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.61.1 - 2026-10-02
+
+Coordinated Genesis Mesh v0.61.1 release. No functional changes; the Go, .NET
+and TypeScript SDKs fix their consensus types, and the core revises its
+formal models and RFCs.
+
 ## 0.61.0 - 2026-10-02
 
 Coordinated Genesis Mesh v0.61.0 release. No functional changes; the core adds
