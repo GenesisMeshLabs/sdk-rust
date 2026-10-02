@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.61.0 - 2026-10-02
+
+Coordinated Genesis Mesh v0.61.0 release. No functional changes; the core adds
+the cross-language interoperability proof, in which the Go, TypeScript and .NET
+SDKs verify Network Authority records offline. This SDK is not a leg of that
+scenario yet.
+
 ## 0.60.0 - 2026-10-01
 
 Coordinated Genesis Mesh v0.60.0 release. No functional changes; the core adds
