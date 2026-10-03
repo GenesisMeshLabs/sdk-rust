@@ -36,6 +36,27 @@ jobs:
       - run: cargo test --locked --all-targets
       - run: cargo test --locked --doc
 
+  sdk-e2e:
+    name: SDK against core main
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: GenesisMeshLabs/genesismesh
+          ref: main
+          path: core
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ./core
+      - name: Governed-action lifecycle against a live NA
+        run: cargo test --locked --test live_na -- --nocapture
+        env:
+          GM_E2E_PYTHON: python
+
   release-checks:
     runs-on: ubuntu-latest
     timeout-minutes: 20

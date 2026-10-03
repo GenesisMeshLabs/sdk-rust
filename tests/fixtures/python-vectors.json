@@ -1,0 +1,705 @@
+{
+  "generated_by": "genesismesh scripts via sdk-typescript/scripts/generate_vectors.py",
+  "na_public_key": "FzJEvJjlJ6OaW+EQbs+PqUhN1qc8cXQCR3S4EKKYtNI=",
+  "executor_keys": [
+    {
+      "key_id": "ctrl",
+      "public_key": "TOZV5mnHArIIpyJlZlYqMLOR5qYK6UXBjd4pLqno3og=",
+      "executor_sovereign_id": "secrets-controller"
+    }
+  ],
+  "resource_id": "kv:pilot-vault/vendor-zoë-api",
+  "vendor_id": "vendor-zoë",
+  "attestation": {
+    "attestation_id": "6ce38f75-23a8-4da8-901b-762132db5951",
+    "claims": {
+      "apps": [
+        "app-zürich"
+      ],
+      "capabilities": [
+        "sp-secret.create",
+        "sp-secret.rotate",
+        "sp-secret.revoke"
+      ],
+      "note": "😀",
+      "risk_score": 0.25
+    },
+    "expires_at": "2036-09-28T09:56:14.605528Z",
+    "issued_at": "2026-10-01T09:56:14.605528Z",
+    "issued_by": "na-vectors",
+    "issuer_sovereign_id": "vectors",
+    "roles": [
+      "role:client"
+    ],
+    "signatures": [
+      {
+        "key_id": "na-vectors",
+        "sig": "4tjht8Mxa6EfA3aKaYrf4uy6eYRV55bU32JGpS1dPzhGWioTDzcgWIq9E5dYbs9XbS5NnrwhdMUmhG2Ejm7CDw=="
+      }
+    ],
+    "status": "active",
+    "subject_id": "vendor-zoë",
+    "subject_public_key": null,
+    "valid_from": "2026-10-01T09:56:14.605528Z"
+  },
+  "attestation_digest": "25916b16721b74a118cc12f3beb1be6b3fc67a228e77602012a03b8cc8429e92",
+  "policy": {
+    "description": "Vendor SP secrets - pilot 1",
+    "gates": [
+      {
+        "config": {
+          "claim": "apps",
+          "path": "request_parameters.app_id"
+        },
+        "disclose_input": false,
+        "gate_id": "app",
+        "gate_type": "attestation_claim.v1",
+        "mode": "enforce",
+        "order": 0
+      },
+      {
+        "config": {
+          "path": "attributes.owner"
+        },
+        "disclose_input": false,
+        "gate_id": "owner",
+        "gate_type": "required_parameter.v1",
+        "mode": "observe",
+        "order": 1
+      },
+      {
+        "config": {
+          "max": 90,
+          "path": "request_parameters.lifetime_days"
+        },
+        "disclose_input": false,
+        "gate_id": "max-lifetime",
+        "gate_type": "max_value.v1",
+        "mode": "enforce",
+        "order": 2
+      }
+    ],
+    "issued_at": "2026-10-01T09:56:14.610642Z",
+    "issued_by": "na-vectors",
+    "issuer_sovereign_id": "vectors",
+    "policy_id": "vendor-sp-secret",
+    "selector": {
+      "agreement_ids": [],
+      "capabilities": [
+        "sp-secret.*"
+      ],
+      "parameter_equals": {},
+      "parent_kinds": [
+        "attestation"
+      ],
+      "provider_sovereign_ids": [],
+      "requester_sovereign_ids": []
+    },
+    "signature": {
+      "key_id": "na-vectors",
+      "sig": "QkIw2GDcn7pFvBQ/1A59lo/T1LKSvbWNcVn7/EDfBeTQhnVDVjm+nflvEZMxvPOQZ6eeIuceXyEhcLvoP/fxCw=="
+    },
+    "valid_from": "2026-10-01T09:56:14.350335Z",
+    "valid_until": "2036-09-28T09:56:14.350335Z",
+    "version": 1
+  },
+  "policy_digest": "f3e9a7542eed3faeda464bb746b37c3f46d661111721a6574b4d9bd77dbc37db",
+  "allowed": {
+    "decision": {
+      "agreement_id": "6ce38f75-23a8-4da8-901b-762132db5951",
+      "attestation_binding": {
+        "attestation_digest": "25916b16721b74a118cc12f3beb1be6b3fc67a228e77602012a03b8cc8429e92",
+        "attestation_id": "6ce38f75-23a8-4da8-901b-762132db5951",
+        "issuer_sovereign_id": "vectors",
+        "revocation_seq_checked": 0,
+        "subject_id": "vendor-zoë"
+      },
+      "authorized": true,
+      "context_id": "c6742781-2594-43a7-be2f-c8e6feffac13",
+      "decision_id": "3d389084-c3ea-4c75-a178-c974c69afa65",
+      "decision_made_at": "2026-10-01T09:56:14.633444Z",
+      "decision_valid_until": "2026-10-01T10:01:14.633444Z",
+      "denial_reason": null,
+      "freshness_proof": null,
+      "gate_results": [
+        {
+          "detail": "attestation is active, signed by a trusted key, and not revoked",
+          "gate_name": "attestation_status",
+          "passed": true
+        },
+        {
+          "detail": "request at 2026-10-01T09:56:14.633369+00:00 is within [2026-10-01T09:56:14.605528+00:00, 2036-09-28T09:56:14.605528+00:00]",
+          "gate_name": "attestation_validity",
+          "passed": true
+        },
+        {
+          "detail": "capability 'sp-secret.rotate' is in attested capabilities",
+          "gate_name": "capability_check",
+          "passed": true
+        },
+        {
+          "detail": "freshness seq 0 >= commitment 0",
+          "gate_name": "freshness_check",
+          "passed": true
+        },
+        {
+          "detail": "request_parameters.app_id is in attestation claim 'apps'",
+          "gate_name": "vendor-sp-secret/app",
+          "passed": true
+        },
+        {
+          "detail": "[observe] required fact 'attributes.owner' is missing",
+          "gate_name": "vendor-sp-secret/owner",
+          "passed": false
+        },
+        {
+          "detail": "request_parameters.lifetime_days satisfies <= 90.0",
+          "gate_name": "vendor-sp-secret/max-lifetime",
+          "passed": true
+        }
+      ],
+      "operator_sovereign_id": "vectors",
+      "policy_binding": {
+        "context_digest": "bc5c3c6fa5b48ba6a0159f7e58286fee43a0d1ac745a96b563b35dc2e5107061",
+        "gate_evaluations": [
+          {
+            "gate_id": "app",
+            "gate_type": "attestation_claim.v1",
+            "mode": "enforce",
+            "order": 0,
+            "outcome": "pass",
+            "passed": true,
+            "policy_id": "vendor-sp-secret",
+            "policy_version": 1
+          },
+          {
+            "gate_id": "owner",
+            "gate_type": "required_parameter.v1",
+            "mode": "observe",
+            "order": 1,
+            "outcome": "missing_context",
+            "passed": false,
+            "policy_id": "vendor-sp-secret",
+            "policy_version": 1
+          },
+          {
+            "gate_id": "max-lifetime",
+            "gate_type": "max_value.v1",
+            "mode": "enforce",
+            "order": 2,
+            "outcome": "pass",
+            "passed": true,
+            "policy_id": "vendor-sp-secret",
+            "policy_version": 1
+          }
+        ],
+        "policies": [
+          {
+            "policy_digest": "f3e9a7542eed3faeda464bb746b37c3f46d661111721a6574b4d9bd77dbc37db",
+            "policy_id": "vendor-sp-secret",
+            "signed_by": "na-vectors",
+            "version": 1
+          }
+        ],
+        "policy_set_digest": "c0a324f2990e869f40e41683a83f6bb7f341c6ad60d15fb2d4b636fecad31a82",
+        "registry_gate_types": [
+          "attestation_claim.v1",
+          "max_value.v1",
+          "required_parameter.v1"
+        ],
+        "resolution_failure": null,
+        "resolution_status": "resolved"
+      },
+      "signature": {
+        "key_id": "na-vectors",
+        "sig": "Y5+CsfCUiu32EtymTYetrzi6H9VpKefV3bKXdzv360A2ruv2SiRgDidYBcb5eN65QiYR/Lsta5cvwAvW9N5jCg=="
+      }
+    },
+    "justification_proof": {
+      "decision_id": "3d389084-c3ea-4c75-a178-c974c69afa65",
+      "issuer_sovereign_id": "vectors",
+      "proof_id": "17dbe2e3-1238-40e2-a1b4-c4820287f54d",
+      "proof_issued_at": "2026-10-01T09:56:14.633444Z",
+      "signature": {
+        "key_id": "na-vectors",
+        "sig": "Nq678eYPgt+VknlBI6hgz4oTvBrxU8HUzMt20xnFVqqsAf5EBKIGUTumSj2YnKdOLtmKb+PIsrhbYkeLcwvjAg=="
+      },
+      "trace": {
+        "agreement_id": "6ce38f75-23a8-4da8-901b-762132db5951",
+        "decision_id": "3d389084-c3ea-4c75-a178-c974c69afa65",
+        "entries": [
+          {
+            "evaluated_at": "2026-10-01T09:56:14.633444Z",
+            "gate_name": "attestation_status",
+            "gate_type": "AttestationStatusGate",
+            "inputs": {
+              "attestation_id": "6ce38f75-23a8-4da8-901b-762132db5951",
+              "found": true,
+              "revocation_seq_checked": 0
+            },
+            "metadata": {},
+            "reason": "attestation is active, signed by a trusted key, and not revoked",
+            "result": true
+          },
+          {
+            "evaluated_at": "2026-10-01T09:56:14.633444Z",
+            "gate_name": "attestation_validity",
+            "gate_type": "AttestationValidityGate",
+            "inputs": {
+              "expires_at": "2036-09-28T09:56:14.605528+00:00",
+              "requested_at": "2026-10-01T09:56:14.633369+00:00",
+              "valid_from": "2026-10-01T09:56:14.605528+00:00"
+            },
+            "metadata": {},
+            "reason": "request at 2026-10-01T09:56:14.633369+00:00 is within [2026-10-01T09:56:14.605528+00:00, 2036-09-28T09:56:14.605528+00:00]",
+            "result": true
+          },
+          {
+            "evaluated_at": "2026-10-01T09:56:14.633444Z",
+            "gate_name": "capability_check",
+            "gate_type": "CapabilityGate",
+            "inputs": {
+              "capabilities": [
+                "sp-secret.create",
+                "sp-secret.rotate",
+                "sp-secret.revoke"
+              ],
+              "requested_capability": "sp-secret.rotate"
+            },
+            "metadata": {},
+            "reason": "capability 'sp-secret.rotate' is in attested capabilities",
+            "result": true
+          },
+          {
+            "evaluated_at": "2026-10-01T09:56:14.633444Z",
+            "gate_name": "freshness_check",
+            "gate_type": "FreshnessGate",
+            "inputs": {
+              "context_freshness_seq": 0,
+              "freshness_commitment": 0
+            },
+            "metadata": {},
+            "reason": "freshness seq 0 >= commitment 0",
+            "result": true
+          },
+          {
+            "evaluated_at": "2026-10-01T09:56:14.633444Z",
+            "gate_name": "vendor-sp-secret/app",
+            "gate_type": "attestation_claim.v1",
+            "inputs": {
+              "condition": {
+                "claim": "apps"
+              },
+              "path": "request_parameters.app_id",
+              "present": true,
+              "value_type": "string"
+            },
+            "metadata": {
+              "gate_id": "app",
+              "mode": "enforce",
+              "order": 0,
+              "outcome": "pass",
+              "policy_id": "vendor-sp-secret",
+              "policy_version": 1
+            },
+            "reason": "request_parameters.app_id is in attestation claim 'apps'",
+            "result": true
+          },
+          {
+            "evaluated_at": "2026-10-01T09:56:14.633444Z",
+            "gate_name": "vendor-sp-secret/owner",
+            "gate_type": "required_parameter.v1",
+            "inputs": {
+              "condition": {
+                "required": "attributes.owner"
+              },
+              "path": "attributes.owner",
+              "present": false,
+              "value_type": "missing"
+            },
+            "metadata": {
+              "gate_id": "owner",
+              "mode": "observe",
+              "order": 1,
+              "outcome": "missing_context",
+              "policy_id": "vendor-sp-secret",
+              "policy_version": 1
+            },
+            "reason": "required fact 'attributes.owner' is missing",
+            "result": false
+          },
+          {
+            "evaluated_at": "2026-10-01T09:56:14.633444Z",
+            "gate_name": "vendor-sp-secret/max-lifetime",
+            "gate_type": "max_value.v1",
+            "inputs": {
+              "condition": {
+                "max": 90.0,
+                "operator": "<="
+              },
+              "path": "request_parameters.lifetime_days",
+              "present": true,
+              "value_type": "number"
+            },
+            "metadata": {
+              "gate_id": "max-lifetime",
+              "mode": "enforce",
+              "order": 2,
+              "outcome": "pass",
+              "policy_id": "vendor-sp-secret",
+              "policy_version": 1
+            },
+            "reason": "request_parameters.lifetime_days satisfies <= 90.0",
+            "result": true
+          }
+        ],
+        "final_authorized": true,
+        "operator_sovereign_id": "vectors",
+        "short_circuited_at": null,
+        "trace_id": "f155e918-9ab9-4259-a516-fb5eb5280152",
+        "traced_at": "2026-10-01T09:56:14.633444Z"
+      }
+    }
+  },
+  "denied": {
+    "decision": {
+      "agreement_id": "6ce38f75-23a8-4da8-901b-762132db5951",
+      "attestation_binding": {
+        "attestation_digest": "25916b16721b74a118cc12f3beb1be6b3fc67a228e77602012a03b8cc8429e92",
+        "attestation_id": "6ce38f75-23a8-4da8-901b-762132db5951",
+        "issuer_sovereign_id": "vectors",
+        "revocation_seq_checked": 0,
+        "subject_id": "vendor-zoë"
+      },
+      "authorized": false,
+      "context_id": "e311f481-6d50-4489-874f-92922bb00dc9",
+      "decision_id": "f09ea2e1-664f-41a2-9a76-c1292ff3a1ab",
+      "decision_made_at": "2026-10-01T09:56:14.641034Z",
+      "decision_valid_until": "2026-10-01T10:01:14.641034Z",
+      "denial_reason": "policy gate 'vendor-sp-secret/app' failed (+1 more)",
+      "freshness_proof": null,
+      "gate_results": [
+        {
+          "detail": "attestation is active, signed by a trusted key, and not revoked",
+          "gate_name": "attestation_status",
+          "passed": true
+        },
+        {
+          "detail": "request at 2026-10-01T09:56:14.640966+00:00 is within [2026-10-01T09:56:14.605528+00:00, 2036-09-28T09:56:14.605528+00:00]",
+          "gate_name": "attestation_validity",
+          "passed": true
+        },
+        {
+          "detail": "capability 'sp-secret.create' is in attested capabilities",
+          "gate_name": "capability_check",
+          "passed": true
+        },
+        {
+          "detail": "freshness seq 0 >= commitment 0",
+          "gate_name": "freshness_check",
+          "passed": true
+        },
+        {
+          "detail": "request_parameters.app_id is not in attestation claim 'apps'",
+          "gate_name": "vendor-sp-secret/app",
+          "passed": false
+        },
+        {
+          "detail": "[observe] required fact 'attributes.owner' is missing",
+          "gate_name": "vendor-sp-secret/owner",
+          "passed": false
+        },
+        {
+          "detail": "request_parameters.lifetime_days violates <= 90.0",
+          "gate_name": "vendor-sp-secret/max-lifetime",
+          "passed": false
+        }
+      ],
+      "operator_sovereign_id": "vectors",
+      "policy_binding": {
+        "context_digest": "bace5e460669f382509cd53985a6d832cc9d0fc0424b333ccdafdd33311f8585",
+        "gate_evaluations": [
+          {
+            "gate_id": "app",
+            "gate_type": "attestation_claim.v1",
+            "mode": "enforce",
+            "order": 0,
+            "outcome": "fail",
+            "passed": false,
+            "policy_id": "vendor-sp-secret",
+            "policy_version": 1
+          },
+          {
+            "gate_id": "owner",
+            "gate_type": "required_parameter.v1",
+            "mode": "observe",
+            "order": 1,
+            "outcome": "missing_context",
+            "passed": false,
+            "policy_id": "vendor-sp-secret",
+            "policy_version": 1
+          },
+          {
+            "gate_id": "max-lifetime",
+            "gate_type": "max_value.v1",
+            "mode": "enforce",
+            "order": 2,
+            "outcome": "fail",
+            "passed": false,
+            "policy_id": "vendor-sp-secret",
+            "policy_version": 1
+          }
+        ],
+        "policies": [
+          {
+            "policy_digest": "f3e9a7542eed3faeda464bb746b37c3f46d661111721a6574b4d9bd77dbc37db",
+            "policy_id": "vendor-sp-secret",
+            "signed_by": "na-vectors",
+            "version": 1
+          }
+        ],
+        "policy_set_digest": "c0a324f2990e869f40e41683a83f6bb7f341c6ad60d15fb2d4b636fecad31a82",
+        "registry_gate_types": [
+          "attestation_claim.v1",
+          "max_value.v1",
+          "required_parameter.v1"
+        ],
+        "resolution_failure": null,
+        "resolution_status": "resolved"
+      },
+      "signature": {
+        "key_id": "na-vectors",
+        "sig": "c5sg2sam+/koiF2V/g4tmPvIAhi6kL1VS3FPxM/Gn8wpy56rGSMJjHOQuHV5iNduh1CRrVDsM64HCJzni+BHBA=="
+      }
+    },
+    "justification_proof": {
+      "decision_id": "f09ea2e1-664f-41a2-9a76-c1292ff3a1ab",
+      "issuer_sovereign_id": "vectors",
+      "proof_id": "777d60a4-fe65-467a-b4bb-ec8bd0950873",
+      "proof_issued_at": "2026-10-01T09:56:14.641034Z",
+      "signature": {
+        "key_id": "na-vectors",
+        "sig": "jT6qqGGpYb5ddRl6CD5UP6K557mGK2orh6yfMDqcttRDDZUc5brPCGVFL3qkctsO8Vdnz+uX5gsANrbkjUHQDg=="
+      },
+      "trace": {
+        "agreement_id": "6ce38f75-23a8-4da8-901b-762132db5951",
+        "decision_id": "f09ea2e1-664f-41a2-9a76-c1292ff3a1ab",
+        "entries": [
+          {
+            "evaluated_at": "2026-10-01T09:56:14.641034Z",
+            "gate_name": "attestation_status",
+            "gate_type": "AttestationStatusGate",
+            "inputs": {
+              "attestation_id": "6ce38f75-23a8-4da8-901b-762132db5951",
+              "found": true,
+              "revocation_seq_checked": 0
+            },
+            "metadata": {},
+            "reason": "attestation is active, signed by a trusted key, and not revoked",
+            "result": true
+          },
+          {
+            "evaluated_at": "2026-10-01T09:56:14.641034Z",
+            "gate_name": "attestation_validity",
+            "gate_type": "AttestationValidityGate",
+            "inputs": {
+              "expires_at": "2036-09-28T09:56:14.605528+00:00",
+              "requested_at": "2026-10-01T09:56:14.640966+00:00",
+              "valid_from": "2026-10-01T09:56:14.605528+00:00"
+            },
+            "metadata": {},
+            "reason": "request at 2026-10-01T09:56:14.640966+00:00 is within [2026-10-01T09:56:14.605528+00:00, 2036-09-28T09:56:14.605528+00:00]",
+            "result": true
+          },
+          {
+            "evaluated_at": "2026-10-01T09:56:14.641034Z",
+            "gate_name": "capability_check",
+            "gate_type": "CapabilityGate",
+            "inputs": {
+              "capabilities": [
+                "sp-secret.create",
+                "sp-secret.rotate",
+                "sp-secret.revoke"
+              ],
+              "requested_capability": "sp-secret.create"
+            },
+            "metadata": {},
+            "reason": "capability 'sp-secret.create' is in attested capabilities",
+            "result": true
+          },
+          {
+            "evaluated_at": "2026-10-01T09:56:14.641034Z",
+            "gate_name": "freshness_check",
+            "gate_type": "FreshnessGate",
+            "inputs": {
+              "context_freshness_seq": 0,
+              "freshness_commitment": 0
+            },
+            "metadata": {},
+            "reason": "freshness seq 0 >= commitment 0",
+            "result": true
+          },
+          {
+            "evaluated_at": "2026-10-01T09:56:14.641034Z",
+            "gate_name": "vendor-sp-secret/app",
+            "gate_type": "attestation_claim.v1",
+            "inputs": {
+              "condition": {
+                "claim": "apps"
+              },
+              "path": "request_parameters.app_id",
+              "present": true,
+              "value_type": "string"
+            },
+            "metadata": {
+              "gate_id": "app",
+              "mode": "enforce",
+              "order": 0,
+              "outcome": "fail",
+              "policy_id": "vendor-sp-secret",
+              "policy_version": 1
+            },
+            "reason": "request_parameters.app_id is not in attestation claim 'apps'",
+            "result": false
+          },
+          {
+            "evaluated_at": "2026-10-01T09:56:14.641034Z",
+            "gate_name": "vendor-sp-secret/owner",
+            "gate_type": "required_parameter.v1",
+            "inputs": {
+              "condition": {
+                "required": "attributes.owner"
+              },
+              "path": "attributes.owner",
+              "present": false,
+              "value_type": "missing"
+            },
+            "metadata": {
+              "gate_id": "owner",
+              "mode": "observe",
+              "order": 1,
+              "outcome": "missing_context",
+              "policy_id": "vendor-sp-secret",
+              "policy_version": 1
+            },
+            "reason": "required fact 'attributes.owner' is missing",
+            "result": false
+          },
+          {
+            "evaluated_at": "2026-10-01T09:56:14.641034Z",
+            "gate_name": "vendor-sp-secret/max-lifetime",
+            "gate_type": "max_value.v1",
+            "inputs": {
+              "condition": {
+                "max": 90.0,
+                "operator": "<="
+              },
+              "path": "request_parameters.lifetime_days",
+              "present": true,
+              "value_type": "number"
+            },
+            "metadata": {
+              "gate_id": "max-lifetime",
+              "mode": "enforce",
+              "order": 2,
+              "outcome": "fail",
+              "policy_id": "vendor-sp-secret",
+              "policy_version": 1
+            },
+            "reason": "request_parameters.lifetime_days violates <= 90.0",
+            "result": false
+          }
+        ],
+        "final_authorized": false,
+        "operator_sovereign_id": "vectors",
+        "short_circuited_at": "vendor-sp-secret/app",
+        "trace_id": "053bc232-4ae1-42fe-833c-6398122788c0",
+        "traced_at": "2026-10-01T09:56:14.641034Z"
+      }
+    }
+  },
+  "executions": [
+    {
+      "evidence_id": "7ecd4840-b991-4790-862e-c5bbe0da4503",
+      "sequence_no": 1,
+      "decision_id": "28d25e73-e0c1-4563-b691-d687fa368896",
+      "context_id": "2b8591fd-8584-4d0e-a899-42fc79436acc",
+      "agreement_id": "6ce38f75-23a8-4da8-901b-762132db5951",
+      "executor_sovereign_id": "secrets-controller",
+      "executed_capability": "sp-secret.create",
+      "execution_parameters": {
+        "secret_version": "v1",
+        "owner": "Zoë"
+      },
+      "executed_at": "2026-10-01T09:56:14.628709Z",
+      "outcome": "success",
+      "outcome_detail": null,
+      "prev_evidence_digest": null,
+      "resource_id": "kv:pilot-vault/vendor-zoë-api",
+      "resource_action": "create",
+      "resource_sequence": 1,
+      "prev_resource_digest": null,
+      "signature": {
+        "key_id": "ctrl",
+        "sig": "+lTd7euhPevaJhZQ3RKRPuqJzWiAejWjD3fdIXtyTa+hUxf+zNGIEuQOpH6tP8lhOQhSeoodQOpstcYFFU1wCg=="
+      }
+    },
+    {
+      "evidence_id": "5de536bd-d771-4479-945d-cd310761af6d",
+      "sequence_no": 1,
+      "decision_id": "3d389084-c3ea-4c75-a178-c974c69afa65",
+      "context_id": "c6742781-2594-43a7-be2f-c8e6feffac13",
+      "agreement_id": "6ce38f75-23a8-4da8-901b-762132db5951",
+      "executor_sovereign_id": "secrets-controller",
+      "executed_capability": "sp-secret.rotate",
+      "execution_parameters": {
+        "secret_version": "v2",
+        "owner": "Zoë"
+      },
+      "executed_at": "2026-10-01T09:56:14.636711Z",
+      "outcome": "success",
+      "outcome_detail": null,
+      "prev_evidence_digest": null,
+      "resource_id": "kv:pilot-vault/vendor-zoë-api",
+      "resource_action": "rotate",
+      "resource_sequence": 2,
+      "prev_resource_digest": "cb6da44d70e2402528639b5d9393960b568e589544e476d65480a088fd44a0f8",
+      "signature": {
+        "key_id": "ctrl",
+        "sig": "rwNdBqtyeygMaGKD/ewLd9sCd2yQf0/622Ne8Y11+z4IkLpq4nsdRnjxbRmy5UHLUpqqsQhipvpUY3J2bhvBBA=="
+      }
+    }
+  ],
+  "execution_digests": [
+    "cb6da44d70e2402528639b5d9393960b568e589544e476d65480a088fd44a0f8",
+    "73b9d7f99b707f6cefb0e49c532f98bfd4a4d59f16f84d9ab05e1092595f1a04"
+  ],
+  "checkpoint": {
+    "checkpoint_id": "248152a2-ce5c-42e3-8cd2-6298a794cec2",
+    "created_at": "2026-10-01T09:56:14.643875Z",
+    "cutoff": "2026-10-01T09:56:14.350335Z",
+    "removed_through_sequence": 3,
+    "last_removed_entry_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "removed_count": 3,
+    "resource_heads": {
+      "kv:pilot-vault/vendor-zoë-api": {
+        "resource_sequence": 1,
+        "record_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+      }
+    },
+    "previous_checkpoint_id": null,
+    "issued_by": "na-vectors",
+    "signature": {
+      "key_id": "na-vectors",
+      "sig": "hzfUEo/Kvg79yHzWmKLLb3u0w8FkvKotI7uLAUsOWwI7Lxp3ORNOCMFVjs4q3y1qocexWuFbDzSPkh9fnB6kBQ=="
+    }
+  },
+  "export": "{\"entry\":{\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"capability\":\"sp-secret.create\",\"context_id\":\"2b8591fd-8584-4d0e-a899-42fc79436acc\",\"decision_id\":\"28d25e73-e0c1-4563-b691-d687fa368896\",\"entry_kind\":\"decision\",\"evidence_id\":null,\"exec_sequence_no\":null,\"executor_sovereign_id\":null,\"outcome\":\"authorized\",\"payload_digest\":\"699c756b1a2af4bfd1a0f45eff6cf3d1c1b502b3254e8b62d28356692e3ac81e\",\"prev_entry_digest\":null,\"recorded_at\":\"2026-10-01T09:56:14.627051Z\",\"resource_action\":null,\"resource_id\":null,\"resource_sequence\":null,\"store_sequence\":1,\"vendor_id\":\"vendor-zo\\u00eb\"},\"entry_digest\":\"f76eb032c84b19d7cf0301887e6edf73d1e6b1e2ed884bdf0826a54cdfefb78a\",\"payload\":{\"context\":{\"agreement_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"attributes\":{\"secret_store\":\"azure-key-vault\"},\"context_freshness_seq\":0,\"context_id\":\"2b8591fd-8584-4d0e-a899-42fc79436acc\",\"parent_kind\":\"attestation\",\"provider_sovereign_id\":\"vectors\",\"request_parameters\":{\"app_id\":\"app-z\\u00fcrich\",\"lifetime_days\":30},\"requested_at\":\"2026-10-01T09:56:14.622500Z\",\"requested_capability\":\"sp-secret.create\",\"requester_sovereign_id\":\"vendor-zo\\u00eb\"},\"decision\":{\"agreement_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"attestation_binding\":{\"attestation_digest\":\"25916b16721b74a118cc12f3beb1be6b3fc67a228e77602012a03b8cc8429e92\",\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"issuer_sovereign_id\":\"vectors\",\"revocation_seq_checked\":0,\"subject_id\":\"vendor-zo\\u00eb\"},\"authorized\":true,\"context_id\":\"2b8591fd-8584-4d0e-a899-42fc79436acc\",\"decision_id\":\"28d25e73-e0c1-4563-b691-d687fa368896\",\"decision_made_at\":\"2026-10-01T09:56:14.622649Z\",\"decision_valid_until\":\"2026-10-01T10:01:14.622649Z\",\"denial_reason\":null,\"freshness_proof\":null,\"gate_results\":[{\"detail\":\"attestation is active, signed by a trusted key, and not revoked\",\"gate_name\":\"attestation_status\",\"passed\":true},{\"detail\":\"request at 2026-10-01T09:56:14.622500+00:00 is within [2026-10-01T09:56:14.605528+00:00, 2036-09-28T09:56:14.605528+00:00]\",\"gate_name\":\"attestation_validity\",\"passed\":true},{\"detail\":\"capability 'sp-secret.create' is in attested capabilities\",\"gate_name\":\"capability_check\",\"passed\":true},{\"detail\":\"freshness seq 0 >= commitment 0\",\"gate_name\":\"freshness_check\",\"passed\":true},{\"detail\":\"request_parameters.app_id is in attestation claim 'apps'\",\"gate_name\":\"vendor-sp-secret/app\",\"passed\":true},{\"detail\":\"[observe] required fact 'attributes.owner' is missing\",\"gate_name\":\"vendor-sp-secret/owner\",\"passed\":false},{\"detail\":\"request_parameters.lifetime_days satisfies <= 90.0\",\"gate_name\":\"vendor-sp-secret/max-lifetime\",\"passed\":true}],\"operator_sovereign_id\":\"vectors\",\"policy_binding\":{\"context_digest\":\"07a62c477b6dfb7c772161145be2fe2f921a39f6a09712bc13f2ae6df5ed286d\",\"gate_evaluations\":[{\"gate_id\":\"app\",\"gate_type\":\"attestation_claim.v1\",\"mode\":\"enforce\",\"order\":0,\"outcome\":\"pass\",\"passed\":true,\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},{\"gate_id\":\"owner\",\"gate_type\":\"required_parameter.v1\",\"mode\":\"observe\",\"order\":1,\"outcome\":\"missing_context\",\"passed\":false,\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},{\"gate_id\":\"max-lifetime\",\"gate_type\":\"max_value.v1\",\"mode\":\"enforce\",\"order\":2,\"outcome\":\"pass\",\"passed\":true,\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1}],\"policies\":[{\"policy_digest\":\"f3e9a7542eed3faeda464bb746b37c3f46d661111721a6574b4d9bd77dbc37db\",\"policy_id\":\"vendor-sp-secret\",\"signed_by\":\"na-vectors\",\"version\":1}],\"policy_set_digest\":\"c0a324f2990e869f40e41683a83f6bb7f341c6ad60d15fb2d4b636fecad31a82\",\"registry_gate_types\":[\"attestation_claim.v1\",\"max_value.v1\",\"required_parameter.v1\"],\"resolution_failure\":null,\"resolution_status\":\"resolved\"},\"signature\":{\"key_id\":\"na-vectors\",\"sig\":\"CsNh6OFrnXA7s0Tt+z1DGMQi3J7D5yuA1DpIaqq6aZx5FrI/PcPaOFTh9AmeOWzFYe2JAqwgjmHiY86AYDHtDQ==\"}}},\"schema\":\"gm.evidence.event\",\"schema_version\":1}\n{\"entry\":{\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"capability\":\"sp-secret.create\",\"context_id\":\"2b8591fd-8584-4d0e-a899-42fc79436acc\",\"decision_id\":\"28d25e73-e0c1-4563-b691-d687fa368896\",\"entry_kind\":\"justification\",\"evidence_id\":null,\"exec_sequence_no\":null,\"executor_sovereign_id\":null,\"outcome\":\"authorized\",\"payload_digest\":\"c48a6facf3ebbff5ded5a06868e0b1f61a51078bc09e734d6bbccb7aa32207d0\",\"prev_entry_digest\":\"f76eb032c84b19d7cf0301887e6edf73d1e6b1e2ed884bdf0826a54cdfefb78a\",\"recorded_at\":\"2026-10-01T09:56:14.627051Z\",\"resource_action\":null,\"resource_id\":null,\"resource_sequence\":null,\"store_sequence\":2,\"vendor_id\":\"vendor-zo\\u00eb\"},\"entry_digest\":\"cb49b3384638d0d0f2804fc2a8cd83f6d426684db908dc19bec7463a685d6041\",\"payload\":{\"decision_id\":\"28d25e73-e0c1-4563-b691-d687fa368896\",\"issuer_sovereign_id\":\"vectors\",\"proof_id\":\"b2e72e62-be00-40ba-bec9-90db16addbd6\",\"proof_issued_at\":\"2026-10-01T09:56:14.622649Z\",\"signature\":{\"key_id\":\"na-vectors\",\"sig\":\"7stzTqk3h7uva78weW8nbvfnmhOzn/RMD3+R3K4sI16PNA7LPXU8Ey1x7y1yRhq35girkurb7ZfaK+vqRWG3BQ==\"},\"trace\":{\"agreement_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"decision_id\":\"28d25e73-e0c1-4563-b691-d687fa368896\",\"entries\":[{\"evaluated_at\":\"2026-10-01T09:56:14.622649Z\",\"gate_name\":\"attestation_status\",\"gate_type\":\"AttestationStatusGate\",\"inputs\":{\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"found\":true,\"revocation_seq_checked\":0},\"metadata\":{},\"reason\":\"attestation is active, signed by a trusted key, and not revoked\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.622649Z\",\"gate_name\":\"attestation_validity\",\"gate_type\":\"AttestationValidityGate\",\"inputs\":{\"expires_at\":\"2036-09-28T09:56:14.605528+00:00\",\"requested_at\":\"2026-10-01T09:56:14.622500+00:00\",\"valid_from\":\"2026-10-01T09:56:14.605528+00:00\"},\"metadata\":{},\"reason\":\"request at 2026-10-01T09:56:14.622500+00:00 is within [2026-10-01T09:56:14.605528+00:00, 2036-09-28T09:56:14.605528+00:00]\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.622649Z\",\"gate_name\":\"capability_check\",\"gate_type\":\"CapabilityGate\",\"inputs\":{\"capabilities\":[\"sp-secret.create\",\"sp-secret.rotate\",\"sp-secret.revoke\"],\"requested_capability\":\"sp-secret.create\"},\"metadata\":{},\"reason\":\"capability 'sp-secret.create' is in attested capabilities\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.622649Z\",\"gate_name\":\"freshness_check\",\"gate_type\":\"FreshnessGate\",\"inputs\":{\"context_freshness_seq\":0,\"freshness_commitment\":0},\"metadata\":{},\"reason\":\"freshness seq 0 >= commitment 0\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.622649Z\",\"gate_name\":\"vendor-sp-secret/app\",\"gate_type\":\"attestation_claim.v1\",\"inputs\":{\"condition\":{\"claim\":\"apps\"},\"path\":\"request_parameters.app_id\",\"present\":true,\"value_type\":\"string\"},\"metadata\":{\"gate_id\":\"app\",\"mode\":\"enforce\",\"order\":0,\"outcome\":\"pass\",\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},\"reason\":\"request_parameters.app_id is in attestation claim 'apps'\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.622649Z\",\"gate_name\":\"vendor-sp-secret/owner\",\"gate_type\":\"required_parameter.v1\",\"inputs\":{\"condition\":{\"required\":\"attributes.owner\"},\"path\":\"attributes.owner\",\"present\":false,\"value_type\":\"missing\"},\"metadata\":{\"gate_id\":\"owner\",\"mode\":\"observe\",\"order\":1,\"outcome\":\"missing_context\",\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},\"reason\":\"required fact 'attributes.owner' is missing\",\"result\":false},{\"evaluated_at\":\"2026-10-01T09:56:14.622649Z\",\"gate_name\":\"vendor-sp-secret/max-lifetime\",\"gate_type\":\"max_value.v1\",\"inputs\":{\"condition\":{\"max\":90.0,\"operator\":\"<=\"},\"path\":\"request_parameters.lifetime_days\",\"present\":true,\"value_type\":\"number\"},\"metadata\":{\"gate_id\":\"max-lifetime\",\"mode\":\"enforce\",\"order\":2,\"outcome\":\"pass\",\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},\"reason\":\"request_parameters.lifetime_days satisfies <= 90.0\",\"result\":true}],\"final_authorized\":true,\"operator_sovereign_id\":\"vectors\",\"short_circuited_at\":null,\"trace_id\":\"ec7e6914-093d-4bbe-b71c-b351eb4153a3\",\"traced_at\":\"2026-10-01T09:56:14.622649Z\"}},\"schema\":\"gm.evidence.event\",\"schema_version\":1}\n{\"entry\":{\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"capability\":\"sp-secret.create\",\"context_id\":\"2b8591fd-8584-4d0e-a899-42fc79436acc\",\"decision_id\":\"28d25e73-e0c1-4563-b691-d687fa368896\",\"entry_kind\":\"execution\",\"evidence_id\":\"7ecd4840-b991-4790-862e-c5bbe0da4503\",\"exec_sequence_no\":1,\"executor_sovereign_id\":\"secrets-controller\",\"outcome\":\"success\",\"payload_digest\":\"0aceeae04f2922c3cb99831b7dbefc0543149493e0bfbfe61fe238a725b6539f\",\"prev_entry_digest\":\"cb49b3384638d0d0f2804fc2a8cd83f6d426684db908dc19bec7463a685d6041\",\"recorded_at\":\"2026-10-01T09:56:14.630438Z\",\"resource_action\":\"create\",\"resource_id\":\"kv:pilot-vault/vendor-zo\\u00eb-api\",\"resource_sequence\":1,\"store_sequence\":3,\"vendor_id\":\"vendor-zo\\u00eb\"},\"entry_digest\":\"8f15888669af5b5cc2dbb5d8307c67b844487fa77c2a452424055ef1f6b2fa63\",\"payload\":{\"agreement_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"context_id\":\"2b8591fd-8584-4d0e-a899-42fc79436acc\",\"decision_id\":\"28d25e73-e0c1-4563-b691-d687fa368896\",\"evidence_id\":\"7ecd4840-b991-4790-862e-c5bbe0da4503\",\"executed_at\":\"2026-10-01T09:56:14.628709Z\",\"executed_capability\":\"sp-secret.create\",\"execution_parameters\":{\"owner\":\"Zo\\u00eb\",\"secret_version\":\"v1\"},\"executor_sovereign_id\":\"secrets-controller\",\"outcome\":\"success\",\"outcome_detail\":null,\"prev_evidence_digest\":null,\"prev_resource_digest\":null,\"resource_action\":\"create\",\"resource_id\":\"kv:pilot-vault/vendor-zo\\u00eb-api\",\"resource_sequence\":1,\"sequence_no\":1,\"signature\":{\"key_id\":\"ctrl\",\"sig\":\"+lTd7euhPevaJhZQ3RKRPuqJzWiAejWjD3fdIXtyTa+hUxf+zNGIEuQOpH6tP8lhOQhSeoodQOpstcYFFU1wCg==\"}},\"schema\":\"gm.evidence.event\",\"schema_version\":1}\n{\"entry\":{\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"capability\":\"sp-secret.rotate\",\"context_id\":\"c6742781-2594-43a7-be2f-c8e6feffac13\",\"decision_id\":\"3d389084-c3ea-4c75-a178-c974c69afa65\",\"entry_kind\":\"decision\",\"evidence_id\":null,\"exec_sequence_no\":null,\"executor_sovereign_id\":null,\"outcome\":\"authorized\",\"payload_digest\":\"fd56fd9096f366502bab11d7f47802e4e6860f519100740899a7cd0aba9c9793\",\"prev_entry_digest\":\"8f15888669af5b5cc2dbb5d8307c67b844487fa77c2a452424055ef1f6b2fa63\",\"recorded_at\":\"2026-10-01T09:56:14.635265Z\",\"resource_action\":null,\"resource_id\":null,\"resource_sequence\":null,\"store_sequence\":4,\"vendor_id\":\"vendor-zo\\u00eb\"},\"entry_digest\":\"01745fd138d32816944f5122b5fe4a6fda392b634398c1769e1a41ccbc1b97ab\",\"payload\":{\"context\":{\"agreement_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"attributes\":{\"secret_store\":\"azure-key-vault\"},\"context_freshness_seq\":0,\"context_id\":\"c6742781-2594-43a7-be2f-c8e6feffac13\",\"parent_kind\":\"attestation\",\"provider_sovereign_id\":\"vectors\",\"request_parameters\":{\"app_id\":\"app-z\\u00fcrich\",\"lifetime_days\":30},\"requested_at\":\"2026-10-01T09:56:14.633369Z\",\"requested_capability\":\"sp-secret.rotate\",\"requester_sovereign_id\":\"vendor-zo\\u00eb\"},\"decision\":{\"agreement_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"attestation_binding\":{\"attestation_digest\":\"25916b16721b74a118cc12f3beb1be6b3fc67a228e77602012a03b8cc8429e92\",\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"issuer_sovereign_id\":\"vectors\",\"revocation_seq_checked\":0,\"subject_id\":\"vendor-zo\\u00eb\"},\"authorized\":true,\"context_id\":\"c6742781-2594-43a7-be2f-c8e6feffac13\",\"decision_id\":\"3d389084-c3ea-4c75-a178-c974c69afa65\",\"decision_made_at\":\"2026-10-01T09:56:14.633444Z\",\"decision_valid_until\":\"2026-10-01T10:01:14.633444Z\",\"denial_reason\":null,\"freshness_proof\":null,\"gate_results\":[{\"detail\":\"attestation is active, signed by a trusted key, and not revoked\",\"gate_name\":\"attestation_status\",\"passed\":true},{\"detail\":\"request at 2026-10-01T09:56:14.633369+00:00 is within [2026-10-01T09:56:14.605528+00:00, 2036-09-28T09:56:14.605528+00:00]\",\"gate_name\":\"attestation_validity\",\"passed\":true},{\"detail\":\"capability 'sp-secret.rotate' is in attested capabilities\",\"gate_name\":\"capability_check\",\"passed\":true},{\"detail\":\"freshness seq 0 >= commitment 0\",\"gate_name\":\"freshness_check\",\"passed\":true},{\"detail\":\"request_parameters.app_id is in attestation claim 'apps'\",\"gate_name\":\"vendor-sp-secret/app\",\"passed\":true},{\"detail\":\"[observe] required fact 'attributes.owner' is missing\",\"gate_name\":\"vendor-sp-secret/owner\",\"passed\":false},{\"detail\":\"request_parameters.lifetime_days satisfies <= 90.0\",\"gate_name\":\"vendor-sp-secret/max-lifetime\",\"passed\":true}],\"operator_sovereign_id\":\"vectors\",\"policy_binding\":{\"context_digest\":\"bc5c3c6fa5b48ba6a0159f7e58286fee43a0d1ac745a96b563b35dc2e5107061\",\"gate_evaluations\":[{\"gate_id\":\"app\",\"gate_type\":\"attestation_claim.v1\",\"mode\":\"enforce\",\"order\":0,\"outcome\":\"pass\",\"passed\":true,\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},{\"gate_id\":\"owner\",\"gate_type\":\"required_parameter.v1\",\"mode\":\"observe\",\"order\":1,\"outcome\":\"missing_context\",\"passed\":false,\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},{\"gate_id\":\"max-lifetime\",\"gate_type\":\"max_value.v1\",\"mode\":\"enforce\",\"order\":2,\"outcome\":\"pass\",\"passed\":true,\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1}],\"policies\":[{\"policy_digest\":\"f3e9a7542eed3faeda464bb746b37c3f46d661111721a6574b4d9bd77dbc37db\",\"policy_id\":\"vendor-sp-secret\",\"signed_by\":\"na-vectors\",\"version\":1}],\"policy_set_digest\":\"c0a324f2990e869f40e41683a83f6bb7f341c6ad60d15fb2d4b636fecad31a82\",\"registry_gate_types\":[\"attestation_claim.v1\",\"max_value.v1\",\"required_parameter.v1\"],\"resolution_failure\":null,\"resolution_status\":\"resolved\"},\"signature\":{\"key_id\":\"na-vectors\",\"sig\":\"Y5+CsfCUiu32EtymTYetrzi6H9VpKefV3bKXdzv360A2ruv2SiRgDidYBcb5eN65QiYR/Lsta5cvwAvW9N5jCg==\"}}},\"schema\":\"gm.evidence.event\",\"schema_version\":1}\n{\"entry\":{\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"capability\":\"sp-secret.rotate\",\"context_id\":\"c6742781-2594-43a7-be2f-c8e6feffac13\",\"decision_id\":\"3d389084-c3ea-4c75-a178-c974c69afa65\",\"entry_kind\":\"justification\",\"evidence_id\":null,\"exec_sequence_no\":null,\"executor_sovereign_id\":null,\"outcome\":\"authorized\",\"payload_digest\":\"70601e82c03b9a934a01efba207c00f4d75f314bda76928eac8d00315262a622\",\"prev_entry_digest\":\"01745fd138d32816944f5122b5fe4a6fda392b634398c1769e1a41ccbc1b97ab\",\"recorded_at\":\"2026-10-01T09:56:14.635265Z\",\"resource_action\":null,\"resource_id\":null,\"resource_sequence\":null,\"store_sequence\":5,\"vendor_id\":\"vendor-zo\\u00eb\"},\"entry_digest\":\"34e6f8902c73fe6c6a49e8a88ee63b593638f2dbefab8190ae51146ee8ec7ad2\",\"payload\":{\"decision_id\":\"3d389084-c3ea-4c75-a178-c974c69afa65\",\"issuer_sovereign_id\":\"vectors\",\"proof_id\":\"17dbe2e3-1238-40e2-a1b4-c4820287f54d\",\"proof_issued_at\":\"2026-10-01T09:56:14.633444Z\",\"signature\":{\"key_id\":\"na-vectors\",\"sig\":\"Nq678eYPgt+VknlBI6hgz4oTvBrxU8HUzMt20xnFVqqsAf5EBKIGUTumSj2YnKdOLtmKb+PIsrhbYkeLcwvjAg==\"},\"trace\":{\"agreement_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"decision_id\":\"3d389084-c3ea-4c75-a178-c974c69afa65\",\"entries\":[{\"evaluated_at\":\"2026-10-01T09:56:14.633444Z\",\"gate_name\":\"attestation_status\",\"gate_type\":\"AttestationStatusGate\",\"inputs\":{\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"found\":true,\"revocation_seq_checked\":0},\"metadata\":{},\"reason\":\"attestation is active, signed by a trusted key, and not revoked\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.633444Z\",\"gate_name\":\"attestation_validity\",\"gate_type\":\"AttestationValidityGate\",\"inputs\":{\"expires_at\":\"2036-09-28T09:56:14.605528+00:00\",\"requested_at\":\"2026-10-01T09:56:14.633369+00:00\",\"valid_from\":\"2026-10-01T09:56:14.605528+00:00\"},\"metadata\":{},\"reason\":\"request at 2026-10-01T09:56:14.633369+00:00 is within [2026-10-01T09:56:14.605528+00:00, 2036-09-28T09:56:14.605528+00:00]\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.633444Z\",\"gate_name\":\"capability_check\",\"gate_type\":\"CapabilityGate\",\"inputs\":{\"capabilities\":[\"sp-secret.create\",\"sp-secret.rotate\",\"sp-secret.revoke\"],\"requested_capability\":\"sp-secret.rotate\"},\"metadata\":{},\"reason\":\"capability 'sp-secret.rotate' is in attested capabilities\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.633444Z\",\"gate_name\":\"freshness_check\",\"gate_type\":\"FreshnessGate\",\"inputs\":{\"context_freshness_seq\":0,\"freshness_commitment\":0},\"metadata\":{},\"reason\":\"freshness seq 0 >= commitment 0\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.633444Z\",\"gate_name\":\"vendor-sp-secret/app\",\"gate_type\":\"attestation_claim.v1\",\"inputs\":{\"condition\":{\"claim\":\"apps\"},\"path\":\"request_parameters.app_id\",\"present\":true,\"value_type\":\"string\"},\"metadata\":{\"gate_id\":\"app\",\"mode\":\"enforce\",\"order\":0,\"outcome\":\"pass\",\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},\"reason\":\"request_parameters.app_id is in attestation claim 'apps'\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.633444Z\",\"gate_name\":\"vendor-sp-secret/owner\",\"gate_type\":\"required_parameter.v1\",\"inputs\":{\"condition\":{\"required\":\"attributes.owner\"},\"path\":\"attributes.owner\",\"present\":false,\"value_type\":\"missing\"},\"metadata\":{\"gate_id\":\"owner\",\"mode\":\"observe\",\"order\":1,\"outcome\":\"missing_context\",\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},\"reason\":\"required fact 'attributes.owner' is missing\",\"result\":false},{\"evaluated_at\":\"2026-10-01T09:56:14.633444Z\",\"gate_name\":\"vendor-sp-secret/max-lifetime\",\"gate_type\":\"max_value.v1\",\"inputs\":{\"condition\":{\"max\":90.0,\"operator\":\"<=\"},\"path\":\"request_parameters.lifetime_days\",\"present\":true,\"value_type\":\"number\"},\"metadata\":{\"gate_id\":\"max-lifetime\",\"mode\":\"enforce\",\"order\":2,\"outcome\":\"pass\",\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},\"reason\":\"request_parameters.lifetime_days satisfies <= 90.0\",\"result\":true}],\"final_authorized\":true,\"operator_sovereign_id\":\"vectors\",\"short_circuited_at\":null,\"trace_id\":\"f155e918-9ab9-4259-a516-fb5eb5280152\",\"traced_at\":\"2026-10-01T09:56:14.633444Z\"}},\"schema\":\"gm.evidence.event\",\"schema_version\":1}\n{\"entry\":{\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"capability\":\"sp-secret.rotate\",\"context_id\":\"c6742781-2594-43a7-be2f-c8e6feffac13\",\"decision_id\":\"3d389084-c3ea-4c75-a178-c974c69afa65\",\"entry_kind\":\"execution\",\"evidence_id\":\"5de536bd-d771-4479-945d-cd310761af6d\",\"exec_sequence_no\":1,\"executor_sovereign_id\":\"secrets-controller\",\"outcome\":\"success\",\"payload_digest\":\"d1c664cf2036bdd9cb56ae8a8d8bea7337dcfb21bb0aa4b8953344e2f87151fd\",\"prev_entry_digest\":\"34e6f8902c73fe6c6a49e8a88ee63b593638f2dbefab8190ae51146ee8ec7ad2\",\"recorded_at\":\"2026-10-01T09:56:14.638158Z\",\"resource_action\":\"rotate\",\"resource_id\":\"kv:pilot-vault/vendor-zo\\u00eb-api\",\"resource_sequence\":2,\"store_sequence\":6,\"vendor_id\":\"vendor-zo\\u00eb\"},\"entry_digest\":\"db95651a59de94e84c0d1359de8e75da43e06e366bcdef6d3e619ba711cccd9d\",\"payload\":{\"agreement_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"context_id\":\"c6742781-2594-43a7-be2f-c8e6feffac13\",\"decision_id\":\"3d389084-c3ea-4c75-a178-c974c69afa65\",\"evidence_id\":\"5de536bd-d771-4479-945d-cd310761af6d\",\"executed_at\":\"2026-10-01T09:56:14.636711Z\",\"executed_capability\":\"sp-secret.rotate\",\"execution_parameters\":{\"owner\":\"Zo\\u00eb\",\"secret_version\":\"v2\"},\"executor_sovereign_id\":\"secrets-controller\",\"outcome\":\"success\",\"outcome_detail\":null,\"prev_evidence_digest\":null,\"prev_resource_digest\":\"cb6da44d70e2402528639b5d9393960b568e589544e476d65480a088fd44a0f8\",\"resource_action\":\"rotate\",\"resource_id\":\"kv:pilot-vault/vendor-zo\\u00eb-api\",\"resource_sequence\":2,\"sequence_no\":1,\"signature\":{\"key_id\":\"ctrl\",\"sig\":\"rwNdBqtyeygMaGKD/ewLd9sCd2yQf0/622Ne8Y11+z4IkLpq4nsdRnjxbRmy5UHLUpqqsQhipvpUY3J2bhvBBA==\"}},\"schema\":\"gm.evidence.event\",\"schema_version\":1}\n{\"entry\":{\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"capability\":\"sp-secret.create\",\"context_id\":\"e311f481-6d50-4489-874f-92922bb00dc9\",\"decision_id\":\"f09ea2e1-664f-41a2-9a76-c1292ff3a1ab\",\"entry_kind\":\"decision\",\"evidence_id\":null,\"exec_sequence_no\":null,\"executor_sovereign_id\":null,\"outcome\":\"denied\",\"payload_digest\":\"906e629ba69cc1f779c853c2e90f253e5e42b6cc07288180742f055d09293916\",\"prev_entry_digest\":\"db95651a59de94e84c0d1359de8e75da43e06e366bcdef6d3e619ba711cccd9d\",\"recorded_at\":\"2026-10-01T09:56:14.642723Z\",\"resource_action\":null,\"resource_id\":null,\"resource_sequence\":null,\"store_sequence\":7,\"vendor_id\":\"vendor-zo\\u00eb\"},\"entry_digest\":\"da6a993bfb25dc0329008c34ee66e094cc33e9624b0081769a4d56bf24a39d24\",\"payload\":{\"context\":{\"agreement_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"attributes\":{\"secret_store\":\"azure-key-vault\"},\"context_freshness_seq\":0,\"context_id\":\"e311f481-6d50-4489-874f-92922bb00dc9\",\"parent_kind\":\"attestation\",\"provider_sovereign_id\":\"vectors\",\"request_parameters\":{\"app_id\":\"app-elsewhere\",\"lifetime_days\":365},\"requested_at\":\"2026-10-01T09:56:14.640966Z\",\"requested_capability\":\"sp-secret.create\",\"requester_sovereign_id\":\"vendor-zo\\u00eb\"},\"decision\":{\"agreement_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"attestation_binding\":{\"attestation_digest\":\"25916b16721b74a118cc12f3beb1be6b3fc67a228e77602012a03b8cc8429e92\",\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"issuer_sovereign_id\":\"vectors\",\"revocation_seq_checked\":0,\"subject_id\":\"vendor-zo\\u00eb\"},\"authorized\":false,\"context_id\":\"e311f481-6d50-4489-874f-92922bb00dc9\",\"decision_id\":\"f09ea2e1-664f-41a2-9a76-c1292ff3a1ab\",\"decision_made_at\":\"2026-10-01T09:56:14.641034Z\",\"decision_valid_until\":\"2026-10-01T10:01:14.641034Z\",\"denial_reason\":\"policy gate 'vendor-sp-secret/app' failed (+1 more)\",\"freshness_proof\":null,\"gate_results\":[{\"detail\":\"attestation is active, signed by a trusted key, and not revoked\",\"gate_name\":\"attestation_status\",\"passed\":true},{\"detail\":\"request at 2026-10-01T09:56:14.640966+00:00 is within [2026-10-01T09:56:14.605528+00:00, 2036-09-28T09:56:14.605528+00:00]\",\"gate_name\":\"attestation_validity\",\"passed\":true},{\"detail\":\"capability 'sp-secret.create' is in attested capabilities\",\"gate_name\":\"capability_check\",\"passed\":true},{\"detail\":\"freshness seq 0 >= commitment 0\",\"gate_name\":\"freshness_check\",\"passed\":true},{\"detail\":\"request_parameters.app_id is not in attestation claim 'apps'\",\"gate_name\":\"vendor-sp-secret/app\",\"passed\":false},{\"detail\":\"[observe] required fact 'attributes.owner' is missing\",\"gate_name\":\"vendor-sp-secret/owner\",\"passed\":false},{\"detail\":\"request_parameters.lifetime_days violates <= 90.0\",\"gate_name\":\"vendor-sp-secret/max-lifetime\",\"passed\":false}],\"operator_sovereign_id\":\"vectors\",\"policy_binding\":{\"context_digest\":\"bace5e460669f382509cd53985a6d832cc9d0fc0424b333ccdafdd33311f8585\",\"gate_evaluations\":[{\"gate_id\":\"app\",\"gate_type\":\"attestation_claim.v1\",\"mode\":\"enforce\",\"order\":0,\"outcome\":\"fail\",\"passed\":false,\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},{\"gate_id\":\"owner\",\"gate_type\":\"required_parameter.v1\",\"mode\":\"observe\",\"order\":1,\"outcome\":\"missing_context\",\"passed\":false,\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},{\"gate_id\":\"max-lifetime\",\"gate_type\":\"max_value.v1\",\"mode\":\"enforce\",\"order\":2,\"outcome\":\"fail\",\"passed\":false,\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1}],\"policies\":[{\"policy_digest\":\"f3e9a7542eed3faeda464bb746b37c3f46d661111721a6574b4d9bd77dbc37db\",\"policy_id\":\"vendor-sp-secret\",\"signed_by\":\"na-vectors\",\"version\":1}],\"policy_set_digest\":\"c0a324f2990e869f40e41683a83f6bb7f341c6ad60d15fb2d4b636fecad31a82\",\"registry_gate_types\":[\"attestation_claim.v1\",\"max_value.v1\",\"required_parameter.v1\"],\"resolution_failure\":null,\"resolution_status\":\"resolved\"},\"signature\":{\"key_id\":\"na-vectors\",\"sig\":\"c5sg2sam+/koiF2V/g4tmPvIAhi6kL1VS3FPxM/Gn8wpy56rGSMJjHOQuHV5iNduh1CRrVDsM64HCJzni+BHBA==\"}}},\"schema\":\"gm.evidence.event\",\"schema_version\":1}\n{\"entry\":{\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"capability\":\"sp-secret.create\",\"context_id\":\"e311f481-6d50-4489-874f-92922bb00dc9\",\"decision_id\":\"f09ea2e1-664f-41a2-9a76-c1292ff3a1ab\",\"entry_kind\":\"justification\",\"evidence_id\":null,\"exec_sequence_no\":null,\"executor_sovereign_id\":null,\"outcome\":\"denied\",\"payload_digest\":\"edbc9c91158821dc82689515c86df8ac3d88e45f6165266817dfd13741d68461\",\"prev_entry_digest\":\"da6a993bfb25dc0329008c34ee66e094cc33e9624b0081769a4d56bf24a39d24\",\"recorded_at\":\"2026-10-01T09:56:14.642723Z\",\"resource_action\":null,\"resource_id\":null,\"resource_sequence\":null,\"store_sequence\":8,\"vendor_id\":\"vendor-zo\\u00eb\"},\"entry_digest\":\"21c5aba6e2cb2ebd276e66f8214223e0d21076b55d6b2da0f2a3c01a73996b50\",\"payload\":{\"decision_id\":\"f09ea2e1-664f-41a2-9a76-c1292ff3a1ab\",\"issuer_sovereign_id\":\"vectors\",\"proof_id\":\"777d60a4-fe65-467a-b4bb-ec8bd0950873\",\"proof_issued_at\":\"2026-10-01T09:56:14.641034Z\",\"signature\":{\"key_id\":\"na-vectors\",\"sig\":\"jT6qqGGpYb5ddRl6CD5UP6K557mGK2orh6yfMDqcttRDDZUc5brPCGVFL3qkctsO8Vdnz+uX5gsANrbkjUHQDg==\"},\"trace\":{\"agreement_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"decision_id\":\"f09ea2e1-664f-41a2-9a76-c1292ff3a1ab\",\"entries\":[{\"evaluated_at\":\"2026-10-01T09:56:14.641034Z\",\"gate_name\":\"attestation_status\",\"gate_type\":\"AttestationStatusGate\",\"inputs\":{\"attestation_id\":\"6ce38f75-23a8-4da8-901b-762132db5951\",\"found\":true,\"revocation_seq_checked\":0},\"metadata\":{},\"reason\":\"attestation is active, signed by a trusted key, and not revoked\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.641034Z\",\"gate_name\":\"attestation_validity\",\"gate_type\":\"AttestationValidityGate\",\"inputs\":{\"expires_at\":\"2036-09-28T09:56:14.605528+00:00\",\"requested_at\":\"2026-10-01T09:56:14.640966+00:00\",\"valid_from\":\"2026-10-01T09:56:14.605528+00:00\"},\"metadata\":{},\"reason\":\"request at 2026-10-01T09:56:14.640966+00:00 is within [2026-10-01T09:56:14.605528+00:00, 2036-09-28T09:56:14.605528+00:00]\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.641034Z\",\"gate_name\":\"capability_check\",\"gate_type\":\"CapabilityGate\",\"inputs\":{\"capabilities\":[\"sp-secret.create\",\"sp-secret.rotate\",\"sp-secret.revoke\"],\"requested_capability\":\"sp-secret.create\"},\"metadata\":{},\"reason\":\"capability 'sp-secret.create' is in attested capabilities\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.641034Z\",\"gate_name\":\"freshness_check\",\"gate_type\":\"FreshnessGate\",\"inputs\":{\"context_freshness_seq\":0,\"freshness_commitment\":0},\"metadata\":{},\"reason\":\"freshness seq 0 >= commitment 0\",\"result\":true},{\"evaluated_at\":\"2026-10-01T09:56:14.641034Z\",\"gate_name\":\"vendor-sp-secret/app\",\"gate_type\":\"attestation_claim.v1\",\"inputs\":{\"condition\":{\"claim\":\"apps\"},\"path\":\"request_parameters.app_id\",\"present\":true,\"value_type\":\"string\"},\"metadata\":{\"gate_id\":\"app\",\"mode\":\"enforce\",\"order\":0,\"outcome\":\"fail\",\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},\"reason\":\"request_parameters.app_id is not in attestation claim 'apps'\",\"result\":false},{\"evaluated_at\":\"2026-10-01T09:56:14.641034Z\",\"gate_name\":\"vendor-sp-secret/owner\",\"gate_type\":\"required_parameter.v1\",\"inputs\":{\"condition\":{\"required\":\"attributes.owner\"},\"path\":\"attributes.owner\",\"present\":false,\"value_type\":\"missing\"},\"metadata\":{\"gate_id\":\"owner\",\"mode\":\"observe\",\"order\":1,\"outcome\":\"missing_context\",\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},\"reason\":\"required fact 'attributes.owner' is missing\",\"result\":false},{\"evaluated_at\":\"2026-10-01T09:56:14.641034Z\",\"gate_name\":\"vendor-sp-secret/max-lifetime\",\"gate_type\":\"max_value.v1\",\"inputs\":{\"condition\":{\"max\":90.0,\"operator\":\"<=\"},\"path\":\"request_parameters.lifetime_days\",\"present\":true,\"value_type\":\"number\"},\"metadata\":{\"gate_id\":\"max-lifetime\",\"mode\":\"enforce\",\"order\":2,\"outcome\":\"fail\",\"policy_id\":\"vendor-sp-secret\",\"policy_version\":1},\"reason\":\"request_parameters.lifetime_days violates <= 90.0\",\"result\":false}],\"final_authorized\":false,\"operator_sovereign_id\":\"vectors\",\"short_circuited_at\":\"vendor-sp-secret/app\",\"trace_id\":\"053bc232-4ae1-42fe-833c-6398122788c0\",\"traced_at\":\"2026-10-01T09:56:14.641034Z\"}},\"schema\":\"gm.evidence.event\",\"schema_version\":1}\n",
+  "server_verification": {
+    "checked_entries": 8,
+    "decisions": 3,
+    "executions": 2,
+    "failures": [],
+    "verified": true
+  }
+}

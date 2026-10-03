@@ -55,6 +55,64 @@ pub enum GenesisMeshError {
     /// Admin route was called without a signing key.
     #[error("signing_key_base64 is required for admin routes")]
     MissingSigningKey,
+
+    /// Evidence metadata would carry secret material or exceed the size
+    /// limit; refused before anything is signed or sent. Code
+    /// `evidence_secret_material`, as the NA would return.
+    #[error("evidence metadata refused: {0}")]
+    SecretMaterial(String),
+
+    /// A boundary decision failed offline verification; the action was not
+    /// run. Holds the verification reason code.
+    #[error("decision failed verification: {0}")]
+    DecisionVerification(String),
+
+    /// Data from the NA did not verify or was inconsistent (a history that
+    /// failed verification, a paging cursor that did not advance).
+    #[error("verification failed: {0}")]
+    Verification(String),
+
+    /// A governed action failed; its failure was recorded as evidence.
+    #[error("governed action failed: {source}")]
+    ActionFailed {
+        /// The action's error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// A governed action failed and recording its failure also failed.
+    #[error("action failed and its failure could not be recorded: {evidence_error}")]
+    ActionUnrecorded {
+        /// The action's error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+        /// Why the failure evidence could not be recorded.
+        evidence_error: Box<GenesisMeshError>,
+    },
+}
+
+impl GenesisMeshError {
+    /// The stable error code: the NA's `code` for HTTP errors, the reason
+    /// for verification failures, and SDK codes otherwise.
+    pub fn code(&self) -> &str {
+        match self {
+            Self::Unauthorized { code, .. }
+            | Self::Validation { code, .. }
+            | Self::NotFound { code, .. }
+            | Self::RateLimit { code, .. }
+            | Self::BadRequest { code, .. }
+            | Self::Http { code, .. } => code,
+            Self::DecisionVerification(reason) => reason,
+            Self::SecretMaterial(_) => "evidence_secret_material",
+            Self::Verification(_) => "verification_failed",
+            Self::ActionFailed { .. } => "governed_action_failed",
+            Self::ActionUnrecorded { .. } => "governed_action_unrecorded",
+            Self::Configuration(_) => "configuration",
+            Self::Network(_) => "network",
+            Self::Json(_) => "json",
+            Self::SigningKey(_) | Self::MissingSigningKey => "signing_key",
+        }
+    }
 }
 
 pub(crate) fn from_http_error(status: u16, body: &Value) -> GenesisMeshError {

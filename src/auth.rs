@@ -2,8 +2,9 @@ use std::fmt::Write;
 
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{SecondsFormat, Utc};
-use ed25519_dalek::{Signer, SigningKey};
-use serde_json::Value;
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::errors::{GenesisMeshError, Result};
@@ -139,6 +140,52 @@ pub fn build_admin_headers(
     })
 }
 
+/// Lowercase hex SHA-256 of a value's canonical JSON, as the Python models'
+/// `digest()` methods compute it.
+pub fn canonical_digest(value: &Value) -> Result<String> {
+    Ok(sha256_hex(canonical_json(value)?.as_bytes()))
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(out, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    out
+}
+
+/// Sign a canonical body: `{"key_id", "sig"}` as embedded in GM signed models.
+pub fn sign_canonical(canonical: &str, key_id: &str, signing_key: &SigningKey) -> Value {
+    let signature = signing_key.sign(canonical.as_bytes());
+    json!({"key_id": key_id, "sig": general_purpose::STANDARD.encode(signature.to_bytes())})
+}
+
+/// True when `signature_base64` verifies `canonical` under any of the raw
+/// base64 Ed25519 public keys. Malformed keys and signatures do not verify.
+pub fn verify_canonical(canonical: &str, signature_base64: &str, public_keys: &[String]) -> bool {
+    let Ok(signature) = general_purpose::STANDARD
+        .decode(signature_base64)
+        .map_err(|_| ())
+        .and_then(|bytes| Signature::from_slice(&bytes).map_err(|_| ()))
+    else {
+        return false;
+    };
+    public_keys.iter().any(|key| {
+        general_purpose::STANDARD
+            .decode(key)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            .and_then(|bytes| VerifyingKey::from_bytes(&bytes).ok())
+            .is_some_and(|key| key.verify_strict(canonical.as_bytes(), &signature).is_ok())
+    })
+}
+
+/// Raw base64 Ed25519 public key for a base64 seed.
+pub fn public_key_from_seed(seed_base64: &str) -> Result<String> {
+    let key = load_signing_key(seed_base64)?;
+    Ok(general_purpose::STANDARD.encode(key.verifying_key().to_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +203,35 @@ mod tests {
         assert_eq!(
             canonical_json(&value).unwrap(),
             r#"{"body":{"foo":"bar"},"key_id":"k","nonce":"n","timestamp":"t"}"#
+        );
+    }
+
+    #[test]
+    fn signs_and_verifies_canonical_bodies() {
+        let seed = general_purpose::STANDARD.encode([9_u8; 32]);
+        let key = load_signing_key(&seed).unwrap();
+        let public = public_key_from_seed(&seed).unwrap();
+        let signature = sign_canonical("{\"a\":1}", "k", &key);
+        let sig = signature["sig"].as_str().unwrap();
+        assert!(verify_canonical(
+            "{\"a\":1}",
+            sig,
+            std::slice::from_ref(&public)
+        ));
+        assert!(!verify_canonical(
+            "{\"a\":2}",
+            sig,
+            std::slice::from_ref(&public)
+        ));
+        assert!(!verify_canonical("{\"a\":1}", "not base64", &[public]));
+        assert!(!verify_canonical("{\"a\":1}", sig, &["short".into()]));
+    }
+
+    #[test]
+    fn digests_canonical_json() {
+        assert_eq!(
+            canonical_digest(&json!({"b": 1, "a": "é"})).unwrap(),
+            sha256_hex(br#"{"a":"\u00e9","b":1}"#)
         );
     }
 
