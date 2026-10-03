@@ -144,22 +144,39 @@ async fn admit_decide_record_audit_and_offboard(na: &LiveNa) {
             {"gate_id": "lifetime", "gate_type": "max_value.v1", "order": 2, "config": {"path": "request_parameters.lifetime_days", "max": 90}},
         ],
     });
-    assert_eq!(gm.policy.validate(intent.clone()).await.unwrap()["valid"], true);
+    assert_eq!(
+        gm.policy.validate(intent.clone()).await.unwrap()["valid"],
+        true
+    );
     let policy = gm.policy.publish(intent).await.unwrap();
     let policy_id = policy["policy_id"].as_str().unwrap();
     let version = policy["version"].as_u64().unwrap();
     assert!(verify_policy_signature(&policy, &keys));
-    assert_eq!(gm.policy.verify(json!({"policy": policy})).await.unwrap()["valid"], true);
-    assert_eq!(gm.policy.activate(policy_id, version).await.unwrap()["active"], true);
+    assert_eq!(
+        gm.policy.verify(json!({"policy": policy})).await.unwrap()["valid"],
+        true
+    );
+    assert_eq!(
+        gm.policy.activate(policy_id, version).await.unwrap()["active"],
+        true
+    );
     assert!(gm.policy.active().await.unwrap()["active"]
         .as_array()
         .unwrap()
         .iter()
         .any(|p| p["policy_id"] == policy_id));
-    assert!(gm.policy.list().await.unwrap().iter().any(|p| p["policy_id"] == policy_id));
+    assert!(gm
+        .policy
+        .list()
+        .await
+        .unwrap()
+        .iter()
+        .any(|p| p["policy_id"] == policy_id));
     gm.evidence_store
-        .register_executor_key(json!({"key_id": recorder.key_id(), "public_key": executor_key,
-                                      "executor_sovereign_id": recorder.executor_sovereign_id()}))
+        .register_executor_key(
+            json!({"key_id": recorder.key_id(), "public_key": executor_key,
+                                      "executor_sovereign_id": recorder.executor_sovereign_id()}),
+        )
         .await
         .unwrap();
 
@@ -200,14 +217,34 @@ async fn admit_decide_record_audit_and_offboard(na: &LiveNa) {
         assert_eq!(evidence["resource_sequence"], sequence);
         assert_eq!(result.submission.unwrap()["status"], "recorded");
         assert_eq!(result.summary.observed_failures.len(), 1);
-        assert!(verify_justification_signature(&result.evaluation["justification_proof"], &keys));
-        assert_eq!(gm.evidence_store.submit(evidence.clone()).await.unwrap()["status"], "duplicate");
+        assert!(verify_justification_signature(
+            &result.evaluation["justification_proof"],
+            &keys
+        ));
+        assert_eq!(
+            gm.evidence_store.submit(evidence.clone()).await.unwrap()["status"],
+            "duplicate"
+        );
         last = Some(evidence);
     }
-    let head = gm.evidence_store.resource_head(&resource).await.unwrap().unwrap();
+    let head = gm
+        .evidence_store
+        .resource_head(&resource)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(head.resource_sequence, 3);
-    assert_eq!(head.record_digest, execution_digest(last.as_ref().unwrap()).unwrap());
-    assert_eq!(gm.evidence_store.resource_head(&format!("kv:rust-{id}/none")).await.unwrap(), None);
+    assert_eq!(
+        head.record_digest,
+        execution_digest(last.as_ref().unwrap()).unwrap()
+    );
+    assert_eq!(
+        gm.evidence_store
+            .resource_head(&format!("kv:rust-{id}/none"))
+            .await
+            .unwrap(),
+        None
+    );
 
     for request_parameters in [
         json!({"app_id": "wrong", "lifetime_days": 30}),
@@ -230,7 +267,10 @@ async fn admit_decide_record_audit_and_offboard(na: &LiveNa) {
         assert!(!result.authorized);
     }
 
-    assert_eq!(gm.evidence_store.resource_history(&resource).await.unwrap()["verification"]["verified"], true);
+    assert_eq!(
+        gm.evidence_store.resource_history(&resource).await.unwrap()["verification"]["verified"],
+        true
+    );
     let vendor_history = gm.evidence_store.vendor_history(&vendor).await.unwrap();
     assert_eq!(vendor_history["verification"]["verified"], true);
     let executor_keys = gm.evidence_store.list_executor_keys().await.unwrap();
@@ -238,10 +278,15 @@ async fn admit_decide_record_audit_and_offboard(na: &LiveNa) {
         contiguous: false,
         ..VerifyEvidenceOptions::new(keys.clone(), executor_keys.clone())
     };
-    assert!(verify_evidence_events(vendor_history["entries"].as_array().unwrap(), &filtered).verified);
+    assert!(
+        verify_evidence_events(vendor_history["entries"].as_array().unwrap(), &filtered).verified
+    );
 
     gm.attestation
-        .revoke(attestation["attestation_id"].as_str().unwrap(), Some(json!({"reason": "Rust SDK test complete"})))
+        .revoke(
+            attestation["attestation_id"].as_str().unwrap(),
+            Some(json!({"reason": "Rust SDK test complete"})),
+        )
         .await
         .unwrap();
     let revoked = gm
@@ -270,21 +315,40 @@ async fn admit_decide_record_audit_and_offboard(na: &LiveNa) {
     assert_eq!(err.code(), "evidence_decision_denied");
 
     assert_eq!(gm.evidence_store.verify().await.unwrap()["verified"], true);
-    assert_eq!(gm.evidence_store.status().await.unwrap()["evidence_store"], "on");
+    assert_eq!(
+        gm.evidence_store.status().await.unwrap()["evidence_store"],
+        "on"
+    );
     let exported = gm.evidence_store.export_all(0, 5).await.unwrap();
     let full = VerifyEvidenceOptions::new(keys.clone(), executor_keys);
     let offline = verify_evidence_events(&exported, &full);
     assert!(offline.verified, "{offline:?}");
-    assert_eq!(gm.evidence_store.export(json!({"limit": 1})).await.unwrap().len(), 1);
+    assert_eq!(
+        gm.evidence_store
+            .export(json!({"limit": 1}))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     let searched = gm
         .evidence_store
         .search_all(json!({"vendor_id": vendor, "limit": 2}))
         .await
         .unwrap();
     assert!(searched.len() > 3);
-    assert_eq!(gm.evidence_store.apply_retention(365).await.unwrap()["removed_count"], 0);
+    assert_eq!(
+        gm.evidence_store.apply_retention(365).await.unwrap()["removed_count"],
+        0
+    );
     assert_eq!(gm.evidence_store.latest_checkpoint().await.unwrap(), None);
-    assert_eq!(gm.evidence_store.retire_executor_key(recorder.key_id()).await.unwrap()["active"], false);
+    assert_eq!(
+        gm.evidence_store
+            .retire_executor_key(recorder.key_id())
+            .await
+            .unwrap()["active"],
+        false
+    );
 }
 
 async fn observe_enforce_rollback_failures_conflicts_and_retired_keys(na: &LiveNa) {
@@ -306,15 +370,30 @@ async fn observe_enforce_rollback_failures_conflicts_and_retired_keys(na: &LiveN
     gm.policy.activate(&id, first_version).await.unwrap();
     intent["gates"][0]["mode"] = json!("enforce");
     let second = gm.policy.publish(intent).await.unwrap();
-    gm.policy.activate(&id, second["version"].as_u64().unwrap()).await.unwrap();
-    let request = json!({"attestation_id": attestation["attestation_id"], "requested_capability": "sdk.run"});
-    assert_eq!(gm.boundary.evaluate(request.clone()).await.unwrap()["decision"]["authorized"], false);
+    gm.policy
+        .activate(&id, second["version"].as_u64().unwrap())
+        .await
+        .unwrap();
+    let request =
+        json!({"attestation_id": attestation["attestation_id"], "requested_capability": "sdk.run"});
+    assert_eq!(
+        gm.boundary.evaluate(request.clone()).await.unwrap()["decision"]["authorized"],
+        false
+    );
     gm.policy.activate(&id, first_version).await.unwrap();
-    assert_eq!(gm.policy.history(&id).await.unwrap()["versions"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        gm.policy.history(&id).await.unwrap()["versions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 
     let (recorder, executor_key) = executor(&id);
     gm.evidence_store
-        .register_executor_key(json!({"key_id": id, "public_key": executor_key, "executor_sovereign_id": id}))
+        .register_executor_key(
+            json!({"key_id": id, "public_key": executor_key, "executor_sovereign_id": id}),
+        )
         .await
         .unwrap();
     let resource = format!("sdk:{id}");
@@ -330,12 +409,19 @@ async fn observe_enforce_rollback_failures_conflicts_and_retired_keys(na: &LiveN
             ..GovernedVerification::default()
         },
     };
-    let err = governed_action(&gm.boundary, &gm.evidence_store, &recorder, params, |_| async {
-        Err::<ActionReport<()>, ActionError>("local test failure".into())
-    })
+    let err = governed_action(
+        &gm.boundary,
+        &gm.evidence_store,
+        &recorder,
+        params,
+        |_| async { Err::<ActionReport<()>, ActionError>("local test failure".into()) },
+    )
     .await
     .unwrap_err();
-    assert!(matches!(err, GenesisMeshError::ActionFailed { .. }), "{err}");
+    assert!(
+        matches!(err, GenesisMeshError::ActionFailed { .. }),
+        "{err}"
+    );
     let history = gm.evidence_store.resource_history(&resource).await.unwrap();
     let execution = history["entries"]
         .as_array()
@@ -356,7 +442,10 @@ async fn observe_enforce_rollback_failures_conflicts_and_retired_keys(na: &LiveN
         })
         .unwrap();
     let conflict = gm.evidence_store.submit(bad_head).await.unwrap_err();
-    assert!(matches!(conflict, GenesisMeshError::Http { status: 409, .. }), "{conflict}");
+    assert!(
+        matches!(conflict, GenesisMeshError::Http { status: 409, .. }),
+        "{conflict}"
+    );
 
     gm.evidence_store.retire_executor_key(&id).await.unwrap();
     let retired = recorder
@@ -366,8 +455,14 @@ async fn observe_enforce_rollback_failures_conflicts_and_retired_keys(na: &LiveN
             ..RecordExecution::default()
         })
         .unwrap();
-    assert_eq!(gm.evidence_store.submit(retired).await.unwrap_err().code(), "evidence_unknown_executor");
-    assert_eq!(gm.policy.deactivate(&id, first_version).await.unwrap()["active"], false);
+    assert_eq!(
+        gm.evidence_store.submit(retired).await.unwrap_err().code(),
+        "evidence_unknown_executor"
+    );
+    assert_eq!(
+        gm.policy.deactivate(&id, first_version).await.unwrap()["active"],
+        false
+    );
     let after = gm.boundary.evaluate(request).await.unwrap();
     let check = verify_boundary_decision(
         &after["decision"],
@@ -378,5 +473,8 @@ async fn observe_enforce_rollback_failures_conflicts_and_retired_keys(na: &LiveN
             ..VerifyDecisionOptions::default()
         },
     );
-    assert_eq!((check.accepted, check.reason.as_str()), (false, "policy_binding_mismatch"));
+    assert_eq!(
+        (check.accepted, check.reason.as_str()),
+        (false, "policy_binding_mismatch")
+    );
 }
