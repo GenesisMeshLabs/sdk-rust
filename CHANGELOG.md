@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.64.1 - 2026-10-03
+
+Coordinated Genesis Mesh v0.64.1 release. No functional changes.
+
 ## 0.64.0 - 2026-10-03
 
 Governed-action parity with the TypeScript SDK.
