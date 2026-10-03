@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.64.0 - 2026-10-03
+
+Governed-action parity with the TypeScript SDK.
+
+- `policy`: boundary policy lifecycle (validate, publish, list, active,
+  history, activate, deactivate, verify).
+- `boundary.evaluate`: policy-aware evaluation under one basis
+  (`attestation_id` or `agreement`).
+- `evidence_store`: submission, search (paged), status, verification,
+  resource and vendor histories, resource heads (with the fallback for NAs
+  before 0.63.1), JSON Lines export (paged), executor keys and retention.
+- `health`: liveness and readiness (a not-ready NA is `ready: false`).
+- `ExecutionRecorder` and `governed_action`: verify the decision offline, act
+  only on ALLOW, sign and submit execution evidence linked to the resource
+  chain; failures are recorded without their error text.
+- `verify` and `canonical`: offline verification and canonical digests ported
+  from the Python reference with the same reason codes, tested against
+  Python-produced vectors.
+- Transport: signed admin GETs, query parameters, text responses, and
+  identifiers encoded once per path segment (dot segments refused).
+- `tests/live_na.rs`: the governed lifecycle against a live NA; CI runs it
+  against core main.
+
 ## 0.63.1 - 2026-10-02
 
 Coordinated Genesis Mesh v0.63.1 release. No functional changes.

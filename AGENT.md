@@ -23,7 +23,14 @@ sdk-rust/
     consensus.rs   # ConsensusClient
     data_usage.rs  # DataUsageClient
     disclosure.rs  # DisclosureClient
-    evidence.rs    # EvidenceClient
+    evidence.rs    # EvidenceClient (trust evidence)
+    evidence_store.rs # EvidenceStoreClient, ResourceHead
+    policy.rs      # PolicyClient (boundary policies)
+    health.rs      # HealthClient
+    canonical.rs   # canonical bodies, digests, Pydantic timestamps (pure)
+    verify.rs      # offline verification, Python reason codes (pure)
+    execution.rs   # ExecutionRecorder, secret-material guard
+    governance.rs  # governed_action, summarize_decision
     lib.rs         # public exports
   Cargo.toml
 ```
@@ -33,7 +40,9 @@ sdk-rust/
 Mirror the other official SDKs:
 
 ```text
-auth.rs      = pure crypto: canonical JSON, Ed25519 seed loading, admin headers
+auth.rs      = pure crypto: canonical JSON, digests, Ed25519 signing and verification, admin headers
+canonical.rs = model canonical forms and digests (pure, no keys)
+verify.rs    = offline verification (pure, no network)
 client.rs    = HTTP transport and client composition
 errors.rs    = typed SDK errors only
 {domain}.rs  = thin route wrappers over HttpTransport
