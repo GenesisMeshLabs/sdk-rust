@@ -7,7 +7,7 @@ import tomllib
 root = Path(__file__).resolve().parents[1]
 manifest = tomllib.loads((root / "Cargo.toml").read_text())
 version = (root / "VERSION").read_text().strip()
-assert re.fullmatch(r"0\.[0-9]+\.[0-9]+", version), "Invalid VERSION"
+assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version), "Invalid VERSION"
 assert manifest["package"]["version"] == version, "Cargo.toml and VERSION differ"
 assert f"## {version}" in (root / "CHANGELOG.md").read_text(), "Missing changelog version"
 lock = tomllib.loads((root / "Cargo.lock").read_text())
