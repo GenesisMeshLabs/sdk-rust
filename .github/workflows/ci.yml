@@ -108,3 +108,27 @@ jobs:
               fi
             fi
             echo "Release train verified: $version (core $core)"
+
+  github-release:
+    if: github.ref_type == 'tag'
+    needs: [test, release-checks, release-train]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "Release $tag already exists"
+            exit 0
+          fi
+          awk -v v="$version" '/^## /{ if (p) exit; if (index($0, "[" v "]") || index($0, "## " v " ")) p = 1; next } p' CHANGELOG.md > release-notes.md
+          [ -s release-notes.md ] || echo "Coordinated Genesis Mesh $tag release." > release-notes.md
+          gh release create "$tag" --title "$tag" --notes-file release-notes.md --verify-tag
