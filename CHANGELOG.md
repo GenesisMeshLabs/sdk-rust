@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.65.0 - 2026-10-04
+
+Coordinated Genesis Mesh v0.65.0 release. No functional changes.
+
 ## 0.64.1 - 2026-10-03
 
 Coordinated Genesis Mesh v0.64.1 release. No functional changes.
