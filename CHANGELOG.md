@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.2 - 2026-10-05
+
+Coordinated Genesis Mesh v1.0.2 release: fixes from external testing.
+
+### Changed
+
+- **Admin signatures cover the whole request (signature version 2):** the
+  client signs the HTTP method, the decoded path, the query parameters and the
+  target NA's public key, read once from `/sovereign.json` or given with
+  `ClientOptions::with_audience`. Network Authorities from 1.0.2 accept only
+  version 2 by default.
+- **Breaking:** `build_admin_headers` takes an
+  `AdminRequest` (`method`, `path`, `query`, `audience`, `body`) instead of a
+  body, and `ClientOptions` has a new public `audience` field. New:
+  `admin_signing_payload`, `build_admin_headers_at`, `ADMIN_SIGNATURE_VERSION`.
+  Shared conformance vectors: `tests/fixtures/admin_auth.json`.
+
 ## 1.0.1 - 2026-10-04
 
 Coordinated Genesis Mesh v1.0.1 release: gateway console fixes. No changes in

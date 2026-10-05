@@ -42,11 +42,28 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+      # A coordinated change is tested against the core branch of the same
+      # name when it exists, and against main otherwise.
+      - name: Choose the core revision
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          ref=main
+          if git ls-remote --exit-code --heads https://github.com/GenesisMeshLabs/genesismesh.git "refs/heads/$BRANCH" > /dev/null; then ref="$BRANCH"; fi
+          echo "Testing with core revision: $ref"
+          echo "CORE_REF=$ref" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           repository: GenesisMeshLabs/genesismesh
-          ref: main
+          ref: ${{ env.CORE_REF }}
           path: core
+      - name: The signing vectors are the core's
+        run: |
+          if [ -f core/conformance/vectors/admin_auth.json ]; then
+            cmp core/conformance/vectors/admin_auth.json tests/fixtures/admin_auth.json
+          else
+            echo "::notice::The core revision has no admin_auth vectors yet; skipped."
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v7
         with:

@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::{
     agreement::AgreementClient,
     attestation::AttestationClient,
-    auth::{build_admin_headers, load_signing_key},
+    auth::{build_admin_headers, load_signing_key, AdminRequest},
     boundary::BoundaryClient,
     consensus::ConsensusClient,
     data_usage::DataUsageClient,
@@ -32,6 +32,10 @@ pub struct ClientOptions {
     pub key_id: Option<String>,
     /// Request timeout. Defaults to 10 seconds.
     pub timeout: Option<Duration>,
+    /// The NA's public key, which admin signatures name as their audience
+    /// (signature version 2). When `None` it is read once from `/sovereign.json`
+    /// (`network_authority.public_key`).
+    pub audience: Option<String>,
 }
 
 impl std::fmt::Debug for ClientOptions {
@@ -44,6 +48,7 @@ impl std::fmt::Debug for ClientOptions {
             )
             .field("key_id", &self.key_id)
             .field("timeout", &self.timeout)
+            .field("audience", &self.audience)
             .finish()
     }
 }
@@ -56,7 +61,15 @@ impl ClientOptions {
             signing_key_base64: None,
             key_id: None,
             timeout: None,
+            audience: None,
         }
+    }
+
+    /// Name the NA's public key for admin signatures instead of reading it
+    /// (`network_authority.public_key`) from `/sovereign.json`.
+    pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
+        self.audience = Some(audience.into());
+        self
     }
 
     /// Attach a base64 Ed25519 seed for admin routes.
@@ -85,6 +98,7 @@ pub struct HttpTransport {
     http: reqwest::Client,
     signing_key: Option<SigningKey>,
     key_id: String,
+    audience: std::sync::Mutex<Option<String>>,
 }
 
 impl HttpTransport {
@@ -139,15 +153,58 @@ impl HttpTransport {
             http,
             signing_key,
             key_id,
+            audience: std::sync::Mutex::new(options.audience),
         })
     }
 
-    fn admin_headers(&self, body: &Value) -> Result<HeaderMap> {
+    /// The NA's public key for admin signatures, read once from `/sovereign.json`.
+    async fn admin_audience(&self) -> Result<String> {
+        if let Some(audience) = self.audience.lock().expect("audience lock").clone() {
+            return Ok(audience);
+        }
+        // Fetched directly (not through `get`, which signs admin requests).
+        let response = self.http.get(self.url("/sovereign.json")?).send().await?;
+        let status = response.status().as_u16();
+        let bytes = response.bytes().await?;
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let public_key = body
+            .pointer("/network_authority/public_key")
+            .and_then(Value::as_str)
+            .filter(|key| status == 200 && !key.is_empty())
+            .ok_or_else(|| GenesisMeshError::Http {
+                status,
+                message: "could not read the NA public key from /sovereign.json".into(),
+                code: "na_public_key_unavailable".into(),
+            })?
+            .to_owned();
+        *self.audience.lock().expect("audience lock") = Some(public_key.clone());
+        Ok(public_key)
+    }
+
+    async fn admin_headers(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(String, String)],
+        body: &Value,
+    ) -> Result<HeaderMap> {
         let signing_key = self
             .signing_key
             .as_ref()
             .ok_or(GenesisMeshError::MissingSigningKey)?;
-        let admin_headers = build_admin_headers(body, &self.key_id, signing_key)?;
+        let audience = self.admin_audience().await?;
+        // Segments are percent-encoded on the wire; the NA verifies the decoded path.
+        let decoded = percent_encoding::percent_decode_str(path)
+            .decode_utf8()
+            .map_err(|_| GenesisMeshError::Configuration("route is not UTF-8".into()))?;
+        let request = AdminRequest {
+            method,
+            path: &decoded,
+            query,
+            audience: &audience,
+            body,
+        };
+        let admin_headers = build_admin_headers(&request, &self.key_id, signing_key)?;
         let mut headers = HeaderMap::new();
         for (name, value) in [
             ("X-Admin-Key-Id", &admin_headers.key_id),
@@ -170,7 +227,7 @@ impl HttpTransport {
         T: DeserializeOwned,
     {
         let body = serde_json::to_value(body)?;
-        let headers = self.admin_headers(&body)?;
+        let headers = self.admin_headers("POST", path, &[], &body).await?;
         self.post(path, body, headers).await
     }
 
@@ -223,7 +280,7 @@ impl HttpTransport {
         }
         let mut request = self.http.get(url);
         if admin {
-            request = request.headers(self.admin_headers(&json!({}))?);
+            request = request.headers(self.admin_headers("GET", path, query, &json!({})).await?);
         }
         Ok(request.send().await?)
     }

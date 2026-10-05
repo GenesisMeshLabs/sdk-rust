@@ -6,8 +6,8 @@ use std::{collections::HashMap, time::Duration};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signature, SigningKey};
 use genesis_mesh_sdk::{
-    canonical_json, governed_action, json, ActionError, ActionReport, ClientOptions,
-    ExecutionRecorder, GenesisMeshClient, GenesisMeshError, GovernedActionParams,
+    admin_signing_payload, governed_action, json, ActionError, ActionReport, AdminRequest,
+    ClientOptions, ExecutionRecorder, GenesisMeshClient, GenesisMeshError, GovernedActionParams,
     GovernedVerification, PriorResource, ResourceHead, Value,
 };
 use tokio::{
@@ -108,14 +108,35 @@ fn client(url: &str) -> GenesisMeshClient {
     GenesisMeshClient::new(
         ClientOptions::new(url)
             .with_signing_key(STANDARD.encode([7; 32]))
-            .with_key_id("test-key"),
+            .with_key_id("test-key")
+            // Admin signatures name the NA's sovereign ID; the mock NA is "TEST".
+            .with_audience("TEST"),
     )
     .unwrap()
 }
 
 fn assert_admin(request: &Request, signed_body: &Value) {
     assert_eq!(request.headers["x-admin-key-id"], "test-key");
-    let payload = json!({"body": signed_body, "key_id": "test-key", "nonce": request.headers["x-admin-nonce"], "timestamp": request.headers["x-admin-timestamp"]});
+    // Signature version 2: method, decoded path, query and audience are signed.
+    let sent = reqwest::Url::parse(&format!("http://na{}", request.target)).unwrap();
+    let path = percent_encoding::percent_decode_str(sent.path())
+        .decode_utf8()
+        .unwrap()
+        .into_owned();
+    let query: Vec<(String, String)> = sent.query_pairs().into_owned().collect();
+    let payload = admin_signing_payload(
+        &AdminRequest {
+            method: &request.method,
+            path: &path,
+            query: &query,
+            audience: "TEST",
+            body: signed_body,
+        },
+        "test-key",
+        &request.headers["x-admin-timestamp"],
+        &request.headers["x-admin-nonce"],
+    )
+    .unwrap();
     let signature = Signature::from_slice(
         &STANDARD
             .decode(&request.headers["x-admin-signature"])
@@ -124,7 +145,7 @@ fn assert_admin(request: &Request, signed_body: &Value) {
     .unwrap();
     SigningKey::from_bytes(&[7; 32])
         .verifying_key()
-        .verify_strict(canonical_json(&payload).unwrap().as_bytes(), &signature)
+        .verify_strict(payload.as_bytes(), &signature)
         .unwrap();
 }
 
