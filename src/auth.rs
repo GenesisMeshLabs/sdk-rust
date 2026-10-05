@@ -115,22 +115,87 @@ fn python_float(value: f64) -> String {
     }
 }
 
-/// Build the four admin auth headers for an admin request body.
+/// The admin signature format this SDK produces (Genesis Mesh 1.0.2).
+pub const ADMIN_SIGNATURE_VERSION: u64 = 2;
+
+/// What an admin signature binds (signature version 2).
+#[derive(Debug, Clone, Copy)]
+pub struct AdminRequest<'a> {
+    /// HTTP method, e.g. `POST`.
+    pub method: &'a str,
+    /// The path the Network Authority serves, decoded, without the query string.
+    pub path: &'a str,
+    /// Query parameters as sent, in order.
+    pub query: &'a [(String, String)],
+    /// The target NA's public key (`network_authority.public_key` in its `/sovereign.json`).
+    pub audience: &'a str,
+    /// JSON body; requests without one sign `{}`.
+    pub body: &'a Value,
+}
+
+/// The canonical JSON an operator signs for `request` (signature version 2).
+pub fn admin_signing_payload(
+    request: &AdminRequest<'_>,
+    key_id: &str,
+    timestamp: &str,
+    nonce: &str,
+) -> Result<String> {
+    // A decoded path may itself contain '?' (from %3F); query parameters go in `query`.
+    if !request.path.starts_with('/') {
+        return Err(GenesisMeshError::Configuration(
+            "admin request path must start with /".into(),
+        ));
+    }
+    let mut query = serde_json::Map::new();
+    for (name, value) in request.query {
+        query
+            .entry(name.clone())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .expect("query values are arrays")
+            .push(Value::String(value.clone()));
+    }
+    let body = if request.body.is_null() {
+        json!({})
+    } else {
+        request.body.clone()
+    };
+    canonical_json(&json!({
+        "v": ADMIN_SIGNATURE_VERSION,
+        "method": request.method.to_ascii_uppercase(),
+        "path": request.path,
+        "query": Value::Object(query),
+        "audience": request.audience,
+        "body": body,
+        "key_id": key_id,
+        "timestamp": timestamp,
+        "nonce": nonce,
+    }))
+}
+
+/// Build the four admin auth headers for one admin request (signature version 2).
 pub fn build_admin_headers(
-    body: &Value,
+    request: &AdminRequest<'_>,
     key_id: &str,
     signing_key: &SigningKey,
 ) -> Result<AdminHeaders> {
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let nonce = Uuid::new_v4().to_string();
-    let payload = serde_json::json!({
-        "body": body,
-        "key_id": key_id,
-        "nonce": nonce,
-        "timestamp": timestamp,
-    });
-    let canonical = canonical_json(&payload)?;
+    build_admin_headers_at(request, key_id, signing_key, &timestamp, &nonce)
+}
+
+/// `build_admin_headers` with a fixed timestamp and nonce, for reproducing a
+/// signature (tests and conformance vectors).
+pub fn build_admin_headers_at(
+    request: &AdminRequest<'_>,
+    key_id: &str,
+    signing_key: &SigningKey,
+    timestamp: &str,
+    nonce: &str,
+) -> Result<AdminHeaders> {
+    let canonical = admin_signing_payload(request, key_id, timestamp, nonce)?;
     let signature = signing_key.sign(canonical.as_bytes());
+    let (timestamp, nonce) = (timestamp.to_owned(), nonce.to_owned());
 
     Ok(AdminHeaders {
         key_id: key_id.to_owned(),
@@ -245,7 +310,15 @@ mod tests {
     fn build_admin_headers_returns_required_fields() {
         let seed = general_purpose::STANDARD.encode([0_u8; 32]);
         let key = load_signing_key(&seed).unwrap();
-        let headers = build_admin_headers(&json!({"foo": "bar"}), "operator-local", &key).unwrap();
+        let body = json!({"foo": "bar"});
+        let request = AdminRequest {
+            method: "POST",
+            path: "/admin/invite",
+            query: &[],
+            audience: "TEST",
+            body: &body,
+        };
+        let headers = build_admin_headers(&request, "operator-local", &key).unwrap();
 
         assert_eq!(headers.key_id, "operator-local");
         assert!(!headers.signature.is_empty());

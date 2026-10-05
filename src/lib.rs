@@ -22,8 +22,9 @@ pub mod verify;
 pub use agreement::AgreementClient;
 pub use attestation::AttestationClient;
 pub use auth::{
-    build_admin_headers, canonical_digest, canonical_json, load_signing_key, public_key_from_seed,
-    sign_canonical, verify_canonical, AdminHeaders,
+    admin_signing_payload, build_admin_headers, build_admin_headers_at, canonical_digest,
+    canonical_json, load_signing_key, public_key_from_seed, sign_canonical, verify_canonical,
+    AdminHeaders, AdminRequest, ADMIN_SIGNATURE_VERSION,
 };
 pub use boundary::BoundaryClient;
 pub use client::{ClientOptions, GenesisMeshClient, HttpTransport};

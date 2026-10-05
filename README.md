@@ -182,13 +182,19 @@ and `public_get` methods. Route paths start with `/`.
 | `X-Admin-Timestamp` | UTC ISO 8601 timestamp with milliseconds |
 | `X-Admin-Nonce` | Fresh UUID v4 for each signed request |
 
-The signed payload is `{body, key_id, nonce, timestamp}`, serialized to match the
-server's Python `json.dumps(..., sort_keys=True, separators=(",", ":"))`, including
-ASCII escaping and float formatting. Tests include Python-generated fixtures.
-Maintain an accurate system clock so the server accepts timestamps.
+The signed payload (signature version 2, 1.0.2) is
+`{v: 2, method, path, query, audience, body, key_id, timestamp, nonce}`: the HTTP
+method, the decoded request path, the query parameters, the target NA's public
+key and the JSON body, serialized to match the server's Python
+`json.dumps(..., sort_keys=True, separators=(",", ":"))`, including ASCII escaping
+and float formatting. The client reads the NA's public key
+(`network_authority.public_key`) once from its public `/sovereign.json`, or uses `ClientOptions::with_audience`. Tests include
+Python-generated fixtures and the shared `admin_auth.json` vectors. Maintain an
+accurate system clock so the server accepts timestamps.
 
-`load_signing_key`, `canonical_json`, and `build_admin_headers` are available for
-custom integrations. When using raw headers, send the same JSON body that was
+`load_signing_key`, `canonical_json`, `admin_signing_payload`, and
+`build_admin_headers` (with an `AdminRequest`) are available for custom
+integrations. When using raw headers, send the same JSON body that was
 signed. `ClientOptions` debug output redacts the seed.
 
 ## Development and release
