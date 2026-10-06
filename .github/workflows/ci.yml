@@ -29,8 +29,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ matrix.rust }}
       - run: cargo test --locked --all-targets
@@ -41,8 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      # A coordinated change is tested against the core branch of the same
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # name when it exists, and against main otherwise.
       - name: Choose the core revision
         env:
@@ -52,7 +51,7 @@ jobs:
           if git ls-remote --exit-code --heads https://github.com/GenesisMeshLabs/genesismesh.git "refs/heads/$BRANCH" > /dev/null; then ref="$BRANCH"; fi
           echo "Testing with core revision: $ref"
           echo "CORE_REF=$ref" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: GenesisMeshLabs/genesismesh
           ref: ${{ env.CORE_REF }}
@@ -64,8 +63,10 @@ jobs:
           else
             echo "::notice::The core revision has no admin_auth vectors yet; skipped."
           fi
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v7
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # stable
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - run: python -m pip install -e ./core
@@ -78,11 +79,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - run: python scripts/check_release.py
@@ -98,7 +100,7 @@ jobs:
   release-train:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify release train (Genesis Mesh core leads every version)
         shell: bash
         run: |
@@ -134,7 +136,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
