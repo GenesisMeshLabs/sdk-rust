@@ -37,9 +37,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Run the equivalent checked example with `cargo run --example get_policy`.
 Use HTTPS when connecting to a remote Network Authority.
 
+## Local Network Authority
+
+To develop against a governed Network Authority on your machine (policies
+required, a privileged key for setup and a standard key for your controller),
+see [Develop Against a Local Network Authority](https://docs.genesismesh.org/sdk/local-network-authority.html).
+It needs `genesis-mesh` 1.2.0 or later from PyPI.
+
 ## Admin requests
 
-Register the operator public key with the Network Authority first. `OPERATOR_KEY`
+Register the operator public key with the Network Authority first (for a local
+Network Authority, `genesis-mesh keygen operator --env-file` does it). `OPERATOR_KEY`
 is the standard base64 encoding of the **32-byte Ed25519 seed**, with or without
 padding; PEM files and 64-byte keypairs are not accepted. Keep the seed in a secret
 store or environment variable, outside source control.
