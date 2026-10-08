@@ -5,6 +5,15 @@
 Coordinated Genesis Mesh v1.1.0 release: signed container images and a local
 governed Network Authority. No API change in this SDK.
 
+### Fixed
+
+- `ExecutionRecorder` no longer stamps evidence before its decision. Evidence
+  recorded in the decision's millisecond, or on a host whose clock is behind
+  the Network Authority's, could come out before `decision_made_at`, and the
+  NA refused it with `evidence_outside_decision_window`. Without an explicit
+  `executed_at`, the recorder now uses the later of the clock and the
+  decision time. An explicit `executed_at` is signed unchanged.
+
 ### Changed
 
 - The README links *Develop Against a Local Network Authority*: a governed
