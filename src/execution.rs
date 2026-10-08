@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{load_signing_key, sign_canonical},
-    canonical::{execution_canonical, execution_digest, python_timestamp},
+    canonical::{execution_canonical, execution_digest, parse_timestamp, python_timestamp},
     errors::{GenesisMeshError, Result},
     evidence_store::ResourceHead,
 };
@@ -173,10 +173,22 @@ pub struct RecordExecution {
     pub resource_action: Option<String>,
     /// Previous record for the same resource, from any decision; `None` for its first record.
     pub prior_resource: Option<PriorResource>,
-    /// Execution time. Defaults to now.
+    /// Execution time. Defaults to now, but never before the decision's
+    /// `decision_made_at`. An explicit value is signed as given.
     pub executed_at: Option<DateTime<Utc>>,
     /// Record id. Defaults to a random UUID.
     pub evidence_id: Option<String>,
+}
+
+/// `now`, but never before the decision (1.1.0). The NA refuses evidence
+/// stamped before `decision_made_at`, which a host whose clock is behind the
+/// NA's produced for any action quicker than the skew.
+fn not_before_decision(now: DateTime<Utc>, decision: &Value) -> DateTime<Utc> {
+    decision
+        .get("decision_made_at")
+        .and_then(Value::as_str)
+        .and_then(|at| parse_timestamp(at).ok())
+        .map_or(now, |decided| now.max(decided))
 }
 
 /// Builds and signs ExecutionEvidence for one executor.
@@ -276,9 +288,9 @@ impl ExecutionRecorder {
         record.insert("execution_parameters".into(), execution_parameters);
         record.insert(
             "executed_at".into(),
-            json!(python_timestamp(
-                params.executed_at.unwrap_or_else(Utc::now)
-            )),
+            json!(python_timestamp(params.executed_at.unwrap_or_else(|| {
+                not_before_decision(Utc::now(), &params.decision)
+            }))),
         );
         record.insert(
             "outcome".into(),
@@ -324,6 +336,54 @@ impl ExecutionRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(value: &str) -> DateTime<Utc> {
+        parse_timestamp(value).unwrap()
+    }
+
+    #[test]
+    fn executed_at_is_never_before_the_decision() {
+        let decision = json!({"decision_made_at": "2026-10-08T05:17:04.391773Z"});
+        // Clock behind the NA's: the decision time.
+        assert_eq!(
+            not_before_decision(at("2026-10-08T05:17:02Z"), &decision),
+            at("2026-10-08T05:17:04.391773Z")
+        );
+        // Clock past the decision: the clock.
+        assert_eq!(
+            not_before_decision(at("2026-10-08T05:17:05.5Z"), &decision),
+            at("2026-10-08T05:17:05.5Z")
+        );
+        // No usable decision time: the clock.
+        assert_eq!(
+            not_before_decision(at("2026-10-08T05:17:02Z"), &json!({})),
+            at("2026-10-08T05:17:02Z")
+        );
+    }
+
+    #[test]
+    fn record_stamps_a_future_decision_time_and_keeps_an_explicit_one() {
+        let recorder = ExecutionRecorder::new("executor", "executor-key", &"A".repeat(43)).unwrap();
+        let future = "2999-01-01T00:00:00.123456Z";
+        let decision = json!({
+            "decision_id": "d", "context_id": "c", "agreement_id": "a",
+            "decision_made_at": future,
+        });
+        let params = || RecordExecution {
+            decision: decision.clone(),
+            executed_capability: "sp-secret.rotate".into(),
+            ..Default::default()
+        };
+        assert_eq!(recorder.record(params()).unwrap()["executed_at"], future);
+        let explicit = RecordExecution {
+            executed_at: Some(at("2026-10-08T05:17:02Z")),
+            ..params()
+        };
+        assert_eq!(
+            recorder.record(explicit).unwrap()["executed_at"],
+            "2026-10-08T05:17:02Z"
+        );
+    }
 
     #[test]
     fn refuses_secret_metadata_and_allows_identifiers() {
