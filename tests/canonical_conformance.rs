@@ -76,4 +76,18 @@ fn names_timestamp_paths_at_any_depth() {
 fn export_lines_are_read_strictly() {
     let err = parse_export_lines(r#"{"schema":"gm.evidence.event","schema":"x"}"#).unwrap_err();
     assert_eq!(err.code(), "duplicate_key");
+    // Only JSON whitespace is stripped around a line.
+    assert!(parse_export_lines(" \t\r\n").unwrap().is_empty());
+    assert_eq!(
+        parse_export_lines("\u{a0}{}").unwrap_err().code(),
+        "invalid_json"
+    );
+}
+
+#[test]
+fn long_non_ascii_strings_are_read_in_linear_time() {
+    let text = format!("[\"{}\"]", "\u{e9}".repeat(1_000_000));
+    let started = std::time::Instant::now();
+    parse_strict_json(&text).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }

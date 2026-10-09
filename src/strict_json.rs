@@ -6,7 +6,8 @@
 //! .NET keeps both, and reads an integer beyond 64 bits as a float, which the
 //! other implementations keep exact. Such input is refused here, as in every
 //! implementation, by a named reason (the conformance suite `canonical`):
-//! `invalid_json` (not JSON, including `NaN`), `duplicate_key`,
+//! `invalid_json` (not JSON, including `NaN`, a byte order mark, text that is
+//! not UTF-8, and arrays or objects nested more than 64 deep), `duplicate_key`,
 //! `non_finite_number` (`1e400`), `integer_out_of_range` (outside
 //! `-2**63 .. 2**64 - 1`), `negative_zero` (the integer `-0`) and
 //! `lone_surrogate`.
@@ -25,13 +26,15 @@ fn refuse(reason: &str, detail: impl Into<String>) -> GenesisMeshError {
 }
 
 struct Scanner<'a> {
+    src: &'a str,
     text: &'a [u8],
     at: usize,
     depth: usize,
 }
 
-/// Deeper nesting is refused as `invalid_json` (serde_json's own limit is 128).
-const MAX_DEPTH: usize = 128;
+/// Arrays and objects nested deeper are refused as `invalid_json`, as in every
+/// implementation (.NET's reader stops there by default).
+pub const MAX_DEPTH: usize = 64;
 
 impl Scanner<'_> {
     fn peek(&self) -> Option<u8> {
@@ -91,9 +94,8 @@ impl Scanner<'_> {
                     &buf[..1]
                 }
                 _ => {
-                    let rest = std::str::from_utf8(&self.text[self.at..])
-                        .map_err(|_| refuse("invalid_json", "text that is not UTF-8"))?;
-                    let c = rest.chars().next().expect("a character");
+                    // `at` is always on a character boundary of the source text.
+                    let c = self.src[self.at..].chars().next().expect("a character");
                     self.at += c.len_utf8();
                     c.encode_utf16(&mut buf)
                 }
@@ -270,7 +272,10 @@ impl Scanner<'_> {
     fn nest(&mut self) -> Result<()> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
-            return Err(refuse("invalid_json", "nested too deeply"));
+            return Err(refuse(
+                "invalid_json",
+                format!("arrays or objects nested more than {MAX_DEPTH} deep"),
+            ));
         }
         Ok(())
     }
@@ -280,6 +285,7 @@ impl Scanner<'_> {
 /// [`GenesisMeshError::StrictJson`] with the reason.
 pub fn check_strict_json(text: &str) -> Result<()> {
     let mut scanner = Scanner {
+        src: text,
         text: text.as_bytes(),
         at: 0,
         depth: 0,

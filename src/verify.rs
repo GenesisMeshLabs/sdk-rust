@@ -117,7 +117,9 @@ validator!(
             ("context_id", string()),
             ("agreement_id", string()),
             ("authorized", boolean()),
-            ("denial_reason", nullable(string())),
+            // Absent is read as absent, so a decision whose signature covers a
+            // null fails at the signature, as in every implementation.
+            ("denial_reason", optional(nullable(string()))),
             (
                 "gate_results",
                 array(shape(
@@ -134,7 +136,7 @@ validator!(
             ("operator_sovereign_id", string()),
             (
                 "freshness_proof",
-                nullable(shape(
+                optional(nullable(shape(
                     vec![
                         ("proof_id", string()),
                         ("feed_sovereign_id", string()),
@@ -146,7 +148,7 @@ validator!(
                         ("signature", optional(signature())),
                     ],
                     false
-                ))
+                )))
             ),
             (
                 "policy_binding",
@@ -871,7 +873,13 @@ fn check_payload_fields(
 /// Parse `gm.evidence.event` JSON Lines (blank lines ignored).
 pub fn parse_export_lines(text: &str) -> Result<Vec<Value>> {
     let mut events = Vec::new();
-    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+    // JSON whitespace only, as every implementation (`trim` also removes other spaces).
+    let json_space = |c: char| matches!(c, ' ' | '\t' | '\r' | '\n');
+    for line in text
+        .lines()
+        .map(|l| l.trim_matches(json_space))
+        .filter(|l| !l.is_empty())
+    {
         let event = crate::strict_json::parse_strict_json(line)?;
         if !valid_event(Some(&event)) {
             return Err(GenesisMeshError::Verification(
