@@ -11,10 +11,10 @@ use uuid::Uuid;
 
 use crate::{
     boundary::BoundaryClient,
-    errors::{GenesisMeshError, Result},
+    errors::{ActionValue, GenesisMeshError, Result},
     evidence_store::EvidenceStoreClient,
     execution::{check_metadata_only, ExecutionRecorder, PriorResource, RecordExecution},
-    outbox::Submission,
+    outbox::OutboxEntry,
     verify::{verify_boundary_decision, VerifyDecisionOptions},
 };
 
@@ -153,6 +153,7 @@ pub struct GovernedActionParams {
 
 /// Outcome of [`governed_action`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GovernedActionResult<T> {
     /// `{decision, justification}` from the NA.
     pub evaluation: Value,
@@ -164,13 +165,35 @@ pub struct GovernedActionResult<T> {
     pub value: Option<T>,
     /// The signed execution evidence, when the action ran.
     pub evidence: Option<Value>,
-    /// What happened to the evidence (v1.2.0): admitted by the NA, or kept
-    /// in the outbox as pending or as a dead letter. A failed submission is
-    /// not an error.
-    pub submission: Option<Submission>,
+    /// The NA's acknowledgement of the evidence, when it admitted it.
+    pub submission: Option<Value>,
+    /// With an outbox (v1.2.0): the outbox entry holding the evidence when
+    /// the NA has not admitted it, pending for `flush_pending` or a dead
+    /// letter when it was refused. A failed submission then is not an error.
+    pub queued: Option<OutboxEntry>,
 }
 
 const GUARD_NOTE: &str = "secret guard dropped";
+
+/// The note naming what the guard dropped: plain field names only, others
+/// counted.
+fn guard_note(dropped: &[String]) -> String {
+    let nameable = |d: &String| {
+        !d.is_empty()
+            && d.len() <= 64
+            && d.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+    };
+    let mut parts: Vec<String> = dropped.iter().filter(|d| nameable(d)).cloned().collect();
+    let others = dropped.len() - parts.len();
+    if others > 0 {
+        parts.push(format!(
+            "{others} other field{}",
+            if others == 1 { "" } else { "s" }
+        ));
+    }
+    format!("[{GUARD_NOTE}: {}]", parts.join(", "))
+}
 
 /// Reported metadata without the parts the secret guard refuses.
 #[derive(Debug, Clone, PartialEq)]
@@ -202,6 +225,7 @@ pub fn without_refused_metadata(
             dropped.push(key.clone());
         }
     }
+    let outcome_detail_given = outcome_detail.is_some();
     let detail = outcome_detail.filter(|d| check_metadata_only(&json!({}), Some(d)).is_none());
     if outcome_detail.is_some() && detail.is_none() {
         dropped.push("outcome_detail".into());
@@ -214,7 +238,7 @@ pub fn without_refused_metadata(
         kept.clear();
     }
     dropped.sort();
-    let note = format!("[{GUARD_NOTE}: {}]", dropped.join(", "));
+    let note = guard_note(&dropped);
     let outcome_detail = match detail {
         Some(detail) if !dropped.iter().any(|d| d == "outcome_detail") => {
             format!("{detail} {note}")
@@ -222,10 +246,15 @@ pub fn without_refused_metadata(
         _ => note,
     };
     if check_metadata_only(&Value::Object(kept.clone()), Some(&outcome_detail)).is_some() {
+        let mut all: Vec<String> = params.keys().cloned().collect();
+        if outcome_detail_given {
+            all.push("outcome_detail".into());
+        }
+        all.sort();
         return RefusedMetadata {
             execution_parameters: json!({}),
             outcome_detail: format!("[{GUARD_NOTE}]"),
-            dropped,
+            dropped: all,
         };
     }
     RefusedMetadata {
@@ -279,20 +308,21 @@ fn check_decision(decision: &Value, params: &GovernedActionParams, context_id: &
     Ok(())
 }
 
-/// Evaluate, run `action` only on a verified ALLOW, then sign the execution
-/// evidence linked to the resource chain, keep it in the outbox and submit
-/// it. A DENY returns `authorized: false` without running the action. If the
-/// action fails, a `failure` record is kept and submitted the same way and
-/// [`GenesisMeshError::ActionFailed`] is returned with the action's error.
+/// Evaluate, run `action` only on a verified ALLOW, then sign and submit the
+/// execution evidence linked to the resource chain. A DENY returns
+/// `authorized: false` without running the action. If the action fails, a
+/// `failure` record is submitted and [`GenesisMeshError::ActionFailed`] is
+/// returned with the action's error.
 ///
-/// A failed submission is not an error (v1.2.0): the result's `submission`
-/// is [`Submission::Pending`] or [`Submission::DeadLettered`], and
-/// [`EvidenceStoreClient::flush_pending`] submits pending records later. A
-/// resource with pending records chains from the newest of them, not from the
-/// NA's head. A guard refusal after the action is
-/// [`GenesisMeshError::MetadataRefused`]; an outbox failure after it is
-/// [`GenesisMeshError::EvidenceNotKept`]; both carry the action's value.
-/// Requires an outbox ([`ClientOptions::with_outbox`](crate::ClientOptions::with_outbox)).
+/// With an outbox ([`ClientOptions::with_outbox`](crate::ClientOptions::with_outbox),
+/// v1.2.0) every record is kept until the NA admits it, and a failed
+/// submission is not an error: the result's `queued` is the outbox entry,
+/// which [`EvidenceStoreClient::flush_pending`] submits later. A resource with
+/// pending records chains from the newest of them, not from the NA's head. A
+/// guard refusal after the action records the outcome without the refused
+/// fields and returns [`GenesisMeshError::MetadataRefused`]; a failure to
+/// keep the record returns [`GenesisMeshError::EvidenceNotKept`]. Both carry
+/// the action's value.
 pub async fn governed_action<T, F, Fut>(
     boundary: &BoundaryClient,
     evidence_store: &EvidenceStoreClient,
@@ -301,7 +331,7 @@ pub async fn governed_action<T, F, Fut>(
     action: F,
 ) -> Result<GovernedActionResult<T>>
 where
-    T: Send + Sync + 'static,
+    T: Send + 'static,
     F: FnOnce(Value) -> Fut,
     Fut: Future<Output = std::result::Result<ActionReport<T>, ActionError>>,
 {
@@ -315,8 +345,11 @@ where
             "verification_keys_required".into(),
         ));
     }
-    if evidence_store.outbox().is_none() {
-        return Err(GenesisMeshError::OutboxRequired);
+    let outbox = evidence_store.outbox();
+    if let Some(outbox) = outbox {
+        // An outbox that cannot be read fails here, before anything is
+        // evaluated or run.
+        outbox.list().await.map_err(GenesisMeshError::Outbox)?;
     }
     let mut request = params.evaluate.clone();
     if !request.is_object() {
@@ -345,13 +378,17 @@ where
             value: None,
             evidence: None,
             submission: None,
+            queued: None,
         });
     }
 
     let prior = match (&params.resource_id, &params.prior_resource) {
         (None, _) => None,
         (Some(_), Some(prior)) => prior.clone(),
-        (Some(resource_id), None) => match evidence_store.pending_head(resource_id)? {
+        (Some(resource_id), None) => match match outbox {
+            Some(_) => evidence_store.pending_head(resource_id).await?,
+            None => None,
+        } {
             Some(pending) => Some(PriorResource::Record(pending)),
             None => evidence_store
                 .resource_head(resource_id)
@@ -386,19 +423,31 @@ where
         Ok(report) => report,
         Err(source) => {
             // The error text is not recorded: it may carry secret material.
-            let evidence = record(Some("failure".into()), None, Some("action failed".into()));
-            let kept = match &evidence {
-                Ok(evidence) => evidence_store.enqueue(evidence.clone()).await.map(|_| ()),
-                Err(_) => Ok(()),
+            let evidence = match record(Some("failure".into()), None, Some("action failed".into()))
+            {
+                Ok(evidence) => evidence,
+                Err(evidence_error) => {
+                    return Err(GenesisMeshError::ActionUnrecorded {
+                        source,
+                        evidence_error: Box::new(evidence_error),
+                        evidence: None,
+                    })
+                }
             };
-            return Err(match (evidence, kept) {
-                (Ok(_), Ok(())) => GenesisMeshError::ActionFailed { source },
-                (Err(evidence_error), _) => GenesisMeshError::ActionUnrecorded {
+            let kept = match outbox {
+                Some(_) => evidence_store
+                    .enqueue(evidence.clone())
+                    .await
+                    .map(|d| d.queued),
+                None => evidence_store.submit(evidence.clone()).await.map(|_| None),
+            };
+            return Err(match kept {
+                Ok(queued) => GenesisMeshError::ActionFailed {
                     source,
-                    evidence_error: Box::new(evidence_error),
-                    evidence: None,
+                    evidence: Some(Box::new(evidence)),
+                    queued: queued.map(Box::new),
                 },
-                (Ok(evidence), Err(evidence_error)) => GenesisMeshError::ActionUnrecorded {
+                Err(evidence_error) => GenesisMeshError::ActionUnrecorded {
                     source,
                     evidence_error: Box::new(evidence_error),
                     evidence: Some(Box::new(evidence)),
@@ -407,18 +456,32 @@ where
         }
     };
 
-    // The action ran: from here on its outcome is always recorded.
     let ActionReport {
         value,
         execution_parameters,
         outcome,
         outcome_detail,
     } = report;
+    if outbox.is_none() {
+        let evidence = record(outcome, execution_parameters, outcome_detail)?;
+        let submission = evidence_store.submit(evidence.clone()).await?;
+        return Ok(GovernedActionResult {
+            evaluation,
+            authorized: true,
+            summary,
+            value,
+            evidence: Some(evidence),
+            submission: Some(submission),
+            queued: None,
+        });
+    }
+
+    // The action ran: from here on its outcome is always recorded.
     let not_kept = |source: GenesisMeshError, evidence: Option<Value>, value: Option<T>| {
         GenesisMeshError::EvidenceNotKept {
             source: Box::new(source),
             evidence: evidence.map(Box::new),
-            value: value.map(|v| Box::new(v) as Box<dyn std::any::Any + Send + Sync>),
+            value: ActionValue::new(value),
         }
     };
     let (evidence, refused) = match record(
@@ -443,8 +506,8 @@ where
         }
         Err(err) => return Err(not_kept(err, None, value)),
     };
-    let submission = match evidence_store.enqueue(evidence.clone()).await {
-        Ok(submission) => submission,
+    let delivery = match evidence_store.enqueue(evidence.clone()).await {
+        Ok(delivery) => delivery,
         Err(err) => return Err(not_kept(err, Some(evidence), value)),
     };
     if let Some((reason, dropped)) = refused {
@@ -452,8 +515,9 @@ where
             reason,
             dropped,
             evidence: Box::new(evidence),
-            submission: Box::new(submission),
-            value: value.map(|v| Box::new(v) as Box<dyn std::any::Any + Send + Sync>),
+            submission: delivery.submission.map(Box::new),
+            queued: delivery.queued.map(Box::new),
+            value: ActionValue::new(value),
         });
     }
     Ok(GovernedActionResult {
@@ -462,6 +526,7 @@ where
         summary,
         value,
         evidence: Some(evidence),
-        submission: Some(submission),
+        submission: delivery.submission,
+        queued: delivery.queued,
     })
 }

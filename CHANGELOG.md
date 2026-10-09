@@ -2,42 +2,40 @@
 
 ## 1.2.0 - Unreleased
 
-### Changed (breaking)
-
-- **Signed evidence is kept until the NA admits it.** `governed_action`
-  writes each signed record to an evidence outbox before submitting it and
-  removes it once admitted. A failed submission is no longer an error:
-  `GovernedActionResult::submission` is now a `Submission`: `Admitted` with
-  the NA's acknowledgement, `Pending` after a transient error (network,
-  timeout, `5xx`, `429`, a lost race between NA instances) or `DeadLettered`
-  with the NA's code after a refusal (any other `4xx`). `governed_action`
-  requires an outbox (`ClientOptions::with_outbox`) and returns
-  `OutboxRequired` without one; its value type must be `Send + Sync +
-  'static`.
-- A failed action's record that cannot be submitted is kept and
-  `ActionFailed` is returned, instead of `ActionUnrecorded`, which now means
-  the record could not be signed or kept and carries it as `evidence`.
-- When the secret guard refuses metadata the action reported, the outcome is
-  still recorded with the accepted parameters, and `MetadataRefused`
-  (`governed_action_metadata_refused`) is returned with the evidence, its
-  submission, the `dropped` field names and the action's value. No record was
-  made before.
-- A governed action on a resource with pending records chains from the newest
-  of them rather than the NA's head.
-- `GenesisMeshError` is `#[non_exhaustive]`; `ClientOptions` has a new
-  `outbox` field.
-
 ### Added
 
-- `FileOutbox` (one file per record, synced and renamed into place, private
-  permissions, the TypeScript SDK's format), `MemoryOutbox` for tests, and the
-  `EvidenceOutbox` trait for other storage.
-- `EvidenceStoreClient::flush_pending`: submits pending records in order,
-  waits behind pending predecessors, dead-letters records whose predecessor
-  was refused, and backs off from 5 s to 15 minutes. `enqueue` and
-  `pending_head`.
-- `EvidenceNotKept` (`governed_action_evidence_unkept`), `Outbox` and
-  `OutboxRequired` errors, and `GenesisMeshError::action_value`.
+- **An evidence outbox keeps signed evidence until the NA admits it.** With
+  `ClientOptions::with_outbox`, `governed_action` writes each signed record to
+  the outbox before submitting it and removes it once admitted. A failed
+  submission then is not an error: `GovernedActionResult::queued` is the
+  outbox entry, pending after a failure a later attempt can overcome or a dead
+  letter after a refusal no retry can overcome (`PERMANENT_REFUSALS`). Dead
+  letters are kept, never dropped. A resource with pending records chains from
+  the newest of them, which the next action on it submits first. Without an
+  outbox, `governed_action` behaves as in 1.1.
+- `FileOutbox` (one file per record, synced and renamed into place, crash
+  leftovers recovered, private permissions on Unix, the TypeScript SDK's
+  format), `MemoryOutbox` for tests, and the `EvidenceOutbox` trait, whose
+  methods return boxed futures (`OutboxFuture`) so other storage can be
+  asynchronous.
+- `EvidenceStoreClient::flush_pending`, `enqueue` and `pending_head`.
+- With an outbox, a secret-guard refusal of the metadata an action reported
+  still records the outcome, with the accepted parameters and a note naming
+  the dropped ones, and returns `MetadataRefused`; a failure to keep the
+  record returns `EvidenceNotKept`. Both carry the action's value
+  (`GenesisMeshError::take_action_value`). `Outbox`, `OutboxRequired` and
+  `FlushInProgress` errors.
+
+### Changed (breaking)
+
+- `GenesisMeshError` and its `ActionFailed`, `ActionUnrecorded`,
+  `MetadataRefused` and `EvidenceNotKept` variants are `#[non_exhaustive]`:
+  match with a wildcard arm and `..`. `ActionFailed` carries the failure
+  record and its outbox entry; `ActionUnrecorded` carries the record when it
+  was signed.
+- `GovernedActionResult` is `#[non_exhaustive]` and gains `queued`.
+  `ClientOptions` gains `outbox`. `governed_action`'s value type must be
+  `Send + 'static`.
 
 ## 1.1.1 - 2026-10-09
 

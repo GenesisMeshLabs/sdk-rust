@@ -32,7 +32,7 @@ pub use client::{ClientOptions, GenesisMeshClient, HttpTransport};
 pub use consensus::ConsensusClient;
 pub use data_usage::DataUsageClient;
 pub use disclosure::DisclosureClient;
-pub use errors::{GenesisMeshError, Result};
+pub use errors::{ActionValue, GenesisMeshError, Result};
 pub use evidence::EvidenceClient;
 pub use evidence_store::{EvidenceStoreClient, FlushOptions, ResourceHead, MAX_PAGE};
 pub use execution::{
@@ -45,8 +45,9 @@ pub use governance::{
 };
 pub use health::HealthClient;
 pub use outbox::{
-    classify_submission_error, retry_delay, EvidenceOutbox, FileOutbox, FlushReport, MemoryOutbox,
-    OutboxEntry, OutboxState, Submission, SubmissionFailure, PREDECESSOR_DEAD_LETTERED,
+    classify_submission_error, retry_delay, Delivery, EvidenceOutbox, FileOutbox, FlushReport,
+    MemoryOutbox, OutboxEntry, OutboxFuture, OutboxState, SubmissionFailure, PERMANENT_REFUSALS,
+    PREDECESSOR_DEAD_LETTERED,
 };
 pub use policy::PolicyClient;
 pub use serde_json::{json, Value};

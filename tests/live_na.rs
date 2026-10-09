@@ -22,7 +22,7 @@ use genesis_mesh_sdk::{
     },
     ActionError, ActionReport, ClientOptions, EvidenceOutbox, ExecutionRecorder, FlushOptions,
     GenesisMeshClient, GenesisMeshError, GovernedActionParams, GovernedVerification, MemoryOutbox,
-    RecordExecution, Value,
+    OutboxState, RecordExecution, Value,
 };
 use uuid::Uuid;
 
@@ -71,12 +71,7 @@ fn live_na() -> Option<LiveNa> {
     let options = ClientOptions::new(config["baseUrl"].as_str().unwrap())
         .with_signing_key(config["signingKeyBase64"].as_str().unwrap())
         .with_key_id(config["keyId"].as_str().unwrap());
-    let client = GenesisMeshClient::new(
-        options
-            .clone()
-            .with_outbox(Arc::new(MemoryOutbox::default())),
-    )
-    .unwrap();
+    let client = GenesisMeshClient::new(options.clone()).unwrap();
     Some(LiveNa {
         client,
         options,
@@ -166,7 +161,7 @@ async fn keep_evidence_while_the_na_is_unreachable_and_admit_it_in_order(na: &Li
         .await
         .unwrap();
         assert_eq!(result.value, Some(version));
-        assert_eq!(result.submission.unwrap().status(), "pending");
+        assert_eq!(result.queued.unwrap().state, OutboxState::Pending);
         evidence.push(result.evidence.unwrap());
     }
     assert_eq!(
@@ -183,12 +178,12 @@ async fn keep_evidence_while_the_na_is_unreachable_and_admit_it_in_order(na: &Li
         .unwrap();
     let admitted: Vec<Value> = flushed.admitted.into_iter().map(|e| e.evidence).collect();
     assert_eq!(admitted, evidence);
-    assert!(outbox.list().unwrap().is_empty());
+    assert!(outbox.list().await.unwrap().is_empty());
     let history = gm.evidence_store.resource_history(&resource).await.unwrap();
     assert_eq!(history["verification"]["verified"], true);
 
     // A guard refusal after the action: recorded without the refused field.
-    let err = governed_action(
+    let mut err = governed_action(
         &live.boundary,
         &live.evidence_store,
         &recorder,
@@ -205,7 +200,7 @@ async fn keep_evidence_while_the_na_is_unreachable_and_admit_it_in_order(na: &Li
     )
     .await
     .unwrap_err();
-    assert_eq!(err.action_value::<u8>(), Some(&3));
+    assert_eq!(err.take_action_value::<u8>(), Some(3));
     let GenesisMeshError::MetadataRefused {
         evidence,
         submission,
@@ -214,7 +209,7 @@ async fn keep_evidence_while_the_na_is_unreachable_and_admit_it_in_order(na: &Li
     else {
         panic!("unexpected error");
     };
-    assert_eq!(submission.status(), "recorded");
+    assert_eq!(submission.unwrap()["status"], "recorded");
     assert_eq!(
         evidence["execution_parameters"],
         json!({"secret_version": "v3"})
@@ -332,7 +327,7 @@ async fn admit_decide_record_audit_and_offboard(na: &LiveNa) {
         assert!(result.authorized);
         let evidence = result.evidence.unwrap();
         assert_eq!(evidence["resource_sequence"], sequence);
-        assert_eq!(result.submission.unwrap().status(), "recorded");
+        assert_eq!(result.submission.unwrap()["status"], "recorded");
         assert_eq!(result.summary.observed_failures.len(), 1);
         assert!(verify_justification_signature(
             &result.evaluation["justification_proof"],

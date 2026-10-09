@@ -114,10 +114,10 @@ set, commitment, and prover identity.
 
 `governed_action` evaluates a request, verifies the decision offline (signature,
 expiry, context, attestation and exact policy bindings), runs your action only on
-ALLOW, then signs execution evidence with an `ExecutionRecorder`, keeps it in the
-client's evidence outbox and submits it, linked to the resource's chain head. The
-client needs an outbox:
-`ClientOptions::new(url).with_outbox(Arc::new(FileOutbox::new("/var/lib/controller/gm-outbox")))`.
+ALLOW, then signs execution evidence with an `ExecutionRecorder` and submits it,
+linked to the resource's chain head. Give the client an evidence outbox
+(`ClientOptions::new(url).with_outbox(Arc::new(FileOutbox::new("/var/lib/controller/gm-outbox")))`)
+so no signed record is lost when the NA is unreachable after an action:
 
 ```no_run
 use genesis_mesh_sdk::{
@@ -161,35 +161,47 @@ offline with the same reason codes as the Python reference, and
 
 ### Evidence outbox
 
-Since 1.2.0 signed evidence is written to the outbox before it is submitted and
-removed once the NA admits it. `FileOutbox` keeps one JSON file per record in a
-private directory (`0700`, files `0600`), written to a temporary file, synced
-and renamed into place, in the format the TypeScript SDK uses; implement
-`EvidenceOutbox` to keep records elsewhere. It holds signed metadata, never
-secret values, but must be durable and private. `MemoryOutbox` is for tests.
+Since 1.2.0 a client can keep signed evidence in an outbox: `governed_action`
+writes each record there before submitting it and removes it once the NA admits
+it. `FileOutbox` keeps one JSON file per record in a directory, written to a
+temporary file, synced and renamed into place, in the format the TypeScript SDK
+uses. It reads the directory once and keeps it in memory, so one process uses a
+directory at a time, and recovers what a crash left on that first read. A
+directory it creates is `0700` and its files `0600` on Unix; on Windows, or for
+a directory that already exists, restrict access to it yourself. Implement the
+`EvidenceOutbox` trait (its methods return boxed futures) to keep records in a
+database instead. The outbox holds signed metadata, never secret values, but
+must be durable and private. `MemoryOutbox` is for tests only.
 
-A failed submission is not an error. `result.submission` is
-`Submission::Admitted` with the NA's acknowledgement, `Submission::Pending`
-after a transient error (network, timeout, `5xx`, `429`, a lost race between NA
-instances) or while a record it chains from is pending, or
-`Submission::DeadLettered` after a refusal (any other `4xx`), with the code in
-`last_error`. Dead letters are kept, never dropped.
+With an outbox, a failed submission is not an error. `result.submission` is the
+NA's acknowledgement when it admitted the record; otherwise `result.queued` is
+the outbox entry: `OutboxState::Pending` after a failure a later attempt can
+overcome (network, timeout, `5xx`, `429`, an executor key not registered yet, a
+chain gap, a disabled store, a proxy's error page), or `OutboxState::DeadLetter`
+after a refusal no retry can overcome (`PERMANENT_REFUSALS`), or when a record it
+chains from was refused (`evidence_predecessor_dead_lettered`), with the code in
+`last_error`. Dead letters are kept, never dropped. Without an outbox,
+`governed_action` behaves as in 1.1.
 
 `gm.evidence_store.flush_pending(FlushOptions::default())` submits pending
-records in the order they were added; run it at startup and on a timer. A record
-waits behind a pending predecessor and is dead-lettered
-(`evidence_predecessor_dead_lettered`) when that one was refused. Retries back
-off from 5 s to 15 minutes; `FlushOptions { ignore_backoff: true }` retries at
-once. A transient error ends the run. A resource with pending records chains
-from the newest of them, not from the NA's head, unless `prior_resource` is set.
+records in the order they were added; run it at startup and on a timer, one run
+at a time (`FlushInProgress` otherwise). A record waits behind a pending
+predecessor. Retries back off from 5 s to 15 minutes;
+`FlushOptions { ignore_backoff: true }` retries at once. A transient error ends
+the run. A resource with pending records chains from the newest of them, not
+from the NA's head, and the next action on it submits them first (up to 100),
+unless `prior_resource` is set. Two controllers with separate outboxes that
+change one resource while the NA is away fork its chain; the record that loses
+is dead-lettered with `evidence_conflict`.
 
-Two errors mean the action ran; do not run it again. `MetadataRefused`
-(`governed_action_metadata_refused`): the secret guard refused metadata the
-action reported, and the outcome was recorded without the refused fields
-(`dropped`, also named in `outcome_detail`). `EvidenceNotKept`
+With an outbox, two errors mean the action ran; do not run it again.
+`MetadataRefused` (`governed_action_metadata_refused`): the secret guard refused
+metadata the action reported, and the outcome was recorded without the refused
+fields (`dropped`, also named in `outcome_detail`). `EvidenceNotKept`
 (`governed_action_evidence_unkept`): the evidence could not be signed or the
 outbox failed; it carries the signed `evidence` when there is one. Both carry
-the action's value: `err.action_value::<T>()`.
+the action's value: `err.take_action_value::<T>()`. A failed action's
+`ActionFailed` carries its failure record and, with an outbox, its entry.
 
 ## Transport and errors
 

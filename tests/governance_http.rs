@@ -8,9 +8,9 @@ use ed25519_dalek::{Signature, SigningKey};
 use genesis_mesh_sdk::{
     admin_signing_payload, canonical::execution_digest, governed_action, json, ActionError,
     ActionReport, AdminRequest, ClientOptions, EvidenceOutbox, ExecutionRecorder, FlushOptions,
-    GenesisMeshClient, GenesisMeshError, GovernedActionParams, GovernedVerification, MemoryOutbox,
-    OutboxEntry, OutboxState, PriorResource, ResourceHead, Submission, Value,
-    PREDECESSOR_DEAD_LETTERED,
+    GenesisMeshClient, GenesisMeshError, GovernedActionParams, GovernedActionResult,
+    GovernedVerification, MemoryOutbox, OutboxEntry, OutboxFuture, OutboxState, PriorResource,
+    RecordExecution, ResourceHead, Value, PREDECESSOR_DEAD_LETTERED,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -115,11 +115,15 @@ fn options(url: &str) -> ClientOptions {
 }
 
 fn client(url: &str) -> GenesisMeshClient {
-    GenesisMeshClient::new(options(url).with_outbox(Arc::new(MemoryOutbox::default()))).unwrap()
+    GenesisMeshClient::new(options(url)).unwrap()
 }
 
 fn client_with(url: &str, outbox: Arc<dyn EvidenceOutbox>) -> GenesisMeshClient {
     GenesisMeshClient::new(options(url).with_outbox(outbox)).unwrap()
+}
+
+fn with_outbox(url: &str) -> GenesisMeshClient {
+    client_with(url, Arc::new(MemoryOutbox::default()))
 }
 
 fn assert_admin(request: &Request, signed_body: &Value) {
@@ -546,14 +550,8 @@ async fn governed_action_verifies_allow_reads_the_head_and_records_the_result() 
         evidence["execution_parameters"],
         json!({"secret_version": "v3"})
     );
-    assert_eq!(result.submission.unwrap().status(), "recorded");
-    assert!(c
-        .evidence_store
-        .outbox()
-        .unwrap()
-        .list()
-        .unwrap()
-        .is_empty());
+    assert_eq!(result.submission.unwrap()["status"], "recorded");
+    assert!(result.queued.is_none());
     assert_eq!(result.summary.observed_failures.len(), 1);
     let r = task.await.unwrap();
     assert_eq!(r[0].route(), "/admin/boundary/evaluate");
@@ -665,7 +663,7 @@ async fn governed_action_records_a_failure_without_the_error_text() {
 }
 
 #[tokio::test]
-async fn governed_action_keeps_a_refused_failure_record_as_a_dead_letter() {
+async fn governed_action_reports_both_errors_when_failure_evidence_is_refused() {
     let v = vectors();
     let (url, task) = scripted(vec![
         ok(signed_evaluation(&v, true, "ctx-5")),
@@ -683,64 +681,48 @@ async fn governed_action_keeps_a_refused_failure_record_as_a_dead_letter() {
     })
     .await
     .unwrap_err();
-    assert!(
-        matches!(err, GenesisMeshError::ActionFailed { .. }),
-        "{err}"
-    );
-    let kept = c.evidence_store.outbox().unwrap().list().unwrap();
-    assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0].state, OutboxState::DeadLetter);
-    assert_eq!(
-        kept[0].last_error.as_ref().unwrap().code,
-        "evidence_rejected"
-    );
-    assert_eq!(kept[0].evidence["outcome"], "failure");
-    assert_eq!(task.await.unwrap().len(), 2);
-}
-
-#[derive(Debug, Default)]
-struct BrokenOutbox;
-
-impl EvidenceOutbox for BrokenOutbox {
-    fn add(&self, _: &OutboxEntry) -> io::Result<()> {
-        Err(io::Error::other("disk full"))
-    }
-    fn update(&self, _: &OutboxEntry) -> io::Result<()> {
-        Ok(())
-    }
-    fn remove(&self, _: &str) -> io::Result<()> {
-        Ok(())
-    }
-    fn list(&self) -> io::Result<Vec<OutboxEntry>> {
-        Ok(Vec::new())
-    }
-}
-
-#[tokio::test]
-async fn governed_action_reports_both_errors_and_the_record_when_the_outbox_fails() {
-    let v = vectors();
-    let (url, task) = scripted(vec![ok(signed_evaluation(&v, true, "ctx-6"))]).await;
-    let c = client_with(&url, Arc::new(BrokenOutbox));
-    let mut p = params(&v, "ctx-6");
-    p.prior_resource = Some(None);
-    let err = governed_action(&c.boundary, &c.evidence_store, &recorder(), p, |_| async {
-        Err::<ActionReport<()>, ActionError>("boom".into())
-    })
-    .await
-    .unwrap_err();
     match err {
         GenesisMeshError::ActionUnrecorded {
             source,
             evidence_error,
             evidence,
+            ..
         } => {
             assert_eq!(source.to_string(), "boom");
-            assert_eq!(evidence_error.code(), "outbox_error");
+            assert_eq!(evidence_error.code(), "evidence_rejected");
             assert_eq!(evidence.unwrap()["outcome"], "failure");
         }
         other => panic!("unexpected {other}"),
     }
-    assert_eq!(task.await.unwrap().len(), 1);
+    assert_eq!(task.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn without_an_outbox_a_failed_submission_is_an_error_and_secrets_are_refused_unsigned() {
+    let v = vectors();
+    let (url, task) = scripted(vec![
+        ok(signed_evaluation(&v, true, "ctx-n1")),
+        unavailable(),
+        ok(signed_evaluation(&v, true, "ctx-n2")),
+    ])
+    .await;
+    let c = client(&url);
+    let err = rotate_to(&c, &v, "ctx-n1", Some(None), "v1")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "service_unavailable");
+    let mut p = params(&v, "ctx-n2");
+    p.prior_resource = Some(None);
+    let err = governed_action(&c.boundary, &c.evidence_store, &recorder(), p, |_| async {
+        Ok::<_, ActionError>(ActionReport::<()> {
+            execution_parameters: Some(json!({"client_secret": "s3cr3t"})),
+            ..ActionReport::default()
+        })
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(err, GenesisMeshError::SecretMaterial(_)), "{err}");
+    assert_eq!(task.await.unwrap().len(), 3);
 }
 
 // ── the evidence outbox (1.2.0) ──────────────────────────────────────────────
@@ -752,10 +734,10 @@ fn unavailable() -> (u16, String) {
     )
 }
 
-fn conflict(code: &str) -> (u16, String) {
+fn refusal(status: u16, code: &str) -> (u16, String) {
     (
-        409,
-        json!({"error": {"code": code, "message": "taken"}}).to_string(),
+        status,
+        json!({"error": {"code": code, "message": "refused"}}).to_string(),
     )
 }
 
@@ -765,7 +747,7 @@ async fn rotate_to(
     context_id: &str,
     prior: Option<Option<PriorResource>>,
     version: &str,
-) -> genesis_mesh_sdk::Result<genesis_mesh_sdk::GovernedActionResult<String>> {
+) -> genesis_mesh_sdk::Result<GovernedActionResult<String>> {
     let mut p = params(v, context_id);
     p.prior_resource = prior;
     let version = version.to_owned();
@@ -785,14 +767,91 @@ async fn rotate_to(
     .await
 }
 
+/// An outbox whose every operation fails (or only `add`, when `adds_only`).
+#[derive(Debug, Default)]
+struct BrokenOutbox {
+    adds_only: bool,
+    inner: MemoryOutbox,
+}
+
+impl EvidenceOutbox for BrokenOutbox {
+    fn add<'a>(&'a self, _: &'a OutboxEntry) -> OutboxFuture<'a, ()> {
+        Box::pin(async { Err(io::Error::other("disk full")) })
+    }
+    fn update<'a>(&'a self, entry: &'a OutboxEntry) -> OutboxFuture<'a, ()> {
+        self.inner.update(entry)
+    }
+    fn remove<'a>(&'a self, id: &'a str) -> OutboxFuture<'a, ()> {
+        self.inner.remove(id)
+    }
+    fn list(&self) -> OutboxFuture<'_, Vec<OutboxEntry>> {
+        if self.adds_only {
+            return self.inner.list();
+        }
+        Box::pin(async { Err(io::Error::other("outbox file is unreadable")) })
+    }
+}
+
+/// An outbox that cannot remove entries.
+#[derive(Debug, Default)]
+struct StickyOutbox(MemoryOutbox);
+
+impl EvidenceOutbox for StickyOutbox {
+    fn add<'a>(&'a self, entry: &'a OutboxEntry) -> OutboxFuture<'a, ()> {
+        self.0.add(entry)
+    }
+    fn update<'a>(&'a self, entry: &'a OutboxEntry) -> OutboxFuture<'a, ()> {
+        self.0.update(entry)
+    }
+    fn remove<'a>(&'a self, _: &'a str) -> OutboxFuture<'a, ()> {
+        Box::pin(async { Err(io::Error::other("disk")) })
+    }
+    fn list(&self) -> OutboxFuture<'_, Vec<OutboxEntry>> {
+        self.0.list()
+    }
+}
+
+/// An outbox whose `list` takes a while, to overlap two flushes.
+#[derive(Debug, Default)]
+struct SlowOutbox(MemoryOutbox);
+
+impl EvidenceOutbox for SlowOutbox {
+    fn add<'a>(&'a self, entry: &'a OutboxEntry) -> OutboxFuture<'a, ()> {
+        self.0.add(entry)
+    }
+    fn update<'a>(&'a self, entry: &'a OutboxEntry) -> OutboxFuture<'a, ()> {
+        self.0.update(entry)
+    }
+    fn remove<'a>(&'a self, id: &'a str) -> OutboxFuture<'a, ()> {
+        self.0.remove(id)
+    }
+    fn list(&self) -> OutboxFuture<'_, Vec<OutboxEntry>> {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.0.list().await
+        })
+    }
+}
+
+fn state(entry: &Option<OutboxEntry>) -> Option<OutboxState> {
+    entry.as_ref().map(|e| e.state)
+}
+
+fn code(entry: &Option<OutboxEntry>) -> &str {
+    entry
+        .as_ref()
+        .and_then(|e| e.last_error.as_ref())
+        .map_or("", |e| e.code.as_str())
+}
+
 #[tokio::test]
-async fn governed_action_requires_an_outbox_before_evaluating() {
+async fn an_unreadable_outbox_fails_before_evaluating() {
     let v = vectors();
-    let c = GenesisMeshClient::new(options("http://127.0.0.1:9")).unwrap();
+    let c = client_with("http://127.0.0.1:9", Arc::new(BrokenOutbox::default()));
     let err = rotate_to(&c, &v, "ctx-o0", Some(None), "v1")
         .await
         .unwrap_err();
-    assert_eq!(err.code(), "outbox_required");
+    assert_eq!(err.code(), "outbox_error");
 }
 
 #[tokio::test]
@@ -804,13 +863,12 @@ async fn a_transient_error_keeps_the_record_pending_and_a_flush_admits_it() {
         ok(json!({"status": "recorded"})),
     ])
     .await;
-    let c = client(&url);
+    let c = with_outbox(&url);
     let result = rotate_to(&c, &v, "ctx-o1", Some(None), "v1").await.unwrap();
     assert_eq!(result.value.as_deref(), Some("rotated to v1"));
-    let Some(Submission::Pending(entry)) = result.submission else {
-        panic!("not pending");
-    };
-    assert_eq!(entry.attempts, 1);
+    assert!(result.submission.is_none());
+    let entry = result.queued.unwrap();
+    assert_eq!((entry.state, entry.attempts), (OutboxState::Pending, 1));
     assert_eq!(entry.last_error.as_ref().unwrap().status, 503);
     assert!(entry.next_attempt_at.is_some());
     assert_eq!(&entry.evidence, result.evidence.as_ref().unwrap());
@@ -830,51 +888,42 @@ async fn a_transient_error_keeps_the_record_pending_and_a_flush_admits_it() {
         .await
         .unwrap();
     assert_eq!(flushed.admitted.len(), 1);
-    assert!(outbox.list().unwrap().is_empty());
+    assert!(outbox.list().await.unwrap().is_empty());
     let r = task.await.unwrap();
     assert_eq!(&r[2].body["evidence"], result.evidence.as_ref().unwrap());
 }
 
 #[tokio::test]
-async fn a_refusal_dead_letters_the_record_with_its_code() {
+async fn only_refusals_no_retry_can_overcome_dead_letter_a_record() {
     let v = vectors();
-    let (url, task) = scripted(vec![
-        ok(signed_evaluation(&v, true, "ctx-o2")),
-        conflict("evidence_conflict"),
-    ])
-    .await;
-    let c = client(&url);
-    let result = rotate_to(&c, &v, "ctx-o2", Some(None), "v1").await.unwrap();
-    let Some(Submission::DeadLettered(entry)) = result.submission else {
-        panic!("not dead-lettered");
-    };
-    assert_eq!(entry.last_error.as_ref().unwrap().code, "evidence_conflict");
-    let report = c
-        .evidence_store
-        .flush_pending(FlushOptions {
-            ignore_backoff: true,
-        })
-        .await
-        .unwrap();
-    assert_eq!(report, genesis_mesh_sdk::FlushReport::default());
-    assert_eq!(task.await.unwrap().len(), 2);
+    for (status, refused, dead) in [
+        (409, "evidence_conflict", true),
+        (422, "evidence_outside_decision_window", true),
+        (409, "retention_in_progress", false),
+        (404, "evidence_store_disabled", false),
+        (422, "evidence_unknown_executor", false),
+        (422, "resource_chain_gap", false),
+        (403, "unknown", false),
+    ] {
+        let (url, _task) = scripted(vec![
+            ok(signed_evaluation(&v, true, "ctx-o2")),
+            refusal(status, refused),
+        ])
+        .await;
+        let c = with_outbox(&url);
+        let result = rotate_to(&c, &v, "ctx-o2", Some(None), "v1").await.unwrap();
+        let expected = if dead {
+            OutboxState::DeadLetter
+        } else {
+            OutboxState::Pending
+        };
+        assert_eq!(state(&result.queued), Some(expected), "{refused}");
+        assert_eq!(code(&result.queued), refused);
+    }
 }
 
 #[tokio::test]
-async fn a_lost_race_between_instances_is_transient() {
-    let v = vectors();
-    let (url, _task) = scripted(vec![
-        ok(signed_evaluation(&v, true, "ctx-o3")),
-        conflict("retention_in_progress"),
-    ])
-    .await;
-    let c = client(&url);
-    let result = rotate_to(&c, &v, "ctx-o3", Some(None), "v1").await.unwrap();
-    assert_eq!(result.submission.unwrap().status(), "pending");
-}
-
-#[tokio::test]
-async fn a_second_action_chains_from_the_pending_head_and_both_are_admitted_in_order() {
+async fn a_second_action_chains_from_the_pending_head_and_submits_it_first() {
     let v = vectors();
     let (url, task) = scripted(vec![
         ok(signed_evaluation(&v, true, "ctx-o4")),
@@ -885,10 +934,10 @@ async fn a_second_action_chains_from_the_pending_head_and_both_are_admitted_in_o
         ok(json!({"status": "recorded"})),
     ])
     .await;
-    let c = client(&url);
+    let c = with_outbox(&url);
     let first = rotate_to(&c, &v, "ctx-o4", None, "v1").await.unwrap();
     let second = rotate_to(&c, &v, "ctx-o5", None, "v2").await.unwrap();
-    let (first, second) = (first.evidence.unwrap(), second);
+    let first = first.evidence.unwrap();
     assert_eq!(first["resource_sequence"], 3);
     let second_evidence = second.evidence.unwrap();
     assert_eq!(second_evidence["resource_sequence"], 4);
@@ -896,20 +945,16 @@ async fn a_second_action_chains_from_the_pending_head_and_both_are_admitted_in_o
         second_evidence["prev_resource_digest"],
         execution_digest(&first).unwrap()
     );
-    // Submitting the second before the first would be refused: it waits.
-    let Some(Submission::Pending(waiting)) = second.submission else {
-        panic!("not pending");
-    };
-    assert_eq!(waiting.attempts, 0);
-    let flushed = c
+    // The NA just answered the evaluation: the first record goes first.
+    assert_eq!(second.submission.unwrap()["status"], "recorded");
+    assert!(c
         .evidence_store
-        .flush_pending(FlushOptions {
-            ignore_backoff: true,
-        })
+        .outbox()
+        .unwrap()
+        .list()
         .await
-        .unwrap();
-    let admitted: Vec<&Value> = flushed.admitted.iter().map(|e| &e.evidence).collect();
-    assert_eq!(admitted, vec![&first, &second_evidence]);
+        .unwrap()
+        .is_empty());
     let r = task.await.unwrap();
     assert_eq!(r.len(), 6);
     assert_eq!(r[3].route(), "/admin/boundary/evaluate");
@@ -924,26 +969,114 @@ async fn a_record_behind_a_refused_one_is_dead_lettered_without_submission() {
         ok(signed_evaluation(&v, true, "ctx-o6")),
         unavailable(),
         ok(signed_evaluation(&v, true, "ctx-o7")),
-        conflict("evidence_conflict"),
+        refusal(409, "evidence_conflict"),
+        ok(signed_evaluation(&v, true, "ctx-o8")),
+        ok(json!({"resource_id": v["resource_id"], "resource_sequence": 9, "record_digest": "na-head"})),
+        ok(json!({"status": "recorded"})),
     ])
     .await;
-    let c = client(&url);
+    let c = with_outbox(&url);
     rotate_to(&c, &v, "ctx-o6", Some(None), "v1").await.unwrap();
-    rotate_to(&c, &v, "ctx-o7", None, "v2").await.unwrap();
-    let flushed = c
+    let second = rotate_to(&c, &v, "ctx-o7", None, "v2").await.unwrap();
+    assert_eq!(state(&second.queued), Some(OutboxState::DeadLetter));
+    assert_eq!(code(&second.queued), PREDECESSOR_DEAD_LETTERED);
+    // A third action no longer chains from the dead records.
+    let third = rotate_to(&c, &v, "ctx-o8", None, "v3").await.unwrap();
+    assert_eq!(third.evidence.unwrap()["prev_resource_digest"], "na-head");
+    assert_eq!(task.await.unwrap().len(), 7);
+}
+
+#[tokio::test]
+async fn enqueue_dead_letters_at_once_behind_a_dead_letter_and_waits_on_the_decision_chain() {
+    let v = vectors();
+    let (url, task) = scripted(vec![
+        refusal(409, "evidence_conflict"),
+        unavailable(),
+        unavailable(),
+    ])
+    .await;
+    let c = with_outbox(&url);
+    let decision = signed_evaluation(&v, true, "ctx-e")["decision"].clone();
+    let sign = |prior: Option<Value>, resource: bool| {
+        recorder()
+            .record(RecordExecution {
+                decision: decision.clone(),
+                executed_capability: "sp-secret.rotate".into(),
+                resource_id: resource.then(|| "kv:v/e".to_owned()),
+                resource_action: resource.then(|| "rotate".to_owned()),
+                prior_resource: if resource {
+                    prior.clone().map(PriorResource::Record)
+                } else {
+                    None
+                },
+                prior_record: if resource { None } else { prior },
+                ..RecordExecution::default()
+            })
+            .unwrap()
+    };
+    let a = sign(None, true);
+    let refused = c.evidence_store.enqueue(a.clone()).await.unwrap();
+    assert_eq!(state(&refused.queued), Some(OutboxState::DeadLetter));
+    let b = sign(Some(a), true);
+    let behind = c.evidence_store.enqueue(b).await.unwrap();
+    assert_eq!(code(&behind.queued), PREDECESSOR_DEAD_LETTERED);
+    // The decision chain: d waits behind c's failed retry.
+    let first = sign(None, false);
+    c.evidence_store.enqueue(first.clone()).await.unwrap();
+    let next = c
         .evidence_store
-        .flush_pending(FlushOptions {
-            ignore_backoff: true,
-        })
+        .enqueue(sign(Some(first), false))
         .await
         .unwrap();
-    let codes: Vec<&str> = flushed
-        .dead_lettered
-        .iter()
-        .map(|e| e.last_error.as_ref().unwrap().code.as_str())
-        .collect();
-    assert_eq!(codes, ["evidence_conflict", PREDECESSOR_DEAD_LETTERED]);
-    assert_eq!(task.await.unwrap().len(), 4);
+    let waiting = next.queued.unwrap();
+    assert_eq!((waiting.state, waiting.attempts), (OutboxState::Pending, 0));
+    assert_eq!(task.await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn enqueue_resubmits_a_kept_record_and_refuses_another_with_its_id() {
+    let v = vectors();
+    let (url, _task) = scripted(vec![unavailable(), ok(json!({"status": "recorded"}))]).await;
+    let c = with_outbox(&url);
+    let decision = signed_evaluation(&v, true, "ctx-r")["decision"].clone();
+    let record = recorder()
+        .record(RecordExecution {
+            decision,
+            executed_capability: "c".into(),
+            ..RecordExecution::default()
+        })
+        .unwrap();
+    c.evidence_store.enqueue(record.clone()).await.unwrap();
+    let again = c.evidence_store.enqueue(record.clone()).await.unwrap();
+    assert_eq!(again.submission.unwrap()["status"], "recorded");
+    let mut imposter = record;
+    imposter["outcome"] = json!("failure");
+    c.evidence_store
+        .outbox()
+        .unwrap()
+        .add(&OutboxEntry::new(imposter.clone()))
+        .await
+        .unwrap();
+    let mut other = imposter.clone();
+    other["outcome"] = json!("success");
+    other["outcome_detail"] = json!("different");
+    assert_eq!(
+        c.evidence_store.enqueue(other).await.unwrap_err().code(),
+        "outbox_error"
+    );
+}
+
+#[tokio::test]
+async fn an_admitted_record_stays_admitted_when_the_outbox_cannot_remove_it() {
+    let v = vectors();
+    let (url, _task) = scripted(vec![
+        ok(signed_evaluation(&v, true, "ctx-s")),
+        ok(json!({"status": "recorded"})),
+    ])
+    .await;
+    let c = client_with(&url, Arc::new(StickyOutbox::default()));
+    let result = rotate_to(&c, &v, "ctx-s", Some(None), "v1").await.unwrap();
+    assert_eq!(result.submission.unwrap()["status"], "recorded");
 }
 
 #[tokio::test]
@@ -957,7 +1090,7 @@ async fn a_flush_ends_at_the_first_transient_error() {
         unavailable(),
     ])
     .await;
-    let c = client(&url);
+    let c = with_outbox(&url);
     rotate_to(&c, &v, "ctx-o8", Some(None), "v1").await.unwrap();
     let mut p = params(&v, "ctx-o9");
     p.resource_id = Some("kv:v/other".into());
@@ -980,6 +1113,24 @@ async fn a_flush_ends_at_the_first_transient_error() {
 }
 
 #[tokio::test]
+async fn one_flush_runs_at_a_time() {
+    let c = client_with("http://127.0.0.1:9", Arc::new(SlowOutbox::default()));
+    let options = FlushOptions::default();
+    let (a, b) = tokio::join!(
+        c.evidence_store.flush_pending(options),
+        c.evidence_store.flush_pending(options)
+    );
+    let codes: Vec<&str> = [&a, &b]
+        .iter()
+        .map(|r| r.as_ref().map_or_else(|e| e.code(), |_| "ok"))
+        .collect();
+    assert!(
+        codes.contains(&"ok") && codes.contains(&"outbox_flush_in_progress"),
+        "{codes:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_guard_refusal_after_the_action_records_the_outcome_and_returns_the_value() {
     let v = vectors();
     let (url, task) = scripted(vec![
@@ -987,10 +1138,10 @@ async fn a_guard_refusal_after_the_action_records_the_outcome_and_returns_the_va
         ok(json!({"status": "recorded"})),
     ])
     .await;
-    let c = client(&url);
+    let c = with_outbox(&url);
     let mut p = params(&v, "ctx-o10");
     p.prior_resource = Some(None);
-    let err = governed_action(&c.boundary, &c.evidence_store, &recorder(), p, |_| async {
+    let mut err = governed_action(&c.boundary, &c.evidence_store, &recorder(), p, |_| async {
         Ok::<_, ActionError>(ActionReport {
             value: Some(42_u32),
             execution_parameters: Some(json!({"client_secret": "s3cr3t", "secret_version": "v2"})),
@@ -1001,7 +1152,9 @@ async fn a_guard_refusal_after_the_action_records_the_outcome_and_returns_the_va
     .await
     .unwrap_err();
     assert_eq!(err.code(), "governed_action_metadata_refused");
-    assert_eq!(err.action_value::<u32>(), Some(&42));
+    assert_eq!(err.take_action_value::<String>(), None);
+    assert_eq!(err.take_action_value::<u32>(), Some(42));
+    assert_eq!(err.take_action_value::<u32>(), None);
     let GenesisMeshError::MetadataRefused {
         dropped,
         evidence,
@@ -1020,7 +1173,7 @@ async fn a_guard_refusal_after_the_action_records_the_outcome_and_returns_the_va
         evidence["outcome_detail"],
         "rotated [secret guard dropped: client_secret]"
     );
-    assert_eq!(submission.status(), "recorded");
+    assert_eq!(submission.unwrap()["status"], "recorded");
     let r = task.await.unwrap();
     assert_eq!(r[1].body["evidence"], *evidence);
     assert!(!r[1].body.to_string().contains("s3cr3t"));
@@ -1030,13 +1183,19 @@ async fn a_guard_refusal_after_the_action_records_the_outcome_and_returns_the_va
 async fn an_outbox_failure_after_the_action_returns_the_value_and_the_record() {
     let v = vectors();
     let (url, task) = scripted(vec![ok(signed_evaluation(&v, true, "ctx-o11"))]).await;
-    let c = client_with(&url, Arc::new(BrokenOutbox));
-    let err = rotate_to(&c, &v, "ctx-o11", Some(None), "v1")
+    let c = client_with(
+        &url,
+        Arc::new(BrokenOutbox {
+            adds_only: true,
+            ..BrokenOutbox::default()
+        }),
+    );
+    let mut err = rotate_to(&c, &v, "ctx-o11", Some(None), "v1")
         .await
         .unwrap_err();
     assert_eq!(err.code(), "governed_action_evidence_unkept");
     assert_eq!(
-        err.action_value::<String>().map(String::as_str),
+        err.take_action_value::<String>().as_deref(),
         Some("rotated to v1")
     );
     assert!(matches!(
@@ -1047,4 +1206,57 @@ async fn an_outbox_failure_after_the_action_returns_the_value_and_the_record() {
         }
     ));
     assert_eq!(task.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn with_an_outbox_a_failed_action_keeps_its_failure_record() {
+    let v = vectors();
+    let (url, _task) = scripted(vec![
+        ok(signed_evaluation(&v, true, "ctx-o12")),
+        unavailable(),
+    ])
+    .await;
+    let c = with_outbox(&url);
+    let mut p = params(&v, "ctx-o12");
+    p.prior_resource = Some(None);
+    let err = governed_action(&c.boundary, &c.evidence_store, &recorder(), p, |_| async {
+        Err::<ActionReport<()>, ActionError>("boom".into())
+    })
+    .await
+    .unwrap_err();
+    let GenesisMeshError::ActionFailed {
+        evidence, queued, ..
+    } = err
+    else {
+        panic!("unexpected {err}");
+    };
+    assert_eq!(evidence.unwrap()["outcome"], "failure");
+    assert_eq!(queued.unwrap().state, OutboxState::Pending);
+}
+
+#[test]
+fn the_guard_fallback_drops_only_refused_fields_and_names_plain_ones() {
+    use genesis_mesh_sdk::without_refused_metadata;
+    let cleaned = without_refused_metadata(
+        &json!({"password": "x", "version": "v1", "nested": {"token": "y"}}),
+        Some("-----BEGIN KEY"),
+    );
+    assert_eq!(cleaned.execution_parameters, json!({"version": "v1"}));
+    assert_eq!(
+        cleaned.outcome_detail,
+        "[secret guard dropped: nested, outcome_detail, password]"
+    );
+    let odd = without_refused_metadata(
+        &json!({"a b": "x".repeat(130), "ok": 1, "y".repeat(70): "z".repeat(130)}),
+        None,
+    );
+    assert_eq!(odd.execution_parameters, json!({"ok": 1}));
+    assert_eq!(odd.outcome_detail, "[secret guard dropped: 2 other fields]");
+    let big: serde_json::Map<String, Value> = (0..4)
+        .map(|i| (format!("k{i}"), json!("x".repeat(5000))))
+        .collect();
+    let all = without_refused_metadata(&Value::Object(big), None);
+    assert_eq!(all.execution_parameters, json!({}));
+    assert_eq!(all.dropped, ["k0", "k1", "k2", "k3"]);
+    assert_eq!(all.outcome_detail, "[secret guard dropped: k0, k1, k2, k3]");
 }

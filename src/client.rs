@@ -38,9 +38,9 @@ pub struct ClientOptions {
     /// (`network_authority.public_key`).
     pub audience: Option<String>,
     /// Durable storage for signed execution records not yet admitted
-    /// (v1.2.0), e.g. a [`FileOutbox`](crate::FileOutbox). Required by
-    /// [`governed_action`](crate::governed_action); see
-    /// [`EvidenceStoreClient::flush_pending`].
+    /// (v1.2.0), e.g. a [`FileOutbox`](crate::FileOutbox). With one,
+    /// [`governed_action`](crate::governed_action) keeps every record until
+    /// the NA admits it; see [`EvidenceStoreClient::flush_pending`].
     pub outbox: Option<Arc<dyn EvidenceOutbox>>,
 }
 
