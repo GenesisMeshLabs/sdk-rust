@@ -260,8 +260,9 @@ fn classifies_transient_and_refused_submissions() {
         },
         GenesisMeshError::Configuration("x".into()),
     ];
-    for err in &transient {
-        assert!(classify_submission_error(err).1, "{}", err.code());
+    // Cases are named by index: nothing derived from an error reaches a message.
+    for (i, err) in transient.iter().enumerate() {
+        assert!(classify_submission_error(err).1, "transient[{i}]");
     }
     let refused = [
         http(409, "evidence_conflict"),
@@ -273,8 +274,8 @@ fn classifies_transient_and_refused_submissions() {
         validation("resource_chain_mismatch"),
         GenesisMeshError::SecretMaterial("field".into()),
     ];
-    for err in &refused {
-        assert!(!classify_submission_error(err).1, "{}", err.code());
+    for (i, err) in refused.iter().enumerate() {
+        assert!(!classify_submission_error(err).1, "refused[{i}]");
     }
     let (failure, _) = classify_submission_error(&http(409, "evidence_conflict"));
     assert_eq!(
