@@ -16,6 +16,7 @@ mod evidence_store;
 mod execution;
 mod governance;
 mod health;
+mod outbox;
 mod policy;
 pub mod verify;
 
@@ -33,14 +34,19 @@ pub use data_usage::DataUsageClient;
 pub use disclosure::DisclosureClient;
 pub use errors::{GenesisMeshError, Result};
 pub use evidence::EvidenceClient;
-pub use evidence_store::{EvidenceStoreClient, ResourceHead, MAX_PAGE};
+pub use evidence_store::{EvidenceStoreClient, FlushOptions, ResourceHead, MAX_PAGE};
 pub use execution::{
     check_metadata_only, ExecutionRecorder, PriorResource, RecordExecution, MAX_METADATA_BYTES,
 };
 pub use governance::{
-    governed_action, summarize_decision, ActionError, ActionReport, DecisionSummary, GateFailure,
-    GovernedActionParams, GovernedActionResult, GovernedVerification,
+    governed_action, summarize_decision, without_refused_metadata, ActionError, ActionReport,
+    DecisionSummary, GateFailure, GovernedActionParams, GovernedActionResult, GovernedVerification,
+    RefusedMetadata,
 };
 pub use health::HealthClient;
+pub use outbox::{
+    classify_submission_error, retry_delay, EvidenceOutbox, FileOutbox, FlushReport, MemoryOutbox,
+    OutboxEntry, OutboxState, Submission, SubmissionFailure, PREDECESSOR_DEAD_LETTERED,
+};
 pub use policy::PolicyClient;
 pub use serde_json::{json, Value};

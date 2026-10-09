@@ -1,5 +1,12 @@
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -8,6 +15,10 @@ use crate::{
     client::{query_pairs, resource_path, segment, HttpTransport},
     errors::{GenesisMeshError, Result},
     execution::ensure_metadata_only,
+    outbox::{
+        classify_submission_error, retry_delay, timestamp, EvidenceOutbox, FlushReport,
+        OutboxEntry, OutboxState, Submission, SubmissionFailure, PREDECESSOR_DEAD_LETTERED,
+    },
     verify::parse_export_lines,
 };
 
@@ -23,16 +34,202 @@ pub struct ResourceHead {
     pub record_digest: String,
 }
 
+/// Options for [`EvidenceStoreClient::flush_pending`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlushOptions {
+    /// Retry entries whose backoff has not expired (e.g. right after the NA
+    /// is back).
+    pub ignore_backoff: bool,
+}
+
+/// The records a signed record chains from: its predecessor under the
+/// decision and on the resource.
+fn predecessors(evidence: &Value) -> Vec<&str> {
+    ["prev_evidence_digest", "prev_resource_digest"]
+        .iter()
+        .filter_map(|k| evidence[*k].as_str())
+        .collect()
+}
+
+fn outbox_error(err: std::io::Error) -> GenesisMeshError {
+    GenesisMeshError::Outbox(err)
+}
+
+/// Clears the flush flag when a run ends, however it ends.
+struct Flushing<'a>(&'a AtomicBool);
+
+impl Drop for Flushing<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// The NA execution evidence store (v0.59): controller submission, operator
 /// search, history, export, executor keys and retention.
 #[derive(Debug, Clone)]
 pub struct EvidenceStoreClient {
     http: Arc<HttpTransport>,
+    outbox: Option<Arc<dyn EvidenceOutbox>>,
+    flushing: Arc<AtomicBool>,
 }
 
 impl EvidenceStoreClient {
-    pub(crate) fn new(http: Arc<HttpTransport>) -> Self {
-        Self { http }
+    pub(crate) fn new(http: Arc<HttpTransport>, outbox: Option<Arc<dyn EvidenceOutbox>>) -> Self {
+        Self {
+            http,
+            outbox,
+            flushing: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The configured evidence outbox (v1.2.0).
+    pub fn outbox(&self) -> Option<&Arc<dyn EvidenceOutbox>> {
+        self.outbox.as_ref()
+    }
+
+    fn require_outbox(&self) -> Result<&dyn EvidenceOutbox> {
+        self.outbox
+            .as_deref()
+            .ok_or(GenesisMeshError::OutboxRequired)
+    }
+
+    /// Keep a signed record in the outbox, then submit it unless a record it
+    /// chains from is still pending (v1.2.0). A failed submission is not an
+    /// error: a transient one (network, timeout, `5xx`, `429`) leaves the
+    /// record pending for [`flush_pending`](Self::flush_pending), and a
+    /// refusal (any other `4xx`) keeps it as a dead letter with the NA's
+    /// code. Fails only when the outbox fails.
+    pub async fn enqueue(&self, evidence: Value) -> Result<Submission> {
+        let outbox = self.require_outbox()?;
+        let entry = OutboxEntry::new(evidence);
+        let queued = outbox.list().map_err(outbox_error)?;
+        outbox.add(&entry).map_err(outbox_error)?;
+        let waiting = queued
+            .iter()
+            .map(|e| execution_digest(&e.evidence))
+            .collect::<Result<HashSet<_>>>()?;
+        if predecessors(&entry.evidence)
+            .iter()
+            .any(|d| waiting.contains(*d))
+        {
+            return Ok(Submission::Pending(entry));
+        }
+        self.attempt(outbox, entry).await
+    }
+
+    /// Submit the outbox's pending records in the order they were added
+    /// (v1.2.0). A record waits while one it chains from is pending; it is
+    /// dead-lettered (`evidence_predecessor_dead_lettered`) when that one was
+    /// refused. Records in backoff are skipped unless `ignore_backoff`; a
+    /// transient error ends the run, leaving the rest for the next one. Run
+    /// it at startup and on a timer, one run at a time per client: a call
+    /// while another runs returns `Configuration`.
+    pub async fn flush_pending(&self, options: FlushOptions) -> Result<FlushReport> {
+        let outbox = self.require_outbox()?;
+        if self.flushing.swap(true, Ordering::AcqRel) {
+            return Err(GenesisMeshError::Configuration(
+                "flush_pending is already running on this client".into(),
+            ));
+        }
+        let _flushing = Flushing(&self.flushing);
+        let mut report = FlushReport::default();
+        let mut waiting = HashSet::new();
+        let mut dead = HashSet::new();
+        let mut stopped = false;
+        for entry in outbox.list().map_err(outbox_error)? {
+            let digest = execution_digest(&entry.evidence)?;
+            let after: Vec<String> = predecessors(&entry.evidence)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            if entry.state == OutboxState::DeadLetter {
+                dead.insert(digest);
+                continue;
+            }
+            if after.iter().any(|d| dead.contains(d)) {
+                let refused = OutboxEntry {
+                    state: OutboxState::DeadLetter,
+                    next_attempt_at: None,
+                    last_error: Some(SubmissionFailure {
+                        status: 0,
+                        code: PREDECESSOR_DEAD_LETTERED.into(),
+                        message: "a record this one chains from was refused".into(),
+                    }),
+                    ..entry
+                };
+                outbox.update(&refused).map_err(outbox_error)?;
+                dead.insert(digest);
+                report.dead_lettered.push(refused);
+                continue;
+            }
+            let due = options.ignore_backoff || entry.due(Utc::now());
+            if stopped || !due || after.iter().any(|d| waiting.contains(d)) {
+                waiting.insert(digest);
+                report.pending.push(entry);
+                continue;
+            }
+            match self.attempt(outbox, entry.clone()).await? {
+                Submission::Pending(failed) => {
+                    waiting.insert(digest);
+                    report.pending.push(failed);
+                    stopped = true;
+                }
+                Submission::DeadLettered(refused) => {
+                    dead.insert(digest);
+                    report.dead_lettered.push(refused);
+                }
+                _ => report.admitted.push(entry),
+            }
+        }
+        Ok(report)
+    }
+
+    /// The newest pending record in the outbox for a resource, or `None`
+    /// (v1.2.0). [`governed_action`](crate::governed_action) chains from it,
+    /// not from the NA's head, while it waits.
+    pub fn pending_head(&self, resource_id: &str) -> Result<Option<Value>> {
+        let entries = self.require_outbox()?.list().map_err(outbox_error)?;
+        Ok(entries
+            .into_iter()
+            .rfind(|e| e.state == OutboxState::Pending && e.evidence["resource_id"] == resource_id)
+            .map(|e| e.evidence))
+    }
+
+    async fn attempt(&self, outbox: &dyn EvidenceOutbox, entry: OutboxEntry) -> Result<Submission> {
+        match self.submit(entry.evidence.clone()).await {
+            Ok(ack) => {
+                outbox.remove(&entry.id).map_err(outbox_error)?;
+                Ok(Submission::Admitted(ack))
+            }
+            Err(err) => {
+                let (failure, transient) = classify_submission_error(&err);
+                let attempts = entry.attempts + 1;
+                let failed = if transient {
+                    let retry = chrono::Duration::from_std(retry_delay(attempts))
+                        .unwrap_or(chrono::Duration::MAX);
+                    OutboxEntry {
+                        attempts,
+                        next_attempt_at: Some(timestamp(Utc::now() + retry)),
+                        last_error: Some(failure),
+                        ..entry
+                    }
+                } else {
+                    OutboxEntry {
+                        attempts,
+                        state: OutboxState::DeadLetter,
+                        next_attempt_at: None,
+                        last_error: Some(failure),
+                        ..entry
+                    }
+                };
+                outbox.update(&failed).map_err(outbox_error)?;
+                Ok(if transient {
+                    Submission::Pending(failed)
+                } else {
+                    Submission::DeadLettered(failed)
+                })
+            }
+        }
     }
 
     /// Submit one signed ExecutionEvidence record. Authenticated by the

@@ -114,8 +114,10 @@ set, commitment, and prover identity.
 
 `governed_action` evaluates a request, verifies the decision offline (signature,
 expiry, context, attestation and exact policy bindings), runs your action only on
-ALLOW, then signs execution evidence with an `ExecutionRecorder` and submits it,
-linked to the resource's chain head:
+ALLOW, then signs execution evidence with an `ExecutionRecorder`, keeps it in the
+client's evidence outbox and submits it, linked to the resource's chain head. The
+client needs an outbox:
+`ClientOptions::new(url).with_outbox(Arc::new(FileOutbox::new("/var/lib/controller/gm-outbox")))`.
 
 ```no_run
 use genesis_mesh_sdk::{
@@ -156,6 +158,38 @@ Metadata that looks like secret material, or exceeds 16 KiB, is refused before
 signing (`SecretMaterial`). `verify::verify_evidence_events` checks an export
 offline with the same reason codes as the Python reference, and
 `verify::verify_boundary_decision` checks one decision.
+
+### Evidence outbox
+
+Since 1.2.0 signed evidence is written to the outbox before it is submitted and
+removed once the NA admits it. `FileOutbox` keeps one JSON file per record in a
+private directory (`0700`, files `0600`), written to a temporary file, synced
+and renamed into place, in the format the TypeScript SDK uses; implement
+`EvidenceOutbox` to keep records elsewhere. It holds signed metadata, never
+secret values, but must be durable and private. `MemoryOutbox` is for tests.
+
+A failed submission is not an error. `result.submission` is
+`Submission::Admitted` with the NA's acknowledgement, `Submission::Pending`
+after a transient error (network, timeout, `5xx`, `429`, a lost race between NA
+instances) or while a record it chains from is pending, or
+`Submission::DeadLettered` after a refusal (any other `4xx`), with the code in
+`last_error`. Dead letters are kept, never dropped.
+
+`gm.evidence_store.flush_pending(FlushOptions::default())` submits pending
+records in the order they were added; run it at startup and on a timer. A record
+waits behind a pending predecessor and is dead-lettered
+(`evidence_predecessor_dead_lettered`) when that one was refused. Retries back
+off from 5 s to 15 minutes; `FlushOptions { ignore_backoff: true }` retries at
+once. A transient error ends the run. A resource with pending records chains
+from the newest of them, not from the NA's head, unless `prior_resource` is set.
+
+Two errors mean the action ran; do not run it again. `MetadataRefused`
+(`governed_action_metadata_refused`): the secret guard refused metadata the
+action reported, and the outcome was recorded without the refused fields
+(`dropped`, also named in `outcome_detail`). `EvidenceNotKept`
+(`governed_action_evidence_unkept`): the evidence could not be signed or the
+outbox failed; it carries the signed `evidence` when there is one. Both carry
+the action's value: `err.action_value::<T>()`.
 
 ## Transport and errors
 

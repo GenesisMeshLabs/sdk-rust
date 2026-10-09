@@ -1,10 +1,16 @@
+use std::any::Any;
+
 use serde_json::Value;
+
+use crate::outbox::Submission;
 
 /// SDK result type.
 pub type Result<T> = std::result::Result<T, GenesisMeshError>;
 
-/// Error type for Genesis Mesh SDK operations.
+/// Error type for Genesis Mesh SDK operations. Non-exhaustive since 1.2.0:
+/// match the variants you handle and keep a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum GenesisMeshError {
     /// Invalid client configuration or route.
     #[error("configuration error: {0}")]
@@ -80,7 +86,8 @@ pub enum GenesisMeshError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    /// A governed action failed and recording its failure also failed.
+    /// A governed action failed and its failure record could not be signed
+    /// or kept in the outbox.
     #[error("action failed and its failure could not be recorded: {evidence_error}")]
     ActionUnrecorded {
         /// The action's error.
@@ -88,7 +95,54 @@ pub enum GenesisMeshError {
         source: Box<dyn std::error::Error + Send + Sync>,
         /// Why the failure evidence could not be recorded.
         evidence_error: Box<GenesisMeshError>,
+        /// The signed failure record, when signing succeeded (v1.2.0).
+        evidence: Option<Box<Value>>,
     },
+
+    /// The governed action ran, but the secret guard refused metadata it
+    /// reported (v1.2.0). The outcome was recorded without the refused fields
+    /// (`dropped`) as `evidence`; `submission` says whether the NA admitted
+    /// it. Do not rerun the action. [`GenesisMeshError::action_value`] reads
+    /// the action's value.
+    #[error("the action ran; its metadata was refused and recorded without {}: {reason}", dropped.join(", "))]
+    MetadataRefused {
+        /// The guard's reason.
+        reason: String,
+        /// The refused field names (`outcome_detail` for the detail).
+        dropped: Vec<String>,
+        /// The recorded outcome.
+        evidence: Box<Value>,
+        /// What happened to it.
+        submission: Box<Submission>,
+        /// The action's value.
+        value: Option<Box<dyn Any + Send + Sync>>,
+    },
+
+    /// The governed action ran, but its evidence could not be signed or kept
+    /// in the outbox (v1.2.0). `evidence` is the signed record when signing
+    /// succeeded: submit it (resubmission is idempotent) once the outbox
+    /// works. Do not rerun the action. [`GenesisMeshError::action_value`]
+    /// reads the action's value.
+    #[error("the action ran; its evidence was not kept: {source}")]
+    EvidenceNotKept {
+        /// Why.
+        #[source]
+        source: Box<GenesisMeshError>,
+        /// The signed record, when signing succeeded.
+        evidence: Option<Box<Value>>,
+        /// The action's value.
+        value: Option<Box<dyn Any + Send + Sync>>,
+    },
+
+    /// The evidence outbox failed to store, update, remove or list entries
+    /// (v1.2.0).
+    #[error("evidence outbox error: {0}")]
+    Outbox(#[source] std::io::Error),
+
+    /// No evidence outbox is configured ([`ClientOptions::with_outbox`](crate::ClientOptions::with_outbox));
+    /// `governed_action` and the outbox methods need one (v1.2.0).
+    #[error("no evidence outbox is configured (ClientOptions::with_outbox)")]
+    OutboxRequired,
 }
 
 impl GenesisMeshError {
@@ -107,10 +161,27 @@ impl GenesisMeshError {
             Self::Verification(_) => "verification_failed",
             Self::ActionFailed { .. } => "governed_action_failed",
             Self::ActionUnrecorded { .. } => "governed_action_unrecorded",
+            Self::MetadataRefused { .. } => "governed_action_metadata_refused",
+            Self::EvidenceNotKept { .. } => "governed_action_evidence_unkept",
+            Self::Outbox(_) => "outbox_error",
+            Self::OutboxRequired => "outbox_required",
             Self::Configuration(_) => "configuration",
             Self::Network(_) => "network",
             Self::Json(_) => "json",
             Self::SigningKey(_) | Self::MissingSigningKey => "signing_key",
+        }
+    }
+}
+
+impl GenesisMeshError {
+    /// The governed action's value, when this error says the action ran
+    /// (`MetadataRefused`, `EvidenceNotKept`) and the value is a `T`.
+    pub fn action_value<T: 'static>(&self) -> Option<&T> {
+        match self {
+            Self::MetadataRefused { value, .. } | Self::EvidenceNotKept { value, .. } => {
+                value.as_ref()?.downcast_ref::<T>()
+            }
+            _ => None,
         }
     }
 }

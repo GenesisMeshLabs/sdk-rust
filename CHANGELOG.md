@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.2.0 - Unreleased
+
+### Changed (breaking)
+
+- **Signed evidence is kept until the NA admits it.** `governed_action`
+  writes each signed record to an evidence outbox before submitting it and
+  removes it once admitted. A failed submission is no longer an error:
+  `GovernedActionResult::submission` is now a `Submission`: `Admitted` with
+  the NA's acknowledgement, `Pending` after a transient error (network,
+  timeout, `5xx`, `429`, a lost race between NA instances) or `DeadLettered`
+  with the NA's code after a refusal (any other `4xx`). `governed_action`
+  requires an outbox (`ClientOptions::with_outbox`) and returns
+  `OutboxRequired` without one; its value type must be `Send + Sync +
+  'static`.
+- A failed action's record that cannot be submitted is kept and
+  `ActionFailed` is returned, instead of `ActionUnrecorded`, which now means
+  the record could not be signed or kept and carries it as `evidence`.
+- When the secret guard refuses metadata the action reported, the outcome is
+  still recorded with the accepted parameters, and `MetadataRefused`
+  (`governed_action_metadata_refused`) is returned with the evidence, its
+  submission, the `dropped` field names and the action's value. No record was
+  made before.
+- A governed action on a resource with pending records chains from the newest
+  of them rather than the NA's head.
+- `GenesisMeshError` is `#[non_exhaustive]`; `ClientOptions` has a new
+  `outbox` field.
+
+### Added
+
+- `FileOutbox` (one file per record, synced and renamed into place, private
+  permissions, the TypeScript SDK's format), `MemoryOutbox` for tests, and the
+  `EvidenceOutbox` trait for other storage.
+- `EvidenceStoreClient::flush_pending`: submits pending records in order,
+  waits behind pending predecessors, dead-letters records whose predecessor
+  was refused, and backs off from 5 s to 15 minutes. `enqueue` and
+  `pending_head`.
+- `EvidenceNotKept` (`governed_action_evidence_unkept`), `Outbox` and
+  `OutboxRequired` errors, and `GenesisMeshError::action_value`.
+
 ## 1.1.1 - 2026-10-09
 
 Coordinated Genesis Mesh v1.1.1 release: security fixes in the Network
