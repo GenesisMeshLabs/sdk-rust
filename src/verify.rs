@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::strict::{is_known_entry_kind, known_fields_only, unknown_payload_fields};
 use crate::{
     auth::verify_canonical,
     canonical::{
@@ -412,56 +413,62 @@ fn any_signed(canonical: Result<String>, signatures: Option<&Value>, keys: &[Str
 
 /// True when the decision signature verifies under any of the operator (NA) keys.
 pub fn verify_decision_signature(decision: &Value, public_keys: &[String]) -> bool {
-    signed_by(
-        decision_canonical(decision),
-        decision.get("signature"),
-        public_keys,
-    )
+    known_fields_only("BoundaryDecision", decision)
+        && signed_by(
+            decision_canonical(decision),
+            decision.get("signature"),
+            public_keys,
+        )
 }
 
 /// True when any attestation signature verifies under the issuer keys.
 pub fn verify_attestation_signature(attestation: &Value, public_keys: &[String]) -> bool {
-    any_signed(
-        crate::canonical::attestation_canonical(attestation),
-        attestation.get("signatures"),
-        public_keys,
-    )
+    known_fields_only("MembershipAttestation", attestation)
+        && any_signed(
+            crate::canonical::attestation_canonical(attestation),
+            attestation.get("signatures"),
+            public_keys,
+        )
 }
 
 /// True when the policy signature verifies under the issuer keys.
 pub fn verify_policy_signature(policy: &Value, public_keys: &[String]) -> bool {
-    signed_by(
-        policy_canonical(policy),
-        policy.get("signature"),
-        public_keys,
-    )
+    known_fields_only("BoundaryPolicy", policy)
+        && signed_by(
+            policy_canonical(policy),
+            policy.get("signature"),
+            public_keys,
+        )
 }
 
 /// True when the justification proof signature verifies under the NA keys.
 pub fn verify_justification_signature(proof: &Value, public_keys: &[String]) -> bool {
-    signed_by(
-        justification_canonical(proof),
-        proof.get("signature"),
-        public_keys,
-    )
+    known_fields_only("JustificationProof", proof)
+        && signed_by(
+            justification_canonical(proof),
+            proof.get("signature"),
+            public_keys,
+        )
 }
 
 /// True when the retention checkpoint signature verifies under the NA keys.
 pub fn verify_retention_checkpoint(checkpoint: &Value, public_keys: &[String]) -> bool {
-    signed_by(
-        checkpoint_canonical(checkpoint),
-        checkpoint.get("signature"),
-        public_keys,
-    )
+    known_fields_only("RetentionCheckpoint", checkpoint)
+        && signed_by(
+            checkpoint_canonical(checkpoint),
+            checkpoint.get("signature"),
+            public_keys,
+        )
 }
 
 /// True when the record's signature verifies under the executor's public key.
 pub fn verify_execution_signature(evidence: &Value, executor_public_key: &str) -> bool {
-    signed_by(
-        execution_canonical(evidence),
-        evidence.get("signature"),
-        &[executor_public_key.to_owned()],
-    )
+    known_fields_only("ExecutionEvidence", evidence)
+        && signed_by(
+            execution_canonical(evidence),
+            evidence.get("signature"),
+            &[executor_public_key.to_owned()],
+        )
 }
 
 // ── Boundary decisions ────────────────────────────────────────────────────────
@@ -526,6 +533,19 @@ pub fn verify_boundary_decision(
 
     if !valid_decision(Some(decision)) {
         return reject("payload_invalid");
+    }
+    // v1.2.0: a field this SDK does not know is refused by name.
+    let unknown_policy = options
+        .expected_policies
+        .iter()
+        .flatten()
+        .any(|p| !known_fields_only("BoundaryPolicy", p));
+    let unknown_attestation = options
+        .expected_attestation
+        .as_ref()
+        .is_some_and(|a| !known_fields_only("MembershipAttestation", a));
+    if !known_fields_only("BoundaryDecision", decision) || unknown_policy || unknown_attestation {
+        return reject("unknown_field");
     }
     if decision.get("signature").is_none_or(Value::is_null) {
         return reject("missing_signature");
@@ -798,6 +818,13 @@ pub fn verify_evidence_events<'a>(
 
     for event in events {
         result.checked_entries += 1;
+        if let Some(kind) = event["entry"]["entry_kind"].as_str() {
+            if !is_known_entry_kind(kind) {
+                let seq = event["entry"]["store_sequence"].as_i64();
+                fail(&mut result, seq, "unknown_entry_kind", kind);
+                continue;
+            }
+        }
         if !valid_event(Some(event)) {
             fail(&mut result, None, "payload_invalid", "event envelope");
             continue;
@@ -845,7 +872,13 @@ pub fn verify_evidence_events<'a>(
         prev = Some(entry.clone());
 
         let payload = &event["payload"];
-        match str_field(entry, "entry_kind").unwrap_or_default() {
+        let kind = str_field(entry, "entry_kind").unwrap_or_default();
+        let unknown = unknown_payload_fields(kind, payload);
+        if !unknown.is_empty() {
+            fail(&mut result, s, "unknown_field", &unknown.join(", "));
+            continue;
+        }
+        match kind {
             "decision" => {
                 let decision = &payload["decision"];
                 if !valid_decision(payload.get("decision")) {

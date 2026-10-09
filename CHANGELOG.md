@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.2.0 - Unreleased
+
+### Changed
+
+- **Verifiers refuse fields they do not know.** A verifier that copied every
+  received field into the signed form accepted a field it did not understand
+  whenever the signer covered it, so a field added in a later release could
+  change what a record means. The crate now embeds the field registry of
+  signed records (generated from the Python reference, shipped in the shared
+  conformance suite `canonical`): `verify_boundary_decision` (including the
+  expected policies and attestation) returns `unknown_field`, the signature
+  helpers return `false`, and `verify_evidence_events` reports
+  `unknown_field` for a payload and `unknown_entry_kind` for an entry of
+  another kind. Free-form fields (`claims`, `execution_parameters`, ...) stay
+  open.
+
+### Added
+
+- `genesis_mesh_sdk::strict`: `unknown_fields`, `known_fields_only`,
+  `is_known_entry_kind` and `CANONICAL_REGISTRY`;
+  `scripts/sync_canonical_registry.py` regenerates the embedded registry from
+  a new copy of the suite.
+
 ## 1.1.1 - 2026-10-09
 
 Coordinated Genesis Mesh v1.1.1 release: security fixes in the Network
