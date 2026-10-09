@@ -392,7 +392,10 @@ async fn success_json_and_empty_body_contract() {
         if status == 204 {
             assert_eq!(result.unwrap(), json!({}));
         } else {
-            assert!(matches!(result, Err(GenesisMeshError::Json(_))));
+            // v1.2.0: a response is read strictly, so malformed JSON is named.
+            assert!(
+                matches!(result, Err(GenesisMeshError::StrictJson { ref reason, .. }) if reason == "invalid_json")
+            );
         }
         request.await.unwrap();
     }

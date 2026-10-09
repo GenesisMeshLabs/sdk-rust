@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::strict::{
-    is_known_entry_kind, prefixed_unknown_fields, unknown_fields, without_unknown_fields,
+    is_known_entry_kind, non_canonical_timestamps, prefixed_unknown_fields, unknown_fields,
+    without_unknown_fields,
 };
 use crate::{
     auth::verify_canonical,
@@ -566,6 +567,10 @@ pub fn verify_boundary_decision(
     {
         return reject("unknown_field");
     }
+    // v1.2.0: a decision signed over a form the reference does not write.
+    if !non_canonical_timestamps("BoundaryDecision", decision).is_empty() {
+        return reject("non_canonical_form");
+    }
 
     let proof = decision.get("freshness_proof").filter(|p| !p.is_null());
     if let Some(proof) = proof {
@@ -867,7 +872,7 @@ fn check_payload_fields(
 pub fn parse_export_lines(text: &str) -> Result<Vec<Value>> {
     let mut events = Vec::new();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let event: Value = serde_json::from_str(line)?;
+        let event = crate::strict_json::parse_strict_json(line)?;
         if !valid_event(Some(&event)) {
             return Err(GenesisMeshError::Verification(
                 "invalid evidence event envelope or unsupported schema".into(),

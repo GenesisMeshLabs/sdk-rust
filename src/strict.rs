@@ -7,8 +7,11 @@
 //! `field_registry`) lists every field of every record this crate verifies.
 //! Verifiers check the signature over the record as received first; a signed
 //! field the registry does not list is then refused as `unknown_field`, and an
-//! evidence export entry of another kind as `unknown_entry_kind`. See the
-//! core's reference page "Canonical Form of Signed Records".
+//! evidence export entry of another kind as `unknown_entry_kind`. A record
+//! signed over a form the reference does not write is refused as
+//! `non_canonical_form`; this crate checks the form of the timestamps the
+//! registry marks (v1.2.0). See the core's reference page "Canonical Form of
+//! Signed Records".
 
 use std::sync::LazyLock;
 
@@ -142,4 +145,123 @@ pub fn registry_list(model: &str, rule: &str) -> Vec<String> {
         .flatten()
         .filter_map(|v| v.as_str().map(str::to_owned))
         .collect()
+}
+
+/// True when `value` is a timestamp in canonical form (v1.2.0): what the
+/// reference writes, `YYYY-MM-DDTHH:MM:SS`, six digits of microseconds when
+/// not all zero, then `Z` for UTC or `+HH:MM` / `-HH:MM` for another offset
+/// (none for a timestamp without one), naming an instant that exists.
+pub fn canonical_timestamp(value: &str) -> bool {
+    let b = value.as_bytes();
+    let digits = |from: usize, len: usize| -> Option<u32> {
+        let part = b.get(from..from + len)?;
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| std::str::from_utf8(part).ok()?.parse().ok())?
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        digits(0, 4),
+        digits(5, 2),
+        digits(8, 2),
+        digits(11, 2),
+        digits(14, 2),
+        digits(17, 2),
+    ) else {
+        return false;
+    };
+    if b.get(4) != Some(&b'-')
+        || b.get(7) != Some(&b'-')
+        || b.get(10) != Some(&b'T')
+        || b.get(13) != Some(&b':')
+        || b.get(16) != Some(&b':')
+    {
+        return false;
+    }
+    let mut at = 19;
+    if b.get(at) == Some(&b'.') {
+        match digits(at + 1, 6) {
+            Some(0) | None => return false,
+            Some(_) => at += 7,
+        }
+    }
+    match &b[at..] {
+        b"" | b"Z" => {}
+        [sign @ (b'+' | b'-'), zone @ ..] if zone.len() == 5 && zone[2] == b':' => {
+            let (Some(h), Some(m)) = (digits(at + 1, 2), digits(at + 4, 2)) else {
+                return false;
+            };
+            if h > 23 || m > 59 || (h == 0 && m == 0) {
+                let _ = sign;
+                return false;
+            }
+        }
+        _ => return false,
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    year >= 1
+        && (1..=12).contains(&month)
+        && day >= 1
+        && day <= days[month as usize - 1]
+        && hour <= 23
+        && minute <= 59
+        && second <= 59
+}
+
+/// Dotted paths, sorted, of the timestamps in `data`'s signed projection
+/// that are not in canonical form (v1.2.0). Values that are not strings are
+/// left to validation.
+pub fn non_canonical_timestamps(model: &str, data: &Value) -> Vec<String> {
+    fn walk(model: &str, data: &Value, prefix: &str, projection: bool, found: &mut Vec<String>) {
+        let spec = &REGISTRY["models"][model];
+        let (Some(fields), Some(record)) = (spec["fields"].as_object(), data.as_object()) else {
+            return;
+        };
+        for (key, value) in record {
+            if projection && outside_projection(spec, key) || value.is_null() {
+                continue;
+            }
+            let Some(kind) = fields.get(key) else {
+                continue;
+            };
+            if kind == "timestamp" {
+                let loose = match value {
+                    Value::Array(items) => items
+                        .iter()
+                        .any(|i| i.as_str().is_some_and(|s| !canonical_timestamp(s))),
+                    other => other.as_str().is_some_and(|s| !canonical_timestamp(s)),
+                };
+                if loose {
+                    found.push(format!("{prefix}{key}"));
+                }
+            } else if let Some(nested) = kind.get("object").and_then(Value::as_str) {
+                walk(nested, value, &format!("{prefix}{key}."), false, found);
+            } else if let Some(nested) = kind.get("list").and_then(Value::as_str) {
+                for (i, item) in value.as_array().into_iter().flatten().enumerate() {
+                    walk(nested, item, &format!("{prefix}{key}.{i}."), false, found);
+                }
+            } else if let Some(nested) = kind.get("map").and_then(Value::as_str) {
+                for (k, item) in value.as_object().into_iter().flatten() {
+                    walk(nested, item, &format!("{prefix}{key}.{k}."), false, found);
+                }
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(model, data, "", true, &mut found);
+    found.sort();
+    found
 }
