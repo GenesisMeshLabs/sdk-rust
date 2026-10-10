@@ -1,6 +1,10 @@
 # Changelog
 
-## 1.2.0 - Unreleased
+## 1.2.0 - 2026-10-10
+
+Coordinated Genesis Mesh v1.2.0 release, *Nothing Lost, Anchored*: an
+evidence outbox for governed actions, verifiers that refuse what they do not
+know, strict input and records only in canonical form.
 
 ### Changed (breaking)
 
