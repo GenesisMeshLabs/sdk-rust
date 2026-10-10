@@ -2,8 +2,40 @@
 
 ## 1.2.0 - Unreleased
 
+### Changed (breaking)
+
+- **Verifiers refuse signed fields they do not know.** This crate used to
+  copy every received field into the signed form, so a field a newer signer
+  covered verified here and could change what a record means. It now embeds
+  the field registry of signed records (generated from the Python reference,
+  shipped in the shared conformance suite `field_registry`). Verifiers check
+  the signature over the record as received first; an authentic record with a
+  signed field the registry does not list is then refused as `unknown_field`,
+  meaning this crate must be upgraded: `verify_boundary_decision` (also for
+  the expected policies and attestation), the signature helpers (which return
+  `false`) and `verify_evidence_events`. Only the signed projection is
+  checked; free-form fields (`claims`, `execution_parameters`, ...) stay open.
+- `verify_evidence_events` names an entry of an unknown kind
+  (`unknown_entry_kind`, previously `payload_invalid`) and keeps it in the
+  chain; `parse_export_lines` accepts entries of any kind. A field outside a
+  stored record's signature (records stored before 1.1.1) is reported in the
+  new `EvidenceVerification::warnings` as `unsigned_field` and the record is
+  verified without it. `EvidenceVerification` gains the `warnings` field.
+- `GenesisMeshError` and its `ActionFailed`, `ActionUnrecorded`,
+  `MetadataRefused` and `EvidenceNotKept` variants are `#[non_exhaustive]`:
+  match with a wildcard arm and `..`. `ActionFailed` carries the failure
+  record and its outbox entry; `ActionUnrecorded` carries the record when it
+  was signed.
+- `GovernedActionResult` is `#[non_exhaustive]` and gains `queued`.
+  `ClientOptions` gains `outbox`. `governed_action`'s value type must be
+  `Send + 'static`.
+
 ### Added
 
+- `genesis_mesh_sdk::strict::{unknown_fields, is_known_entry_kind}` and
+  `canonical::DECISION_OMITTED_WHEN_ABSENT`;
+  `scripts/sync_canonical_registry.py` regenerates the embedded registry from
+  a new copy of the suite, and CI checks the suite against the core's.
 - **An evidence outbox keeps signed evidence until the NA admits it.** With
   `ClientOptions::with_outbox`, `governed_action` writes each signed record to
   the outbox before submitting it and removes it once admitted. A failed
@@ -25,17 +57,6 @@
   record returns `EvidenceNotKept`. Both carry the action's value
   (`GenesisMeshError::take_action_value`). `Outbox`, `OutboxRequired` and
   `FlushInProgress` errors.
-
-### Changed (breaking)
-
-- `GenesisMeshError` and its `ActionFailed`, `ActionUnrecorded`,
-  `MetadataRefused` and `EvidenceNotKept` variants are `#[non_exhaustive]`:
-  match with a wildcard arm and `..`. `ActionFailed` carries the failure
-  record and its outbox entry; `ActionUnrecorded` carries the record when it
-  was signed.
-- `GovernedActionResult` is `#[non_exhaustive]` and gains `queued`.
-  `ClientOptions` gains `outbox`. `governed_action`'s value type must be
-  `Send + 'static`.
 
 ## 1.1.1 - 2026-10-09
 

@@ -18,6 +18,7 @@ mod governance;
 mod health;
 mod outbox;
 mod policy;
+pub mod strict;
 pub mod verify;
 
 pub use agreement::AgreementClient;

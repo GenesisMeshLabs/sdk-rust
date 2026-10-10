@@ -1,0 +1,145 @@
+//! Strict verification (v1.2.0): every signed field of a record is known.
+//!
+//! Before 1.2.0 this crate copied every received field into the signed form,
+//! so a field a newer signer covered verified here and could change what a
+//! record means. The registry (`src/canonical_registry.json`, generated from
+//! the Python reference and shipped in the shared conformance suite
+//! `field_registry`) lists every field of every record this crate verifies.
+//! Verifiers check the signature over the record as received first; a signed
+//! field the registry does not list is then refused as `unknown_field`, and an
+//! evidence export entry of another kind as `unknown_entry_kind`. See the
+//! core's reference page "Canonical Form of Signed Records".
+
+use std::sync::LazyLock;
+
+use serde_json::Value;
+
+static REGISTRY: LazyLock<Value> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("canonical_registry.json"))
+        .expect("the embedded canonical registry is valid JSON")
+});
+
+/// The embedded registry, for the conformance tests. Regenerate it with
+/// `python scripts/sync_canonical_registry.py` after copying a new suite.
+#[doc(hidden)]
+pub fn embedded_registry() -> &'static Value {
+    &REGISTRY
+}
+
+#[derive(Clone)]
+enum Step {
+    Key(String),
+    Index(usize),
+}
+
+fn render(prefix: &str, steps: &[Step]) -> String {
+    let parts: Vec<String> = steps
+        .iter()
+        .map(|s| match s {
+            Step::Key(k) => k.clone(),
+            Step::Index(i) => i.to_string(),
+        })
+        .collect();
+    format!("{prefix}{}", parts.join("."))
+}
+
+fn outside_projection(spec: &Value, key: &str) -> bool {
+    spec["signature_field"].as_str() == Some(key)
+        || spec["canonical_fields"]
+            .as_array()
+            .is_some_and(|fields| !fields.iter().any(|f| f.as_str() == Some(key)))
+}
+
+fn collect(model: &str, data: &Value, path: &[Step], projection: bool, found: &mut Vec<Vec<Step>>) {
+    let spec = &REGISTRY["models"][model];
+    let (Some(fields), Some(record)) = (spec["fields"].as_object(), data.as_object()) else {
+        return;
+    };
+    for (key, value) in record {
+        if projection && outside_projection(spec, key) {
+            continue;
+        }
+        let mut here = path.to_vec();
+        here.push(Step::Key(key.clone()));
+        let Some(kind) = fields.get(key) else {
+            found.push(here);
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        if let Some(nested) = kind.get("object").and_then(Value::as_str) {
+            collect(nested, value, &here, false, found);
+        } else if let Some(nested) = kind.get("list").and_then(Value::as_str) {
+            for (i, item) in value.as_array().into_iter().flatten().enumerate() {
+                let mut at = here.clone();
+                at.push(Step::Index(i));
+                collect(nested, item, &at, false, found);
+            }
+        } else if let Some(nested) = kind.get("map").and_then(Value::as_str) {
+            for (k, item) in value.as_object().into_iter().flatten() {
+                let mut at = here.clone();
+                at.push(Step::Key(k.clone()));
+                collect(nested, item, &at, false, found);
+            }
+        }
+    }
+}
+
+/// Dotted paths, sorted, of the signed fields in `data` that `model` does not
+/// define, at any depth (`policy_binding.policies.0.extra`). Only the signed
+/// projection is checked (not the signature, not an agreement's unsigned
+/// fields); free-form fields are not inspected; values of the wrong type are
+/// left to validation.
+pub fn unknown_fields(model: &str, data: &Value) -> Vec<String> {
+    prefixed_unknown_fields(model, data, "")
+}
+
+pub(crate) fn prefixed_unknown_fields(model: &str, data: &Value, prefix: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    collect(model, data, &[], true, &mut found);
+    let mut paths: Vec<String> = found.iter().map(|steps| render(prefix, steps)).collect();
+    paths.sort();
+    paths
+}
+
+/// True when this crate knows the evidence entry kind.
+pub fn is_known_entry_kind(kind: &str) -> bool {
+    REGISTRY["entry_kinds"]
+        .as_array()
+        .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some(kind)))
+}
+
+/// A copy of `data` without its unknown signed fields: what the signer did sign.
+pub(crate) fn without_unknown_fields(model: &str, data: &Value) -> Value {
+    let mut copy = data.clone();
+    let mut found = Vec::new();
+    collect(model, data, &[], true, &mut found);
+    for steps in found {
+        let Some((last, parents)) = steps.split_last() else {
+            continue;
+        };
+        let mut node = &mut copy;
+        for step in parents {
+            node = match step {
+                Step::Key(k) => &mut node[k.as_str()],
+                Step::Index(i) => &mut node[*i],
+            };
+        }
+        if let (Step::Key(k), Some(object)) = (last, node.as_object_mut()) {
+            object.remove(k);
+        }
+    }
+    copy
+}
+
+/// A root's canonical rules, for the conformance tests.
+#[doc(hidden)]
+pub fn registry_list(model: &str, rule: &str) -> Vec<String> {
+    REGISTRY["models"][model][rule]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect()
+}
