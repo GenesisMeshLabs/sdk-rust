@@ -2,7 +2,7 @@ use std::any::Any;
 
 use serde_json::Value;
 
-use crate::outbox::OutboxEntry;
+use crate::outbox::{OutboxEntry, RecordOutboxEntry};
 
 /// SDK result type.
 pub type Result<T> = std::result::Result<T, GenesisMeshError>;
@@ -96,11 +96,15 @@ pub enum GenesisMeshError {
         /// The action's error.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
-        /// The signed failure record (v1.2.0).
+        /// The signed failure record (v1.2.0): execution evidence, or the
+        /// break-glass record when the action ran under break-glass (v1.3.0).
         evidence: Option<Box<Value>>,
         /// With an outbox, the entry holding the failure record when the NA
         /// has not admitted it (v1.2.0).
         queued: Option<Box<OutboxEntry>>,
+        /// Under break-glass, the record outbox entry holding the failure
+        /// record when the NA has not admitted it (v1.3.0).
+        queued_record: Option<Box<RecordOutboxEntry>>,
     },
 
     /// A governed action failed and its failure record could not be signed,
@@ -143,7 +147,9 @@ pub enum GenesisMeshError {
     /// could not be signed or kept in the outbox. `evidence` is the signed
     /// record when signing succeeded: pass it to
     /// [`EvidenceStoreClient::enqueue`](crate::EvidenceStoreClient::enqueue)
-    /// once the outbox works. Do not rerun the action.
+    /// once the outbox works (a break-glass record, v1.3.0, to
+    /// [`EvidenceStoreClient::enqueue_record`](crate::EvidenceStoreClient::enqueue_record)).
+    /// Do not rerun the action.
     /// [`GenesisMeshError::take_action_value`] takes the action's value.
     #[error("the action ran; its evidence was not kept: {source}")]
     #[non_exhaustive]
@@ -168,9 +174,28 @@ pub enum GenesisMeshError {
     #[error("no evidence outbox is configured (ClientOptions::with_outbox)")]
     OutboxRequired,
 
-    /// Another `flush_pending` run is in progress on this client (v1.2.0).
+    /// Another `flush_pending` run is in progress on this client (v1.2.0),
+    /// or another `flush_records` run (v1.3.0).
     #[error("a flush of the evidence outbox is already running")]
     FlushInProgress,
+
+    /// A record of a change made outside the controlled path would be
+    /// refused, so it was not signed (v1.3.0). `code` is the one the NA would
+    /// return: `observation_malformed`, `observation_secret_material`,
+    /// `break_glass_malformed` or `break_glass_secret_material`.
+    #[error("record refused: {message} [{code}]")]
+    OutOfBandRecord {
+        /// Why, as the NA names it.
+        code: String,
+        /// What is wrong.
+        message: String,
+    },
+
+    /// No record outbox is configured
+    /// ([`ClientOptions::with_record_outbox`](crate::ClientOptions::with_record_outbox));
+    /// the record outbox methods and break-glass need one (v1.3.0).
+    #[error("no record outbox is configured (ClientOptions::with_record_outbox)")]
+    RecordOutboxRequired,
 }
 
 /// A governed action's value carried by an error that says the action ran
@@ -207,7 +232,8 @@ impl GenesisMeshError {
             | Self::NotFound { code, .. }
             | Self::RateLimit { code, .. }
             | Self::BadRequest { code, .. }
-            | Self::Http { code, .. } => code,
+            | Self::Http { code, .. }
+            | Self::OutOfBandRecord { code, .. } => code,
             Self::DecisionVerification(reason) => reason,
             Self::StrictJson { reason, .. } => reason,
             Self::SecretMaterial(_) => "evidence_secret_material",
@@ -219,6 +245,7 @@ impl GenesisMeshError {
             Self::Outbox(_) => "outbox_error",
             Self::OutboxRequired => "outbox_required",
             Self::FlushInProgress => "outbox_flush_in_progress",
+            Self::RecordOutboxRequired => "record_outbox_required",
             Self::Configuration(_) => "configuration",
             Self::Network(_) => "network",
             Self::Json(_) => "json",

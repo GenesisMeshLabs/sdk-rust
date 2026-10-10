@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex, PoisonError,
     },
 };
 
@@ -11,13 +11,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
-    canonical::execution_digest,
+    canonical::{execution_digest, out_of_band_digest},
     client::{query_pairs, resource_path, segment, HttpTransport},
     errors::{GenesisMeshError, Result},
     execution::ensure_metadata_only,
     outbox::{
-        classify_submission_error, retry_delay, timestamp, Delivery, EvidenceOutbox, FlushReport,
-        OutboxEntry, OutboxState, SubmissionFailure, PREDECESSOR_DEAD_LETTERED,
+        classify_record_submission_error, classify_submission_error, retry_delay, timestamp,
+        Delivery, EvidenceOutbox, FlushReport, OutboxEntry, OutboxState, RecordDelivery,
+        RecordFlushReport, RecordKind, RecordOutbox, RecordOutboxEntry, SubmissionFailure,
+        PREDECESSOR_DEAD_LETTERED,
     },
     verify::parse_export_lines,
 };
@@ -28,6 +30,9 @@ pub const MAX_PAGE: u64 = 1000;
 /// Most pending records an action submits before its own (older ones wait
 /// for `flush_pending`).
 const MAX_INLINE_DRAIN: usize = 100;
+
+/// Most observations one batch request carries (v1.3.0).
+const OBSERVATION_BATCH: usize = 100;
 
 /// The head of a resource chain: what the next record must link to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,21 +81,64 @@ impl Drop for Flushing<'_> {
     }
 }
 
+/// Ids of the records an `enqueue` call is submitting right now (v1.3.0): a
+/// flush running meanwhile leaves them to it and reports them pending, so
+/// one record is never submitted twice at once nor settled by two runs.
+#[derive(Debug, Default)]
+struct InFlight(Mutex<HashSet<String>>);
+
+impl InFlight {
+    fn ids(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.ids().contains(id)
+    }
+
+    /// Mark `id` in flight until the guard drops, however the call ends.
+    fn hold(&self, id: &str) -> Holding<'_> {
+        self.ids().insert(id.to_owned());
+        Holding(self, id.to_owned())
+    }
+}
+
+struct Holding<'a>(&'a InFlight, String);
+
+impl Drop for Holding<'_> {
+    fn drop(&mut self) {
+        self.0.ids().remove(&self.1);
+    }
+}
+
 /// The NA execution evidence store (v0.59): controller submission, operator
-/// search, history, export, executor keys and retention.
+/// search, history, export, executor keys and retention; from v1.3.0 also
+/// observations, break-glass records and their judgements.
 #[derive(Debug, Clone)]
 pub struct EvidenceStoreClient {
     http: Arc<HttpTransport>,
     outbox: Option<Arc<dyn EvidenceOutbox>>,
     flushing: Arc<AtomicBool>,
+    in_flight: Arc<InFlight>,
+    record_outbox: Option<Arc<dyn RecordOutbox>>,
+    flushing_records: Arc<AtomicBool>,
+    records_in_flight: Arc<InFlight>,
 }
 
 impl EvidenceStoreClient {
-    pub(crate) fn new(http: Arc<HttpTransport>, outbox: Option<Arc<dyn EvidenceOutbox>>) -> Self {
+    pub(crate) fn new(
+        http: Arc<HttpTransport>,
+        outbox: Option<Arc<dyn EvidenceOutbox>>,
+        record_outbox: Option<Arc<dyn RecordOutbox>>,
+    ) -> Self {
         Self {
             http,
             outbox,
             flushing: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::default(),
+            record_outbox,
+            flushing_records: Arc::new(AtomicBool::new(false)),
+            records_in_flight: Arc::default(),
         }
     }
 
@@ -142,6 +190,7 @@ impl EvidenceStoreClient {
             return Ok(Delivery::queued(refused));
         }
         if pending.is_empty() {
+            let _holding = self.in_flight.hold(&entry.id);
             return self.attempt(outbox, &mut entries, entry).await;
         }
         if pending.len() > MAX_INLINE_DRAIN || self.flushing.swap(true, Ordering::AcqRel) {
@@ -167,7 +216,8 @@ impl EvidenceStoreClient {
     /// Submit the outbox's pending records in the order they were added
     /// (v1.2.0). A record waits while one it chains from is pending, and is
     /// dead-lettered (`evidence_predecessor_dead_lettered`) when that one was
-    /// refused. Records in backoff are skipped unless `ignore_backoff`; a
+    /// refused. Records in backoff are skipped unless `ignore_backoff`, as is
+    /// a record an `enqueue` call is submitting (reported pending, v1.3.0); a
     /// transient error ends the run, leaving the rest for the next one. Run
     /// it at startup and on a timer, one run at a time per client: a call
     /// while another runs returns [`GenesisMeshError::FlushInProgress`].
@@ -255,6 +305,13 @@ impl EvidenceStoreClient {
                 continue;
             }
             let digest = execution_digest(&entry.evidence)?;
+            if self.in_flight.contains(&entry.id) {
+                // `enqueue` is submitting it: still pending as far as this run knows.
+                waiting.insert(digest);
+                outcomes.insert(entry.id.clone(), Delivery::queued(entry.clone()));
+                report.pending.push(entry);
+                continue;
+            }
             if only.is_some_and(|only| !only.contains(&entry.id)) {
                 waiting.insert(digest);
                 continue;
@@ -344,6 +401,8 @@ impl EvidenceStoreClient {
     }
 
     /// Store mode, size, last sequence and retention checkpoint (admin).
+    /// v1.3.0: `unjudged_records`, when present, counts the observations and
+    /// break-glass records not judged yet (they hold retention back).
     pub async fn status(&self) -> Result<Value> {
         self.http.admin_get("/admin/evidence/status", &[]).await
     }
@@ -431,7 +490,11 @@ impl EvidenceStoreClient {
     }
 
     /// Register a controller's executor signing key (admin, privileged):
-    /// `key_id`, `public_key` (raw base64), `executor_sovereign_id`.
+    /// `key_id`, `public_key` (raw base64), `executor_sovereign_id`. v1.3.0:
+    /// `role` is `executor` (the default), which signs execution evidence and
+    /// break-glass records, or `observer`, which signs observations only;
+    /// `resource_prefix` (or `null`) limits the key to resources whose id
+    /// starts with it.
     pub async fn register_executor_key(&self, params: Value) -> Result<Value> {
         self.http
             .admin_post("/admin/evidence/executor-keys", params)
@@ -490,6 +553,298 @@ impl EvidenceStoreClient {
         }
     }
 
+    // ── Changes outside the controlled path (v1.3.0) ─────────────────────────
+
+    /// The configured record outbox (v1.3.0).
+    pub fn record_outbox(&self) -> Option<&Arc<dyn RecordOutbox>> {
+        self.record_outbox.as_ref()
+    }
+
+    fn require_record_outbox(&self) -> Result<&dyn RecordOutbox> {
+        self.record_outbox
+            .as_deref()
+            .ok_or(GenesisMeshError::RecordOutboxRequired)
+    }
+
+    /// Submit one signed observation (v1.3.0). Authenticated by the observer
+    /// key's signature, not operator headers. Idempotent per source event: a
+    /// resubmission returns `status: "duplicate"`; `quarantined` means the NA
+    /// kept an authentic record outside its time bounds, unjudged. The answer
+    /// carries the `judgement` made at admission, when the NA judges then.
+    pub async fn submit_observation(&self, observation: Value) -> Result<Value> {
+        self.http
+            .public_post(
+                "/evidence/observations",
+                json!({ "observation": observation }),
+            )
+            .await
+    }
+
+    /// Submit up to 100 signed observations in one request (v1.3.0); the NA
+    /// admits them in order of their change times. One result per
+    /// observation, with its `index` in the request: `recorded`, `duplicate`,
+    /// `quarantined`, or `refused` with an `error` (`code`, `message`).
+    pub async fn submit_observations(&self, observations: &[Value]) -> Result<Vec<Value>> {
+        let mut body: Value = self
+            .http
+            .public_post(
+                "/evidence/observations/batch",
+                json!({ "observations": observations }),
+            )
+            .await?;
+        Ok(match body["results"].take() {
+            Value::Array(results) => results,
+            _ => Vec::new(),
+        })
+    }
+
+    /// Submit one signed break-glass record (v1.3.0), authenticated by the
+    /// executor key's signature. A resubmission returns `status: "duplicate"`.
+    pub async fn submit_break_glass(&self, record: Value) -> Result<Value> {
+        self.http
+            .public_post("/evidence/break-glass", json!({ "record": record }))
+            .await
+    }
+
+    /// Keep a signed observation or break-glass record in the record outbox
+    /// and submit it (v1.3.0). A failed submission is not an error: a
+    /// transient one leaves the record pending for
+    /// [`flush_records`](Self::flush_records), and a refusal no retry can
+    /// overcome ([`RECORD_PERMANENT_REFUSALS`](crate::RECORD_PERMANENT_REFUSALS))
+    /// keeps it as a dead letter. Fails only when the record outbox cannot
+    /// store the record. Passing a record already in the outbox submits it
+    /// again.
+    pub async fn enqueue_record(&self, record: Value) -> Result<RecordDelivery> {
+        let outbox = self.require_record_outbox()?;
+        let fresh = RecordOutboxEntry::new(record);
+        if fresh.id.is_empty() {
+            return Err(GenesisMeshError::Configuration(
+                "a record needs an observation_id or a break_glass_id".into(),
+            ));
+        }
+        let entries = outbox.list().await.map_err(outbox_error)?;
+        let entry = match entries.into_iter().find(|e| e.id == fresh.id) {
+            Some(found)
+                if out_of_band_digest(&found.record)? != out_of_band_digest(&fresh.record)? =>
+            {
+                return Err(GenesisMeshError::Outbox(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "a different record with id {} is in the record outbox",
+                        fresh.id
+                    ),
+                )))
+            }
+            Some(found) => found,
+            None => {
+                outbox.add(&fresh).await.map_err(outbox_error)?;
+                fresh
+            }
+        };
+        if entry.state == OutboxState::DeadLetter {
+            return Ok(RecordDelivery::queued(entry));
+        }
+        let _holding = self.records_in_flight.hold(&entry.id);
+        Ok(self.attempt_record(outbox, entry).await)
+    }
+
+    /// Submit the record outbox's pending records in the order they were
+    /// added (v1.3.0), consecutive observations up to 100 per request and
+    /// break-glass records one at a time. Records in backoff are skipped
+    /// unless `ignore_backoff`, as are records an `enqueue_record` call is
+    /// submitting (reported pending); a transient error ends the run. A record the
+    /// NA keeps as a quarantine entry is admitted and also listed in
+    /// `quarantined`. One run at a time per client: a call while another
+    /// runs returns [`GenesisMeshError::FlushInProgress`].
+    pub async fn flush_records(&self, options: FlushOptions) -> Result<RecordFlushReport> {
+        let outbox = self.require_record_outbox()?;
+        if self.flushing_records.swap(true, Ordering::AcqRel) {
+            return Err(GenesisMeshError::FlushInProgress);
+        }
+        let _flushing = Flushing(&self.flushing_records);
+        let entries: Vec<RecordOutboxEntry> = outbox
+            .list()
+            .await
+            .map_err(outbox_error)?
+            .into_iter()
+            .filter(|e| e.state == OutboxState::Pending)
+            .collect();
+        // A record `enqueue_record` is submitting is left to it, as pending.
+        let due = |e: &RecordOutboxEntry| {
+            !self.records_in_flight.contains(&e.id) && (options.ignore_backoff || e.due(Utc::now()))
+        };
+        let mut report = RecordFlushReport::default();
+        let mut stopped = false;
+        let mut index = 0;
+        while index < entries.len() {
+            let entry = &entries[index];
+            if stopped || !due(entry) {
+                report.pending.push(entry.clone());
+                index += 1;
+                continue;
+            }
+            if entry.kind == RecordKind::BreakGlass {
+                let delivery = self.attempt_record(outbox, entry.clone()).await;
+                stopped = !settle(&mut report, entry, delivery);
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < entries.len()
+                && index - start < OBSERVATION_BATCH
+                && entries[index].kind == RecordKind::Observation
+                && due(&entries[index])
+            {
+                index += 1;
+            }
+            let batch = &entries[start..index];
+            let records: Vec<Value> = batch.iter().map(|e| e.record.clone()).collect();
+            let results = match self.submit_observations(&records).await {
+                Ok(results) => results,
+                Err(err) if classify_record_submission_error(&err).1 => {
+                    for e in batch {
+                        let failed = record_failed(outbox, e.clone(), &err).await;
+                        settle(&mut report, e, RecordDelivery::queued(failed));
+                    }
+                    stopped = true;
+                    continue;
+                }
+                Err(_) => {
+                    // The batch itself was refused: each observation is tried alone.
+                    for e in batch {
+                        if stopped {
+                            report.pending.push(e.clone());
+                        } else {
+                            let delivery = self.attempt_record(outbox, e.clone()).await;
+                            stopped = !settle(&mut report, e, delivery);
+                        }
+                    }
+                    continue;
+                }
+            };
+            for (position, e) in batch.iter().enumerate() {
+                match results
+                    .iter()
+                    .find(|r| r["index"].as_u64() == Some(position as u64))
+                {
+                    None => report.pending.push(e.clone()),
+                    Some(answer) if answer["status"] == "refused" => {
+                        let refusal = batch_refusal(&answer["error"]);
+                        let failed = record_failed(outbox, e.clone(), &refusal).await;
+                        settle(&mut report, e, RecordDelivery::queued(failed));
+                    }
+                    Some(answer) => {
+                        // The NA holds the record even if this fails: the next
+                        // flush resubmits it, gets a duplicate and removes it.
+                        let _ = outbox.remove(&e.id).await;
+                        settle(&mut report, e, RecordDelivery::admitted(answer.clone()));
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    async fn attempt_record(
+        &self,
+        outbox: &dyn RecordOutbox,
+        entry: RecordOutboxEntry,
+    ) -> RecordDelivery {
+        let submitted = match entry.kind {
+            RecordKind::Observation => self.submit_observation(entry.record.clone()).await,
+            RecordKind::BreakGlass => self.submit_break_glass(entry.record.clone()).await,
+        };
+        match submitted {
+            Ok(ack) => {
+                // The NA holds the record even if this fails: the next flush
+                // resubmits it, gets a duplicate and removes it.
+                let _ = outbox.remove(&entry.id).await;
+                RecordDelivery::admitted(ack)
+            }
+            Err(err) => RecordDelivery::queued(record_failed(outbox, entry, &err).await),
+        }
+    }
+
+    /// Judge an observation once (admin, v1.3.0): `status` `judged`, or
+    /// `existing` with the judgement made before.
+    pub async fn judge_observation(&self, observation_id: &str) -> Result<Value> {
+        self.http
+            .admin_post(
+                &format!(
+                    "/admin/evidence/observations/{}/judge",
+                    segment(observation_id)?
+                ),
+                json!({}),
+            )
+            .await
+    }
+
+    /// Judge a break-glass record once (admin, v1.3.0): `status` `judged`,
+    /// or `existing` with the judgement made before.
+    pub async fn judge_break_glass(&self, break_glass_id: &str) -> Result<Value> {
+        self.http
+            .admin_post(
+                &format!(
+                    "/admin/evidence/break-glass/{}/judge",
+                    segment(break_glass_id)?
+                ),
+                json!({}),
+            )
+            .await
+    }
+
+    /// Every change to a resource, oldest first, with how it was governed
+    /// (`prior_decision` or `after_the_fact`) and its state (`recorded`,
+    /// `matched`, `judged_allowed`, `judged_denied`, `indeterminate`,
+    /// `observed`, `quarantined`) (admin, v1.3.0). `truncated: true` when
+    /// the resource has more changes than one response holds.
+    pub async fn resource_changes(&self, resource_id: &str) -> Result<Value> {
+        self.http
+            .admin_get(
+                &format!("/admin/evidence/changes/{}", resource_path(resource_id)?),
+                &[],
+            )
+            .await
+    }
+
+    /// Operator key holders as the evidence store records them (admin,
+    /// v1.3.0).
+    pub async fn operator_holders(&self) -> Result<Vec<Value>> {
+        let mut body: Value = self
+            .http
+            .admin_get("/admin/evidence/operator-holders", &[])
+            .await?;
+        Ok(match body["holders"].take() {
+            Value::Array(holders) => holders,
+            _ => Vec::new(),
+        })
+    }
+
+    /// Propose a new holder for an operator key (admin, privileged, v1.3.0);
+    /// a privileged key of another holder approves it.
+    pub async fn propose_holder(&self, key_id: &str, holder: &str) -> Result<Value> {
+        self.http
+            .admin_post(
+                &format!("/admin/operator-keys/{}/holder", segment(key_id)?),
+                json!({ "holder": holder }),
+            )
+            .await
+    }
+
+    /// Approve a holder change with a privileged key of a different holder
+    /// (admin, privileged, v1.3.0).
+    pub async fn approve_holder(&self, proposal_id: &str) -> Result<Value> {
+        self.http
+            .admin_post(
+                &format!(
+                    "/admin/operator-keys/holder-changes/{}/approve",
+                    segment(proposal_id)?
+                ),
+                json!({}),
+            )
+            .await
+    }
+
     async fn resource_head_from_history(&self, resource_id: &str) -> Result<Option<ResourceHead>> {
         let history = match self.resource_history(resource_id).await {
             Ok(history) => history,
@@ -532,6 +887,82 @@ impl EvidenceStoreClient {
             }
         }
         Ok(head)
+    }
+}
+
+/// A record outbox entry after a failed submission: pending with a backoff,
+/// or a dead letter. Once the NA has answered, the answer stands even if the
+/// outbox cannot store it: the entry keeps its previous state and the next
+/// flush settles it.
+async fn record_failed(
+    outbox: &dyn RecordOutbox,
+    entry: RecordOutboxEntry,
+    err: &GenesisMeshError,
+) -> RecordOutboxEntry {
+    let (failure, transient) = classify_record_submission_error(err);
+    let attempts = entry.attempts + 1;
+    let next = if transient {
+        let retry =
+            chrono::Duration::from_std(retry_delay(attempts)).unwrap_or(chrono::Duration::MAX);
+        RecordOutboxEntry {
+            attempts,
+            next_attempt_at: Some(timestamp(Utc::now() + retry)),
+            last_error: Some(failure),
+            ..entry
+        }
+    } else {
+        RecordOutboxEntry {
+            attempts,
+            state: OutboxState::DeadLetter,
+            next_attempt_at: None,
+            last_error: Some(failure),
+            ..entry
+        }
+    };
+    let _ = outbox.update(&next).await;
+    next
+}
+
+/// One refused result of a batch, as the error its single submission gives.
+fn batch_refusal(error: &Value) -> GenesisMeshError {
+    let code = error["code"].as_str().unwrap_or("unknown").to_owned();
+    let message = error["message"]
+        .as_str()
+        .map_or_else(|| code.clone(), str::to_owned);
+    if code.ends_with("_conflict") {
+        GenesisMeshError::Http {
+            status: 409,
+            message,
+            code,
+        }
+    } else {
+        GenesisMeshError::Validation { message, code }
+    }
+}
+
+/// File an entry's delivery in the report; true unless it stays pending.
+fn settle(
+    report: &mut RecordFlushReport,
+    entry: &RecordOutboxEntry,
+    delivery: RecordDelivery,
+) -> bool {
+    if let Some(ack) = delivery.submission {
+        report.admitted.push(entry.clone());
+        if ack["status"] == "quarantined" {
+            report.quarantined.push(entry.clone());
+        }
+        return true;
+    }
+    match delivery.queued {
+        Some(queued) if queued.state == OutboxState::DeadLetter => {
+            report.dead_lettered.push(queued);
+            true
+        }
+        Some(queued) => {
+            report.pending.push(queued);
+            false
+        }
+        None => false,
     }
 }
 

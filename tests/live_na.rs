@@ -2,7 +2,9 @@
 //! using only SDK calls. Skipped unless `GM_E2E_PYTHON` names a Python with
 //! the Genesis Mesh core installed (a disposable loopback NA is started from
 //! `scripts/e2e_na.py`), or `GM_E2E_BASE_URL`, `GM_E2E_OPERATOR_SEED` and
-//! `GM_E2E_NA_PUBLIC_KEY` name an existing NA.
+//! `GM_E2E_NA_PUBLIC_KEY` name an existing NA. The changes outside the
+//! controlled path (1.3.0) are exercised when the NA records them: the
+//! loopback NA says so, and `GM_E2E_OUT_OF_BAND=1` says so of an existing one.
 
 use std::{
     io::{BufRead, BufReader},
@@ -14,15 +16,16 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{Duration, Utc};
 use genesis_mesh_sdk::{
     canonical::execution_digest,
-    governed_action, json, public_key_from_seed,
+    governed_action, governed_action_with_break_glass, json, public_key_from_seed,
     verify::{
         verify_attestation_signature, verify_boundary_decision, verify_evidence_events,
         verify_justification_signature, verify_policy_signature, VerifyDecisionOptions,
         VerifyEvidenceOptions,
     },
-    ActionError, ActionReport, ClientOptions, EvidenceOutbox, ExecutionRecorder, FlushOptions,
-    GenesisMeshClient, GenesisMeshError, GovernedActionParams, GovernedVerification, MemoryOutbox,
-    OutboxState, RecordExecution, Value,
+    ActionError, ActionReport, BreakGlassOptions, ClientOptions, EvaluationFailure, EvidenceOutbox,
+    ExecutionRecorder, FlushOptions, GenesisMeshClient, GenesisMeshError, GovernedActionOutcome,
+    GovernedActionParams, GovernedVerification, MemoryOutbox, MemoryRecordOutbox, ObservationInput,
+    ObservationRecorder, OutboxState, RecordExecution, RecordOutbox, Value,
 };
 use uuid::Uuid;
 
@@ -30,6 +33,8 @@ struct LiveNa {
     client: GenesisMeshClient,
     options: ClientOptions,
     na_public_key: String,
+    /// The NA records changes outside the controlled path (1.3.0).
+    out_of_band: bool,
     child: Option<Child>,
 }
 
@@ -49,6 +54,7 @@ fn live_na() -> Option<LiveNa> {
             "signingKeyBase64": std::env::var("GM_E2E_OPERATOR_SEED").expect("GM_E2E_OPERATOR_SEED"),
             "keyId": std::env::var("GM_E2E_OPERATOR_KEY_ID").unwrap_or_else(|_| "ops".into()),
             "naPublicKey": std::env::var("GM_E2E_NA_PUBLIC_KEY").expect("GM_E2E_NA_PUBLIC_KEY"),
+            "outOfBand": std::env::var("GM_E2E_OUT_OF_BAND").is_ok_and(|v| v == "1"),
         });
         (config, None)
     } else {
@@ -76,6 +82,7 @@ fn live_na() -> Option<LiveNa> {
         client,
         options,
         na_public_key: config["naPublicKey"].as_str().unwrap().to_owned(),
+        out_of_band: config["outOfBand"].as_bool().unwrap_or(false),
         child,
     })
 }
@@ -105,6 +112,187 @@ async fn governed_lifecycle_against_a_live_na() {
     admit_decide_record_audit_and_offboard(&na).await;
     observe_enforce_rollback_failures_conflicts_and_retired_keys(&na).await;
     keep_evidence_while_the_na_is_unreachable_and_admit_it_in_order(&na).await;
+    record_and_judge_changes_outside_the_controlled_path(&na).await;
+}
+
+/// v1.3.0: observations and a break-glass record, judged by the NA, and an
+/// export that verifies offline.
+async fn record_and_judge_changes_outside_the_controlled_path(na: &LiveNa) {
+    if !na.out_of_band {
+        eprintln!("skipped 1.3.0: the NA does not record changes outside the controlled path");
+        return;
+    }
+    let gm = &na.client;
+    let keys = vec![na.na_public_key.clone()];
+    let id = Uuid::new_v4().to_string();
+    let capability = format!("sdk.oob.{id}");
+    let resource = format!("kv:oob-{id}/secret");
+    let attestation = gm
+        .attestation
+        .issue(json!({"subject_id": id, "roles": ["role:client"], "claims": {"capabilities": [capability]}}))
+        .await
+        .unwrap();
+    let (valid_from, valid_until) = window();
+    let policy = gm
+        .policy
+        .publish(json!({
+            "policy_id": format!("oob-{id}"), "valid_from": valid_from, "valid_until": valid_until,
+            "selector": {"capabilities": [capability]},
+            "gates": [{"gate_id": "lifetime", "gate_type": "max_value.v1", "order": 0,
+                       "config": {"path": "request_parameters.lifetime_days", "max": 90}}],
+        }))
+        .await
+        .unwrap();
+    gm.policy
+        .activate(
+            policy["policy_id"].as_str().unwrap(),
+            policy["version"].as_u64().unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let observer_id = format!("observer-{id}");
+    let observer_seed = STANDARD.encode(Uuid::new_v4().as_bytes().repeat(2));
+    gm.evidence_store
+        .register_executor_key(json!({
+            "key_id": observer_id, "public_key": public_key_from_seed(&observer_seed).unwrap(),
+            "executor_sovereign_id": observer_id, "role": "observer",
+            "resource_prefix": format!("kv:oob-{id}/"),
+        }))
+        .await
+        .unwrap();
+    let observer = ObservationRecorder::new(&observer_id, &observer_id, &observer_seed).unwrap();
+    let observe = |lifetime: u32, event: String| {
+        observer
+            .record(ObservationInput {
+                resource_id: resource.clone(),
+                action: "rotate".into(),
+                capability: capability.clone(),
+                changed_at: Some(Utc::now()),
+                source: "cloud-activity-log".into(),
+                source_event_id: event,
+                actor: Some("principal-7f3a".into()),
+                metadata: Some(json!({"lifetime_days": lifetime})),
+                ..ObservationInput::default()
+            })
+            .unwrap()
+    };
+    let denied = gm
+        .evidence_store
+        .submit_observation(observe(400, format!("{id}-1")))
+        .await
+        .unwrap();
+    assert_eq!(denied["status"], "recorded");
+    assert_eq!(denied["judgement"]["payload"]["verdict"], "deny");
+    assert_eq!(
+        denied["judgement"]["payload"]["governed_by"],
+        "after_the_fact"
+    );
+    let allowed = gm
+        .evidence_store
+        .submit_observations(&[observe(30, format!("{id}-2"))])
+        .await
+        .unwrap();
+    assert_eq!(allowed[0]["status"], "recorded");
+    assert_eq!(allowed[0]["judgement"]["payload"]["verdict"], "allow");
+    let again = gm
+        .evidence_store
+        .judge_observation(denied["payload"]["observation_id"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(again["status"], "existing");
+
+    // Break-glass: the NA cannot be reached for the evaluation; the action
+    // runs and its record is admitted and judged.
+    let (recorder, executor_key) = executor(&format!("executor-{id}"));
+    gm.evidence_store
+        .register_executor_key(
+            json!({"key_id": recorder.key_id(), "public_key": executor_key,
+                                      "executor_sovereign_id": recorder.executor_sovereign_id()}),
+        )
+        .await
+        .unwrap();
+    let records: Arc<dyn RecordOutbox> = Arc::new(MemoryRecordOutbox::default());
+    let live = GenesisMeshClient::new(na.options.clone().with_record_outbox(records)).unwrap();
+    // Nothing listens on the discard port.
+    let unreachable = GenesisMeshClient::new(ClientOptions {
+        base_url: "http://127.0.0.1:9".into(),
+        ..na.options.clone()
+    })
+    .unwrap();
+    let outcome = governed_action_with_break_glass(
+        &unreachable.boundary,
+        &live.evidence_store,
+        &recorder,
+        GovernedActionParams {
+            evaluate: json!({"attestation_id": attestation["attestation_id"], "requested_capability": capability,
+                             "context": {"request_parameters": {"lifetime_days": 30}}}),
+            resource_id: Some(resource.clone()),
+            resource_action: Some("rotate".into()),
+            prior_resource: None,
+            verify: GovernedVerification {
+                operator_public_keys: keys.clone(),
+                expected_policies: vec![policy],
+                expected_attestation: Some(attestation),
+                ..GovernedVerification::default()
+            },
+        },
+        BreakGlassOptions::new("incident drill: NA unreachable"),
+        |decision| async move {
+            Ok::<_, ActionError>(ActionReport {
+                value: Some(decision.is_none()),
+                execution_parameters: Some(json!({"version_id": "v2"})),
+                ..ActionReport::default()
+            })
+        },
+    )
+    .await
+    .unwrap();
+    let GovernedActionOutcome::BrokeGlass(result) = outcome else {
+        panic!("the glass was not broken");
+    };
+    assert_eq!(result.failure, EvaluationFailure::NetworkError);
+    assert_eq!(result.value, Some(true));
+    let submission = result.submission.unwrap();
+    assert_eq!(submission["status"], "recorded");
+    assert_eq!(submission["judgement"]["payload"]["verdict"], "allow");
+
+    let changes = gm.evidence_store.resource_changes(&resource).await.unwrap();
+    let states: Vec<(&str, &str)> = changes["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["kind"].as_str().unwrap(), c["state"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            ("observation", "judged_denied"),
+            ("observation", "judged_allowed"),
+            ("break_glass", "judged_allowed")
+        ]
+    );
+    assert_eq!(
+        changes["changes"][2]["justification"],
+        "incident drill: NA unreachable"
+    );
+    let operator = na.options.key_id.clone().unwrap_or_else(|| "ops".into());
+    assert!(gm
+        .evidence_store
+        .operator_holders()
+        .await
+        .unwrap()
+        .iter()
+        .any(|h| h["key_id"] == operator.as_str()));
+
+    let exported = gm.evidence_store.export_all(0, 1000).await.unwrap();
+    let executor_keys = gm.evidence_store.list_executor_keys().await.unwrap();
+    let verification =
+        verify_evidence_events(&exported, &VerifyEvidenceOptions::new(keys, executor_keys));
+    assert!(verification.failures.is_empty(), "{verification:?}");
+    assert!(verification.observations >= 2);
+    assert!(verification.break_glass >= 1);
+    assert!(verification.judgements >= 3);
 }
 
 /// v1.2.0: evidence that cannot be submitted stays in the outbox, a second
@@ -567,9 +755,11 @@ async fn observe_enforce_rollback_failures_conflicts_and_retired_keys(na: &LiveN
             ..RecordExecution::default()
         })
         .unwrap();
-    assert_eq!(
-        gm.evidence_store.submit(retired).await.unwrap_err().code(),
-        "evidence_unknown_executor"
+    // 1.3.0 names a retired key; a 1.2 core does not.
+    let refusal = gm.evidence_store.submit(retired).await.unwrap_err();
+    assert!(
+        ["evidence_executor_key_retired", "evidence_unknown_executor"].contains(&refusal.code()),
+        "{refusal}"
     );
     assert_eq!(
         gm.policy.deactivate(&id, first_version).await.unwrap()["active"],

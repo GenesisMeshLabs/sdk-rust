@@ -10,8 +10,9 @@
 //! evidence export entry of another kind as `unknown_entry_kind`. A record
 //! signed over a form the reference does not write is refused as
 //! `non_canonical_form`; this crate checks the form of the timestamps the
-//! registry marks (v1.2.0). See the core's reference page "Canonical Form of
-//! Signed Records".
+//! registry marks (v1.2.0), and that no field the reference always writes is
+//! left out (v1.3.0, [`non_canonical_fields`]). See the core's reference page
+//! "Canonical Form of Signed Records".
 
 use std::sync::LazyLock;
 
@@ -89,11 +90,11 @@ fn collect(model: &str, data: &Value, path: &[Step], projection: bool, found: &m
     }
 }
 
-/// Dotted paths, sorted, of the signed fields in `data` that `model` does not
-/// define, at any depth (`policy_binding.policies.0.extra`). Only the signed
-/// projection is checked (not the signature, not an agreement's unsigned
-/// fields); free-form fields are not inspected; values of the wrong type are
-/// left to validation.
+/// Dotted paths, sorted by code point, of the signed fields in `data` that
+/// `model` does not define, at any depth (`policy_binding.policies.0.extra`).
+/// Only the signed projection is checked (not the signature, not an
+/// agreement's unsigned fields); free-form fields are not inspected; values
+/// of the wrong type are left to validation.
 pub fn unknown_fields(model: &str, data: &Value) -> Vec<String> {
     prefixed_unknown_fields(model, data, "")
 }
@@ -102,6 +103,7 @@ pub(crate) fn prefixed_unknown_fields(model: &str, data: &Value, prefix: &str) -
     let mut found = Vec::new();
     collect(model, data, &[], true, &mut found);
     let mut paths: Vec<String> = found.iter().map(|steps| render(prefix, steps)).collect();
+    // UTF-8 byte order is code point order, as every implementation sorts.
     paths.sort();
     paths
 }
@@ -263,5 +265,56 @@ pub fn non_canonical_timestamps(model: &str, data: &Value) -> Vec<String> {
     let mut found = Vec::new();
     walk(model, data, "", true, &mut found);
     found.sort();
+    found
+}
+
+/// Dotted paths, sorted, where `data`'s signed projection differs from the
+/// form the reference writes (v1.3.0): timestamps not in canonical form
+/// ([`non_canonical_timestamps`]), and a field the reference always writes
+/// left out, at any depth. A field the reference leaves out when absent
+/// (`omit_when_none`) reads the same absent or `null`. A record signed over
+/// such a form is refused as `non_canonical_form`, as the reference refuses
+/// it.
+pub fn non_canonical_fields(model: &str, data: &Value) -> Vec<String> {
+    fn walk(model: &str, data: &Value, prefix: &str, projection: bool, found: &mut Vec<String>) {
+        let spec = &REGISTRY["models"][model];
+        let (Some(fields), Some(record)) = (spec["fields"].as_object(), data.as_object()) else {
+            return;
+        };
+        let omitted = |key: &str| {
+            spec["omit_when_none"]
+                .as_array()
+                .is_some_and(|keys| keys.iter().any(|k| k.as_str() == Some(key)))
+        };
+        for (key, kind) in fields {
+            if projection && outside_projection(spec, key) {
+                continue;
+            }
+            let Some(value) = record.get(key) else {
+                if !omitted(key) {
+                    found.push(format!("{prefix}{key}"));
+                }
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+            if let Some(nested) = kind.get("object").and_then(Value::as_str) {
+                walk(nested, value, &format!("{prefix}{key}."), false, found);
+            } else if let Some(nested) = kind.get("list").and_then(Value::as_str) {
+                for (i, item) in value.as_array().into_iter().flatten().enumerate() {
+                    walk(nested, item, &format!("{prefix}{key}.{i}."), false, found);
+                }
+            } else if let Some(nested) = kind.get("map").and_then(Value::as_str) {
+                for (k, item) in value.as_object().into_iter().flatten() {
+                    walk(nested, item, &format!("{prefix}{key}.{k}."), false, found);
+                }
+            }
+        }
+    }
+    let mut found = non_canonical_timestamps(model, data);
+    walk(model, data, "", true, &mut found);
+    found.sort();
+    found.dedup();
     found
 }

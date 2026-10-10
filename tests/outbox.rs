@@ -272,6 +272,8 @@ fn classifies_transient_and_refused_submissions() {
             code: "invalid_evidence".into(),
         },
         validation("resource_chain_mismatch"),
+        validation("evidence_executor_key_retired"),
+        validation("evidence_out_of_scope"),
         GenesisMeshError::SecretMaterial("field".into()),
     ];
     for (i, err) in refused.iter().enumerate() {

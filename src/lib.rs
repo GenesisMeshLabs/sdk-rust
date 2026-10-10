@@ -16,6 +16,7 @@ mod evidence_store;
 mod execution;
 mod governance;
 mod health;
+mod out_of_band;
 mod outbox;
 mod policy;
 pub mod strict;
@@ -41,15 +42,22 @@ pub use execution::{
     check_metadata_only, ExecutionRecorder, PriorResource, RecordExecution, MAX_METADATA_BYTES,
 };
 pub use governance::{
-    governed_action, summarize_decision, without_refused_metadata, ActionError, ActionReport,
-    DecisionSummary, GateFailure, GovernedActionParams, GovernedActionResult, GovernedVerification,
-    RefusedMetadata,
+    evaluation_failure, governed_action, governed_action_with_break_glass, summarize_decision,
+    without_refused_metadata, ActionError, ActionReport, BreakGlassOptions, BreakGlassResult,
+    DecisionSummary, GateFailure, GovernedActionOutcome, GovernedActionParams,
+    GovernedActionResult, GovernedVerification, RefusedMetadata,
 };
 pub use health::HealthClient;
+pub use out_of_band::{
+    observation_from_finding, BreakGlassInput, EvaluationFailure, FindingObservationOptions,
+    ObservationInput, ObservationRecorder,
+};
 pub use outbox::{
-    classify_submission_error, retry_delay, Delivery, EvidenceOutbox, FileOutbox, FlushReport,
-    MemoryOutbox, OutboxEntry, OutboxFuture, OutboxState, SubmissionFailure, PERMANENT_REFUSALS,
-    PREDECESSOR_DEAD_LETTERED,
+    classify_record_submission_error, classify_submission_error, retry_delay, Delivery,
+    EvidenceOutbox, FileOutbox, FileRecordOutbox, FlushReport, MemoryOutbox, MemoryRecordOutbox,
+    OutboxEntry, OutboxFuture, OutboxState, RecordDelivery, RecordFlushReport, RecordKind,
+    RecordOutbox, RecordOutboxEntry, SubmissionFailure, PERMANENT_REFUSALS,
+    PREDECESSOR_DEAD_LETTERED, RECORD_PERMANENT_REFUSALS,
 };
 pub use policy::PolicyClient;
 pub use serde_json::{json, Value};

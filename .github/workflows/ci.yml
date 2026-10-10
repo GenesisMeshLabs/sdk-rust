@@ -58,7 +58,7 @@ jobs:
           path: core
       - name: The signing vectors are the core's
         run: |
-          for suite in admin_auth field_registry canonical; do
+          for suite in admin_auth field_registry canonical out_of_band; do
             if [ -f "core/conformance/vectors/$suite.json" ]; then
               cmp "core/conformance/vectors/$suite.json" "tests/fixtures/$suite.json"
             else

@@ -18,7 +18,7 @@ use crate::{
     evidence::EvidenceClient,
     evidence_store::EvidenceStoreClient,
     health::HealthClient,
-    outbox::EvidenceOutbox,
+    outbox::{EvidenceOutbox, RecordOutbox},
     policy::PolicyClient,
 };
 
@@ -42,6 +42,12 @@ pub struct ClientOptions {
     /// [`governed_action`](crate::governed_action) keeps every record until
     /// the NA admits it; see [`EvidenceStoreClient::flush_pending`].
     pub outbox: Option<Arc<dyn EvidenceOutbox>>,
+    /// Durable storage for signed observations and break-glass records not
+    /// yet admitted (v1.3.0), e.g. a [`FileRecordOutbox`](crate::FileRecordOutbox)
+    /// in a directory of its own.
+    /// [`governed_action_with_break_glass`](crate::governed_action_with_break_glass)
+    /// needs one; see [`EvidenceStoreClient::flush_records`].
+    pub record_outbox: Option<Arc<dyn RecordOutbox>>,
 }
 
 impl std::fmt::Debug for ClientOptions {
@@ -56,6 +62,7 @@ impl std::fmt::Debug for ClientOptions {
             .field("timeout", &self.timeout)
             .field("audience", &self.audience)
             .field("outbox", &self.outbox)
+            .field("record_outbox", &self.record_outbox)
             .finish()
     }
 }
@@ -70,12 +77,20 @@ impl ClientOptions {
             timeout: None,
             audience: None,
             outbox: None,
+            record_outbox: None,
         }
     }
 
     /// Keep signed evidence in `outbox` until the NA admits it (v1.2.0).
     pub fn with_outbox(mut self, outbox: Arc<dyn EvidenceOutbox>) -> Self {
         self.outbox = Some(outbox);
+        self
+    }
+
+    /// Keep signed observations and break-glass records in `record_outbox`
+    /// until the NA admits them (v1.3.0).
+    pub fn with_record_outbox(mut self, record_outbox: Arc<dyn RecordOutbox>) -> Self {
+        self.record_outbox = Some(record_outbox);
         self
     }
 
@@ -434,7 +449,8 @@ pub struct GenesisMeshClient {
     /// Trust evidence: build, verify.
     pub evidence: EvidenceClient,
     /// Execution evidence store: submission, search, history, export,
-    /// executor keys, retention and resource heads.
+    /// executor keys, retention and resource heads; observations,
+    /// break-glass records and their judgements (v1.3.0).
     pub evidence_store: EvidenceStoreClient,
     /// Liveness, readiness and health.
     pub health: HealthClient,
@@ -446,6 +462,7 @@ impl GenesisMeshClient {
     /// Construct a client from options.
     pub fn new(options: ClientOptions) -> Result<Self> {
         let outbox = options.outbox.clone();
+        let record_outbox = options.record_outbox.clone();
         let transport = Arc::new(HttpTransport::new(options)?);
 
         Ok(Self {
@@ -456,7 +473,7 @@ impl GenesisMeshClient {
             data_usage: DataUsageClient::new(Arc::clone(&transport)),
             disclosure: DisclosureClient::new(Arc::clone(&transport)),
             evidence: EvidenceClient::new(Arc::clone(&transport)),
-            evidence_store: EvidenceStoreClient::new(Arc::clone(&transport), outbox),
+            evidence_store: EvidenceStoreClient::new(Arc::clone(&transport), outbox, record_outbox),
             health: HealthClient::new(Arc::clone(&transport)),
             policy: PolicyClient::new(transport),
         })

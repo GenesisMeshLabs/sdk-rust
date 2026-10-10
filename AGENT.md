@@ -30,7 +30,9 @@ sdk-rust/
     canonical.rs   # canonical bodies, digests, Pydantic timestamps (pure)
     verify.rs      # offline verification, Python reason codes (pure)
     execution.rs   # ExecutionRecorder, secret-material guard
-    governance.rs  # governed_action, summarize_decision
+    out_of_band.rs # ObservationRecorder, break-glass records (1.3.0)
+    outbox.rs      # evidence and record outboxes
+    governance.rs  # governed_action, governed_action_with_break_glass, summarize_decision
     lib.rs         # public exports
   Cargo.toml
 ```

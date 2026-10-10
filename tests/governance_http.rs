@@ -899,6 +899,8 @@ async fn only_refusals_no_retry_can_overcome_dead_letter_a_record() {
     for (status, refused, dead) in [
         (409, "evidence_conflict", true),
         (422, "evidence_outside_decision_window", true),
+        (422, "evidence_executor_key_retired", true),
+        (422, "evidence_out_of_scope", true),
         (409, "retention_in_progress", false),
         (404, "evidence_store_disabled", false),
         (422, "evidence_unknown_executor", false),

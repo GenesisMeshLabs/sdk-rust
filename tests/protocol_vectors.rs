@@ -221,6 +221,24 @@ fn rejects_malformed_exports() {
 }
 
 #[test]
+fn reports_a_decision_entry_without_its_context() {
+    let v = vectors();
+    let mut events = parse_export_lines(v["export"].as_str().unwrap()).unwrap();
+    let decision = events[0]["payload"]["decision"].clone();
+    events[0]["payload"] = json!({"decision": decision, "extra": 1});
+    let options = VerifyEvidenceOptions {
+        contiguous: false,
+        ..export_options(&v)
+    };
+    let found = reasons(&v, &events, &options);
+    assert!(
+        found.contains(&"payload_digest_mismatch".to_owned()),
+        "{found:?}"
+    );
+    assert!(found.contains(&"payload_invalid".to_owned()), "{found:?}");
+}
+
+#[test]
 fn rejects_unknown_executor_keys() {
     let v = vectors();
     let events = parse_export_lines(v["export"].as_str().unwrap()).unwrap();

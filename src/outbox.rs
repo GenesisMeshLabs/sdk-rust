@@ -10,6 +10,13 @@
 //! dead letter with the refusal code; it is never dropped. The outbox holds
 //! signed metadata only, never secret values, but it must be durable and
 //! private.
+//!
+//! The record outbox (v1.3.0,
+//! [`ClientOptions::with_record_outbox`](crate::ClientOptions::with_record_outbox))
+//! keeps signed observations and break-glass records the same way, in a
+//! directory of its own;
+//! [`EvidenceStoreClient::flush_records`](crate::EvidenceStoreClient::flush_records)
+//! submits them.
 
 use std::{
     collections::HashMap,
@@ -23,7 +30,7 @@ use std::{
 };
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -95,10 +102,73 @@ impl OutboxEntry {
     /// Due for an attempt at `now`: never failed, past its backoff, or with a
     /// retry time that does not parse.
     pub(crate) fn due(&self, now: DateTime<Utc>) -> bool {
-        self.next_attempt_at
-            .as_deref()
-            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-            .is_none_or(|at| at.with_timezone(&Utc) <= now)
+        due(self.next_attempt_at.as_deref(), now)
+    }
+}
+
+fn due(next_attempt_at: Option<&str>, now: DateTime<Utc>) -> bool {
+    next_attempt_at
+        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+        .is_none_or(|at| at.with_timezone(&Utc) <= now)
+}
+
+/// What a record outbox entry holds (v1.3.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordKind {
+    /// An `ObservationRecord`, submitted to `/evidence/observations`.
+    Observation,
+    /// A `BreakGlassRecord`, submitted to `/evidence/break-glass`.
+    BreakGlass,
+}
+
+/// One signed observation or break-glass record in the record outbox
+/// (v1.3.0). The TypeScript SDK reads and writes the same JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RecordOutboxEntry {
+    /// The record's `observation_id` or `break_glass_id`.
+    pub id: String,
+    /// Observation or break-glass.
+    pub kind: RecordKind,
+    /// The signed record, exactly as it will be submitted.
+    pub record: Value,
+    /// Pending or dead letter.
+    pub state: OutboxState,
+    /// Submissions attempted so far.
+    pub attempts: u32,
+    /// When it was added (RFC 3339, UTC).
+    pub queued_at: String,
+    /// Earliest time `flush_records` retries it; `None` when it has not failed.
+    pub next_attempt_at: Option<String>,
+    /// The last submission error.
+    pub last_error: Option<SubmissionFailure>,
+}
+
+impl RecordOutboxEntry {
+    /// A new pending entry for a signed observation (a record with an
+    /// `observation_id`) or break-glass record.
+    pub fn new(record: Value) -> Self {
+        let (kind, key) = if record.get("observation_id").is_some() {
+            (RecordKind::Observation, "observation_id")
+        } else {
+            (RecordKind::BreakGlass, "break_glass_id")
+        };
+        Self {
+            id: record[key].as_str().unwrap_or_default().to_owned(),
+            kind,
+            record,
+            state: OutboxState::Pending,
+            attempts: 0,
+            queued_at: timestamp(Utc::now()),
+            next_attempt_at: None,
+            last_error: None,
+        }
+    }
+
+    /// Due for an attempt at `now`, as an [`OutboxEntry`] is.
+    pub(crate) fn due(&self, now: DateTime<Utc>) -> bool {
+        due(self.next_attempt_at.as_deref(), now)
     }
 }
 
@@ -119,6 +189,20 @@ pub trait EvidenceOutbox: Send + Sync + std::fmt::Debug {
     fn remove<'a>(&'a self, id: &'a str) -> OutboxFuture<'a, ()>;
     /// Every entry, in the order added.
     fn list(&self) -> OutboxFuture<'_, Vec<OutboxEntry>>;
+}
+
+/// Durable storage for signed observations and break-glass records (v1.3.0),
+/// with the contract of [`EvidenceOutbox`]. Implement it over a database or
+/// a queue when [`FileRecordOutbox`] does not fit.
+pub trait RecordOutbox: Send + Sync + std::fmt::Debug {
+    /// Store a new entry; refuse an `id` already stored.
+    fn add<'a>(&'a self, entry: &'a RecordOutboxEntry) -> OutboxFuture<'a, ()>;
+    /// Replace the stored entry with the same `id`; nothing when it is gone.
+    fn update<'a>(&'a self, entry: &'a RecordOutboxEntry) -> OutboxFuture<'a, ()>;
+    /// Remove an entry; nothing when it is gone.
+    fn remove<'a>(&'a self, id: &'a str) -> OutboxFuture<'a, ()>;
+    /// Every entry, in the order added.
+    fn list(&self) -> OutboxFuture<'_, Vec<RecordOutboxEntry>>;
 }
 
 /// What became of a record handed to the outbox: the NA's acknowledgement
@@ -162,6 +246,52 @@ pub struct FlushReport {
     pub dead_lettered: Vec<OutboxEntry>,
 }
 
+/// What became of a record handed to the record outbox (v1.3.0): the NA's
+/// answer when it admitted the record (`status` `recorded`, `duplicate` or
+/// `quarantined`), otherwise the record outbox entry holding it (pending or
+/// dead letter).
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct RecordDelivery {
+    /// The NA's answer.
+    pub submission: Option<Value>,
+    /// The record outbox entry, when the NA has not admitted the record.
+    pub queued: Option<RecordOutboxEntry>,
+}
+
+impl RecordDelivery {
+    pub(crate) fn admitted(ack: Value) -> Self {
+        Self {
+            submission: Some(ack),
+            queued: None,
+        }
+    }
+
+    pub(crate) fn queued(entry: RecordOutboxEntry) -> Self {
+        Self {
+            submission: None,
+            queued: Some(entry),
+        }
+    }
+}
+
+/// What one `flush_records` run did (v1.3.0).
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct RecordFlushReport {
+    /// Entries the NA admitted (or already held), now removed from the
+    /// record outbox.
+    pub admitted: Vec<RecordOutboxEntry>,
+    /// Of those, the ones the NA kept as quarantine entries (authentic, but
+    /// outside their time bounds).
+    pub quarantined: Vec<RecordOutboxEntry>,
+    /// Entries still pending: not yet due, after a transient error, or not
+    /// answered.
+    pub pending: Vec<RecordOutboxEntry>,
+    /// Entries this run moved to the dead letters.
+    pub dead_lettered: Vec<RecordOutboxEntry>,
+}
+
 /// Local refusal code for a record whose predecessor in its chain is a dead
 /// letter.
 pub const PREDECESSOR_DEAD_LETTERED: &str = "evidence_predecessor_dead_lettered";
@@ -170,9 +300,13 @@ pub const PREDECESSOR_DEAD_LETTERED: &str = "evidence_predecessor_dead_lettered"
 /// other failure (network, timeout, `5xx`, `429`, an unknown or not yet
 /// registered executor key, a chain gap behind a record not yet admitted, a
 /// disabled store, a proxy's error page) is retried.
-pub const PERMANENT_REFUSALS: [&str; 11] = [
+pub const PERMANENT_REFUSALS: [&str; 13] = [
     "invalid_evidence",
     "evidence_malformed",
+    // v1.3.0: a retired key, and a key whose role or resource prefix does not
+    // cover the record (both were `evidence_unknown_executor`, retried).
+    "evidence_executor_key_retired",
+    "evidence_out_of_scope",
     "evidence_invalid_signature",
     "evidence_decision_denied",
     "evidence_decision_mismatch",
@@ -184,8 +318,38 @@ pub const PERMANENT_REFUSALS: [&str; 11] = [
     "evidence_secret_material",
 ];
 
+/// The NA's refusals of an observation or break-glass record that no retry
+/// can overcome (v1.3.0). An unknown key is retried: it may not be
+/// registered yet; a retired one is not.
+pub const RECORD_PERMANENT_REFUSALS: [&str; 14] = [
+    "invalid_observation",
+    "observation_malformed",
+    "observation_invalid_signature",
+    "observation_key_retired",
+    "observation_out_of_scope",
+    "observation_secret_material",
+    "observation_conflict",
+    "invalid_break_glass",
+    "break_glass_malformed",
+    "break_glass_invalid_signature",
+    "break_glass_key_retired",
+    "break_glass_out_of_scope",
+    "break_glass_secret_material",
+    "break_glass_conflict",
+];
+
 /// The submission error as stored, and whether a later retry may succeed.
 pub fn classify_submission_error(err: &GenesisMeshError) -> (SubmissionFailure, bool) {
+    classify(err, &PERMANENT_REFUSALS)
+}
+
+/// [`classify_submission_error`] for an observation or break-glass record
+/// (v1.3.0): refused for good only by [`RECORD_PERMANENT_REFUSALS`].
+pub fn classify_record_submission_error(err: &GenesisMeshError) -> (SubmissionFailure, bool) {
+    classify(err, &RECORD_PERMANENT_REFUSALS)
+}
+
+fn classify(err: &GenesisMeshError, refusals: &[&str]) -> (SubmissionFailure, bool) {
     let status = match err {
         GenesisMeshError::BadRequest { .. } => 400,
         GenesisMeshError::Unauthorized { .. } => 401,
@@ -200,8 +364,7 @@ pub fn classify_submission_error(err: &GenesisMeshError) -> (SubmissionFailure, 
         code: err.code().to_owned(),
         message: err.to_string(),
     };
-    let refused =
-        PERMANENT_REFUSALS.contains(&err.code()) && (status == 0 || (400..500).contains(&status));
+    let refused = refusals.contains(&err.code()) && (status == 0 || (400..500).contains(&status));
     (failure, !refused)
 }
 
@@ -229,99 +392,150 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// An entry an outbox stores: a signed execution record, or (v1.3.0) a
+/// signed observation or break-glass record.
+trait Entry: Clone + Serialize + DeserializeOwned + Send + Sync + std::fmt::Debug {
+    /// The format of its files.
+    const FORMAT: &'static str;
+    fn id(&self) -> &str;
+}
+
+impl Entry for OutboxEntry {
+    const FORMAT: &'static str = "gm.evidence.outbox.v1";
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Entry for RecordOutboxEntry {
+    const FORMAT: &'static str = "gm.evidence.record-outbox.v1";
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Entries in memory, in the order added. Every change runs under one lock,
+/// so changes never interleave; the scans are in memory and fail at no size.
+#[derive(Debug)]
+struct Memory<E>(Mutex<Vec<E>>);
+
+impl<E> Default for Memory<E> {
+    fn default() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+}
+
+impl<E: Entry> Memory<E> {
+    fn add(&self, entry: &E) -> io::Result<()> {
+        let mut entries = lock(&self.0);
+        if entries.iter().any(|e| e.id() == entry.id()) {
+            return Err(exists(entry.id()));
+        }
+        entries.push(entry.clone());
+        Ok(())
+    }
+
+    fn update(&self, entry: &E) -> io::Result<()> {
+        if let Some(stored) = lock(&self.0).iter_mut().find(|e| e.id() == entry.id()) {
+            *stored = entry.clone();
+        }
+        Ok(())
+    }
+
+    fn remove(&self, id: &str) -> io::Result<()> {
+        lock(&self.0).retain(|e| e.id() != id);
+        Ok(())
+    }
+
+    fn list(&self) -> io::Result<Vec<E>> {
+        Ok(lock(&self.0).clone())
+    }
+}
+
+/// Implements an outbox trait over storage whose methods are synchronous.
+macro_rules! outbox_over {
+    ($outbox:ty, $trait:ident, $entry:ty) => {
+        impl $trait for $outbox {
+            fn add<'a>(&'a self, entry: &'a $entry) -> OutboxFuture<'a, ()> {
+                Box::pin(async move { self.0.add(entry) })
+            }
+
+            fn update<'a>(&'a self, entry: &'a $entry) -> OutboxFuture<'a, ()> {
+                Box::pin(async move { self.0.update(entry) })
+            }
+
+            fn remove<'a>(&'a self, id: &'a str) -> OutboxFuture<'a, ()> {
+                Box::pin(async move { self.0.remove(id) })
+            }
+
+            fn list(&self) -> OutboxFuture<'_, Vec<$entry>> {
+                Box::pin(async move { self.0.list() })
+            }
+        }
+    };
+}
+
 /// An outbox in memory. Not durable: everything in it is lost when the
 /// process exits. For tests only.
 #[derive(Debug, Default)]
-pub struct MemoryOutbox {
-    entries: Mutex<Vec<OutboxEntry>>,
-}
+pub struct MemoryOutbox(Memory<OutboxEntry>);
 
-impl EvidenceOutbox for MemoryOutbox {
-    fn add<'a>(&'a self, entry: &'a OutboxEntry) -> OutboxFuture<'a, ()> {
-        Box::pin(async move {
-            let mut entries = lock(&self.entries);
-            if entries.iter().any(|e| e.id == entry.id) {
-                return Err(exists(&entry.id));
-            }
-            entries.push(entry.clone());
-            Ok(())
-        })
-    }
+outbox_over!(MemoryOutbox, EvidenceOutbox, OutboxEntry);
 
-    fn update<'a>(&'a self, entry: &'a OutboxEntry) -> OutboxFuture<'a, ()> {
-        Box::pin(async move {
-            if let Some(stored) = lock(&self.entries).iter_mut().find(|e| e.id == entry.id) {
-                *stored = entry.clone();
-            }
-            Ok(())
-        })
-    }
+/// A record outbox in memory (v1.3.0). Not durable: for tests only.
+#[derive(Debug, Default)]
+pub struct MemoryRecordOutbox(Memory<RecordOutboxEntry>);
 
-    fn remove<'a>(&'a self, id: &'a str) -> OutboxFuture<'a, ()> {
-        Box::pin(async move {
-            lock(&self.entries).retain(|e| e.id != id);
-            Ok(())
-        })
-    }
-
-    fn list(&self) -> OutboxFuture<'_, Vec<OutboxEntry>> {
-        Box::pin(async move { Ok(lock(&self.entries).clone()) })
-    }
-}
-
-const FORMAT: &str = "gm.evidence.outbox.v1";
+outbox_over!(MemoryRecordOutbox, RecordOutbox, RecordOutboxEntry);
 
 #[derive(Debug, Clone)]
-struct Stored {
+struct Stored<E> {
     file: String,
     sequence: u64,
-    entry: OutboxEntry,
+    entry: E,
 }
 
-/// The default outbox: one JSON file per entry in a directory, written to a
-/// temporary file, synced and renamed into place. File names keep the order
-/// entries were added. The TypeScript SDK reads and writes the same format.
-///
-/// One process uses a directory at a time: the directory is read once, then
-/// kept in memory. A temporary file left by a crash is recovered (an entry
-/// that was being added) or removed (an update that did not finish) on that
-/// first read. A directory the outbox creates is `0700` and its files `0600`
-/// on Unix; on Windows, and for a directory that already exists, restrict
-/// access to it yourself. Its file operations are synchronous and brief, and
-/// run on the caller's task.
+/// The entries of a directory once read, by file stem, and the highest file
+/// sequence used, so an add never scans every entry (v1.3.0).
 #[derive(Debug)]
-pub struct FileOutbox {
-    directory: PathBuf,
-    stored: Mutex<Option<HashMap<String, Stored>>>,
+struct Loaded<E> {
+    entries: HashMap<String, Stored<E>>,
+    last_sequence: u64,
 }
 
-impl FileOutbox {
-    /// An outbox in `directory`, created on first use.
-    pub fn new(directory: impl Into<PathBuf>) -> Self {
+/// One JSON file per entry in a directory; see [`FileOutbox`]. Every change,
+/// file operations included, runs under one lock: changes run one at a time,
+/// so an update never renames a file back over one a removal deleted.
+#[derive(Debug)]
+struct JsonFiles<E> {
+    directory: PathBuf,
+    stored: Mutex<Option<Loaded<E>>>,
+}
+
+impl<E: Entry> JsonFiles<E> {
+    fn new(directory: PathBuf) -> Self {
         Self {
-            directory: directory.into(),
+            directory,
             stored: Mutex::new(None),
         }
     }
 
-    /// The directory holding the entries.
-    pub fn directory(&self) -> &Path {
-        &self.directory
-    }
-
-    /// Run `f` on the entries, reading the directory first if needed.
-    fn with<T>(
-        &self,
-        f: impl FnOnce(&mut HashMap<String, Stored>) -> io::Result<T>,
-    ) -> io::Result<T> {
+    /// Run `f` on the entries, reading the directory first if needed. The
+    /// lock is held until `f` returns.
+    fn with<T>(&self, f: impl FnOnce(&mut Loaded<E>) -> io::Result<T>) -> io::Result<T> {
         let mut guard = lock(&self.stored);
         if guard.is_none() {
-            *guard = Some(self.read()?);
+            let entries = self.read()?;
+            let last_sequence = entries.values().map(|s| s.sequence).max().unwrap_or(0);
+            *guard = Some(Loaded {
+                entries,
+                last_sequence,
+            });
         }
         f(guard.as_mut().expect("loaded"))
     }
 
-    fn read(&self) -> io::Result<HashMap<String, Stored>> {
+    fn read(&self) -> io::Result<HashMap<String, Stored<E>>> {
         create_private_dir(&self.directory)?;
         let names = || -> io::Result<Vec<String>> {
             fs::read_dir(&self.directory)?
@@ -337,7 +551,7 @@ impl FileOutbox {
             let path = self.directory.join(name);
             let complete = fs::read_to_string(&path)
                 .ok()
-                .and_then(|text| parse_entry(&text))
+                .and_then(|text| parse_entry::<E>(&text))
                 .is_some();
             if complete && !found.iter().any(|n| n == target) {
                 fs::rename(&path, self.directory.join(target))?;
@@ -356,10 +570,10 @@ impl FileOutbox {
                 continue;
             };
             let text = fs::read_to_string(self.directory.join(&file))?;
-            let entry = parse_entry(&text).ok_or_else(|| {
+            let entry = parse_entry::<E>(&text).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("outbox file {file} is unreadable or not {FORMAT}"),
+                    format!("outbox file {file} is unreadable or not {}", E::FORMAT),
                 )
             })?;
             stored.insert(
@@ -374,11 +588,11 @@ impl FileOutbox {
         Ok(stored)
     }
 
-    fn write(&self, file: &str, entry: &OutboxEntry) -> io::Result<()> {
+    fn write(&self, file: &str, entry: &E) -> io::Result<()> {
         let temporary = self
             .directory
             .join(format!(".{file}.{}.tmp", Uuid::new_v4().simple()));
-        let body = serde_json::to_string_pretty(&json!({"format": FORMAT, "entry": entry}))
+        let body = serde_json::to_string_pretty(&json!({"format": E::FORMAT, "entry": entry}))
             .map_err(io::Error::other)?;
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -392,75 +606,116 @@ impl FileOutbox {
         fs::rename(&temporary, self.directory.join(file))?;
         sync_dir(&self.directory)
     }
-}
 
-impl EvidenceOutbox for FileOutbox {
-    fn add<'a>(&'a self, entry: &'a OutboxEntry) -> OutboxFuture<'a, ()> {
-        Box::pin(async move {
-            self.with(|stored| {
-                let stem = file_stem(&entry.id);
-                if stored.contains_key(&stem) {
-                    return Err(exists(&entry.id));
-                }
-                let sequence = stored.values().map(|s| s.sequence).max().unwrap_or(0) + 1;
-                let file = format!("{sequence:012}-{stem}.json");
-                self.write(&file, entry)?;
-                stored.insert(
-                    stem,
-                    Stored {
-                        file,
-                        sequence,
-                        entry: entry.clone(),
-                    },
-                );
-                Ok(())
-            })
+    fn add(&self, entry: &E) -> io::Result<()> {
+        self.with(|loaded| {
+            let stem = file_stem(entry.id());
+            if loaded.entries.contains_key(&stem) {
+                return Err(exists(entry.id()));
+            }
+            let sequence = loaded.last_sequence + 1;
+            let file = format!("{sequence:012}-{stem}.json");
+            self.write(&file, entry)?;
+            loaded.last_sequence = sequence;
+            loaded.entries.insert(
+                stem,
+                Stored {
+                    file,
+                    sequence,
+                    entry: entry.clone(),
+                },
+            );
+            Ok(())
         })
     }
 
-    fn update<'a>(&'a self, entry: &'a OutboxEntry) -> OutboxFuture<'a, ()> {
-        Box::pin(async move {
-            self.with(|stored| {
-                if let Some(found) = stored.get_mut(&file_stem(&entry.id)) {
-                    self.write(&found.file, entry)?;
-                    found.entry = entry.clone();
-                }
-                Ok(())
-            })
+    fn update(&self, entry: &E) -> io::Result<()> {
+        self.with(|loaded| {
+            if let Some(found) = loaded.entries.get_mut(&file_stem(entry.id())) {
+                self.write(&found.file, entry)?;
+                found.entry = entry.clone();
+            }
+            Ok(())
         })
     }
 
-    fn remove<'a>(&'a self, id: &'a str) -> OutboxFuture<'a, ()> {
-        Box::pin(async move {
-            self.with(|stored| {
-                let stem = file_stem(id);
-                if let Some(found) = stored.get(&stem) {
-                    match fs::remove_file(self.directory.join(&found.file)) {
-                        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
-                        _ => sync_dir(&self.directory)?,
-                    }
-                    stored.remove(&stem);
+    fn remove(&self, id: &str) -> io::Result<()> {
+        self.with(|loaded| {
+            let stem = file_stem(id);
+            if let Some(found) = loaded.entries.get(&stem) {
+                match fs::remove_file(self.directory.join(&found.file)) {
+                    Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+                    _ => sync_dir(&self.directory)?,
                 }
-                Ok(())
-            })
+                loaded.entries.remove(&stem);
+            }
+            Ok(())
         })
     }
 
-    fn list(&self) -> OutboxFuture<'_, Vec<OutboxEntry>> {
-        Box::pin(async move {
-            self.with(|stored| {
-                let mut entries: Vec<&Stored> = stored.values().collect();
-                entries.sort_by(|a, b| a.sequence.cmp(&b.sequence).then(a.file.cmp(&b.file)));
-                Ok(entries.into_iter().map(|s| s.entry.clone()).collect())
-            })
+    fn list(&self) -> io::Result<Vec<E>> {
+        self.with(|loaded| {
+            let mut entries: Vec<&Stored<E>> = loaded.entries.values().collect();
+            entries.sort_by(|a, b| a.sequence.cmp(&b.sequence).then(a.file.cmp(&b.file)));
+            Ok(entries.into_iter().map(|s| s.entry.clone()).collect())
         })
     }
 }
 
-/// The entry in a file's text, when it is a well-formed outbox file.
-fn parse_entry(text: &str) -> Option<OutboxEntry> {
+/// The default outbox: one JSON file per entry in a directory, written to a
+/// temporary file, synced and renamed into place. File names keep the order
+/// entries were added. The TypeScript SDK reads and writes the same format.
+///
+/// One process uses a directory at a time: the directory is read once, then
+/// kept in memory. A temporary file left by a crash is recovered (an entry
+/// that was being added) or removed (an update that did not finish) on that
+/// first read. A directory the outbox creates is `0700` and its files `0600`
+/// on Unix; on Windows, and for a directory that already exists, restrict
+/// access to it yourself. Its file operations are synchronous and brief, and
+/// run on the caller's task.
+#[derive(Debug)]
+pub struct FileOutbox(JsonFiles<OutboxEntry>);
+
+impl FileOutbox {
+    /// An outbox in `directory`, created on first use.
+    pub fn new(directory: impl Into<PathBuf>) -> Self {
+        Self(JsonFiles::new(directory.into()))
+    }
+
+    /// The directory holding the entries.
+    pub fn directory(&self) -> &Path {
+        &self.0.directory
+    }
+}
+
+outbox_over!(FileOutbox, EvidenceOutbox, OutboxEntry);
+
+/// The default record outbox (v1.3.0): signed observations and break-glass
+/// records, kept as [`FileOutbox`] keeps execution records, in a directory
+/// of its own and in a format of its own (`gm.evidence.record-outbox.v1`,
+/// which the TypeScript SDK shares). It refuses a directory of execution
+/// records.
+#[derive(Debug)]
+pub struct FileRecordOutbox(JsonFiles<RecordOutboxEntry>);
+
+impl FileRecordOutbox {
+    /// A record outbox in `directory`, created on first use.
+    pub fn new(directory: impl Into<PathBuf>) -> Self {
+        Self(JsonFiles::new(directory.into()))
+    }
+
+    /// The directory holding the entries.
+    pub fn directory(&self) -> &Path {
+        &self.0.directory
+    }
+}
+
+outbox_over!(FileRecordOutbox, RecordOutbox, RecordOutboxEntry);
+
+/// The entry in a file's text, when it is a well-formed file of its outbox.
+fn parse_entry<E: Entry>(text: &str) -> Option<E> {
     let body: Value = serde_json::from_str(text).ok()?;
-    if body["format"] != FORMAT {
+    if body["format"] != E::FORMAT {
         return None;
     }
     serde_json::from_value(body["entry"].clone()).ok()

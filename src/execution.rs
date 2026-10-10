@@ -12,6 +12,7 @@ use crate::{
     canonical::{execution_canonical, execution_digest, parse_timestamp, python_timestamp},
     errors::{GenesisMeshError, Result},
     evidence_store::ResourceHead,
+    out_of_band::{sign_break_glass, BreakGlassInput},
 };
 
 /// Limit on `execution_parameters` plus `outcome_detail`, as enforced by the NA.
@@ -232,6 +233,22 @@ impl ExecutionRecorder {
     /// The registered executor key id.
     pub fn key_id(&self) -> &str {
         &self.key_id
+    }
+
+    /// Build and sign a break-glass record with this executor's key
+    /// (v1.3.0). [`governed_action_with_break_glass`](crate::governed_action_with_break_glass)
+    /// calls it when evaluation fails transiently. Refused before signing
+    /// ([`GenesisMeshError::OutOfBandRecord`]) without a justification of 1
+    /// to 1024 characters (`break_glass_malformed`), or with secret material
+    /// in the justification, the parameters, the attributes or the outcome
+    /// detail (`break_glass_secret_material`).
+    pub fn sign_break_glass(&self, input: BreakGlassInput) -> Result<Value> {
+        sign_break_glass(
+            &self.executor_sovereign_id,
+            &self.key_id,
+            &self.signing_key,
+            input,
+        )
     }
 
     /// Build and sign one ExecutionEvidence record.
