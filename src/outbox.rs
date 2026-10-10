@@ -395,10 +395,15 @@ pub fn retry_delay(attempts: u32) -> Duration {
 /// later when the NA asked the caller to wait (`Retry-After`, 1.3.1), at most
 /// 15 minutes.
 pub(crate) fn next_attempt_at(attempts: u32, wait: Option<Duration>) -> String {
+    timestamp(next_attempt(attempts, wait))
+}
+
+/// [`next_attempt_at`] as a time.
+pub(crate) fn next_attempt(attempts: u32, wait: Option<Duration>) -> DateTime<Utc> {
     let asked = wait.unwrap_or_default().min(MAX_RETRY_DELAY);
     let delay = chrono::Duration::from_std(retry_delay(attempts).max(asked))
         .unwrap_or(chrono::Duration::MAX);
-    timestamp(Utc::now() + delay)
+    Utc::now() + delay
 }
 
 pub(crate) fn timestamp(at: DateTime<Utc>) -> String {
@@ -569,37 +574,39 @@ impl<E: Entry> JsonFiles<E> {
         // Every file is read before any is changed: a directory of the other
         // outbox's files is refused as it is found, its temporary files left
         // for that outbox to recover (1.3.1; they were removed).
+        let other_format = |name: &str| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("outbox file {name} is not {}", E::FORMAT),
+            )
+        };
         let mut temporary = Vec::new();
         for name in &names {
             let Some(target) = temp_target(name) else {
                 continue;
             };
-            let body = fs::read_to_string(self.directory.join(name))
+            let body = fs::read(self.directory.join(name))
                 .ok()
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-            if body
-                .as_ref()
-                .is_some_and(|body| body["format"].is_string() && body["format"] != E::FORMAT)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("outbox file {name} is not {}", E::FORMAT),
-                ));
+                .and_then(|bytes| json_of(&bytes));
+            if body.as_ref().is_some_and(of_other_format::<E>) {
+                return Err(other_format(name));
             }
             temporary.push((name, target, body.and_then(entry_of::<E>)));
         }
         let mut stored = HashMap::new();
+        let mut unreadable = Vec::new();
         for file in &names {
             let Some((sequence, stem)) = parse_entry_file(file) else {
                 continue;
             };
-            let text = fs::read_to_string(self.directory.join(file))?;
-            let entry = parse_entry::<E>(&text).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("outbox file {file} is unreadable or not {}", E::FORMAT),
-                )
-            })?;
+            let body = json_of(&fs::read(self.directory.join(file))?);
+            if body.as_ref().is_some_and(of_other_format::<E>) {
+                return Err(other_format(file));
+            }
+            let Some(entry) = body.and_then(entry_of::<E>) else {
+                unreadable.push(file.clone());
+                continue;
+            };
             let file = file.clone();
             stored.insert(
                 stem,
@@ -631,8 +638,33 @@ impl<E: Entry> JsonFiles<E> {
                 _ => fs::remove_file(&path)?,
             }
         }
-        if !temporary.is_empty() {
+        // 1.3.1: a file that cannot be read is moved aside, so it does not
+        // stop every action; the read that finds it fails, once.
+        for file in &unreadable {
+            fs::rename(
+                self.directory.join(file),
+                self.directory.join(format!("{file}{UNREADABLE}")),
+            )?;
+        }
+        if !temporary.is_empty() || !unreadable.is_empty() {
             sync_dir(&self.directory)?;
+        }
+        if !unreadable.is_empty() {
+            let (s, were) = if unreadable.len() == 1 {
+                ("", "was")
+            } else {
+                ("s", "were")
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                UnreadableFiles(format!(
+                    "outbox file{s} {} in {} could not be read as {} and {were} moved aside \
+                     (*{UNREADABLE}); the record{s} held there will not be submitted",
+                    unreadable.join(", "),
+                    self.directory.display(),
+                    E::FORMAT,
+                )),
+            ));
         }
         Ok(stored)
     }
@@ -721,7 +753,10 @@ impl<E: Entry> JsonFiles<E> {
 /// a directory submit each other's records and overwrite each other's
 /// changes, so give each its own. A temporary file left by a crash is
 /// recovered (an entry that was being added) or removed (an update that did
-/// not finish) on that first read. A directory the outbox creates is `0700` and its files `0600`
+/// not finish) on that first read. An entry file that cannot be read is
+/// moved aside as `<name>.unreadable` (1.3.1): the read that finds it fails
+/// once (`outbox_file_unreadable`), and the record it held is not submitted.
+/// A directory holding files of the other outbox's format is refused. A directory the outbox creates is `0700` and its files `0600`
 /// on Unix; on Windows, and for a directory that already exists, restrict
 /// access to it yourself. Its file operations are synchronous and brief, and
 /// run on the caller's task.
@@ -765,8 +800,31 @@ impl FileRecordOutbox {
 outbox_over!(FileRecordOutbox, RecordOutbox, RecordOutboxEntry);
 
 /// The entry in a file's text, when it is a well-formed file of its outbox.
-fn parse_entry<E: Entry>(text: &str) -> Option<E> {
-    entry_of(serde_json::from_str(text).ok()?)
+/// The suffix an unreadable entry file is renamed with (1.3.1).
+const UNREADABLE: &str = ".unreadable";
+
+/// Entry files that could not be read and were moved aside (1.3.1): what the
+/// [`GenesisMeshError::Outbox`] error of the read that found them carries,
+/// with the code `outbox_file_unreadable`.
+#[derive(Debug)]
+pub(crate) struct UnreadableFiles(String);
+
+impl std::fmt::Display for UnreadableFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnreadableFiles {}
+
+/// A file's JSON, when it is JSON.
+fn json_of(bytes: &[u8]) -> Option<Value> {
+    serde_json::from_slice(bytes).ok()
+}
+
+/// A well-formed file of another format: the other outbox's, or a later one.
+fn of_other_format<E: Entry>(body: &Value) -> bool {
+    body["format"].is_string() && body["format"] != E::FORMAT
 }
 
 /// The entry in a file's JSON, when it is of its outbox's format.

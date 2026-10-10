@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
         Arc, Mutex, PoisonError,
     },
     time::Duration,
@@ -17,9 +17,10 @@ use crate::{
     errors::{GenesisMeshError, Result},
     execution::ensure_metadata_only,
     outbox::{
-        classify_record_submission_error, classify_submission_error, next_attempt_at, Delivery,
-        EvidenceOutbox, FlushReport, OutboxEntry, OutboxState, RecordDelivery, RecordFlushReport,
-        RecordKind, RecordOutbox, RecordOutboxEntry, SubmissionFailure, PREDECESSOR_DEAD_LETTERED,
+        classify_record_submission_error, classify_submission_error, next_attempt, next_attempt_at,
+        Delivery, EvidenceOutbox, FlushReport, OutboxEntry, OutboxState, RecordDelivery,
+        RecordFlushReport, RecordKind, RecordOutbox, RecordOutboxEntry, SubmissionFailure,
+        PREDECESSOR_DEAD_LETTERED,
     },
     verify::parse_export_lines,
 };
@@ -135,6 +136,9 @@ pub struct EvidenceStoreClient {
     /// Most observations a batch carries: halved each time the NA throttles
     /// one (`429`, 1.3.1).
     observation_batch: Arc<AtomicUsize>,
+    /// No record is due before this time (Unix milliseconds): the NA asked
+    /// the client to wait (`Retry-After`, 1.3.1).
+    records_paused_until: Arc<AtomicI64>,
 }
 
 impl EvidenceStoreClient {
@@ -152,6 +156,7 @@ impl EvidenceStoreClient {
             flushing_records: Arc::new(AtomicBool::new(false)),
             records_in_flight: Arc::default(),
             observation_batch: Arc::new(AtomicUsize::new(OBSERVATION_BATCH)),
+            records_paused_until: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -700,14 +705,17 @@ impl EvidenceStoreClient {
         Ok(self.attempt_record(outbox, entry).await)
     }
 
-    /// Submit the record outbox's pending records in the order they were
-    /// added (v1.3.0), consecutive observations up to 100 per request and
-    /// break-glass records one at a time. A batch the NA refuses as a whole
+    /// Submit the record outbox's pending records (v1.3.0): break-glass
+    /// records first, one at a time (1.3.1), then observations, consecutive
+    /// ones up to 100 per request, each in the order they were added.
+    /// Break-glass records share the NA's submission rate with observations,
+    /// and an observation of the same change then finds its break-glass
+    /// record. A batch the NA refuses as a whole
     /// (one record it cannot read, `invalid_json`) or that is larger than it
     /// takes (`413`) is split in halves until the record it refuses is tried
     /// alone (1.3.1). A batch it throttles (`429`) halves the batches this
-    /// client sends after it, and its records wait at least as long as the
-    /// NA's `Retry-After` asks (1.3.1, at most 15 minutes). Records in
+    /// client sends after it. After a transient refusal with a `Retry-After`,
+    /// no record is due until then (1.3.1, at most 15 minutes). Records in
     /// backoff are skipped unless `ignore_backoff`, as are records an
     /// `enqueue_record` call is submitting (reported pending); a transient
     /// error ends the run. A record the NA keeps as a quarantine entry is
@@ -720,16 +728,20 @@ impl EvidenceStoreClient {
             return Err(GenesisMeshError::FlushInProgress);
         }
         let _flushing = Flushing(&self.flushing_records);
-        let entries: Vec<RecordOutboxEntry> = outbox
+        let (mut entries, observations): (Vec<RecordOutboxEntry>, Vec<RecordOutboxEntry>) = outbox
             .list()
             .await
             .map_err(outbox_error)?
             .into_iter()
             .filter(|e| e.state == OutboxState::Pending)
-            .collect();
+            .partition(|e| e.kind == RecordKind::BreakGlass);
+        entries.extend(observations);
         // A record `enqueue_record` is submitting is left to it, as pending.
         let due = |e: &RecordOutboxEntry| {
-            !self.records_in_flight.contains(&e.id) && (options.ignore_backoff || e.due(Utc::now()))
+            let now = Utc::now();
+            let paused = self.records_paused_until.load(Ordering::Acquire) > now.timestamp_millis();
+            !self.records_in_flight.contains(&e.id)
+                && (options.ignore_backoff || (!paused && e.due(now)))
         };
         let mut report = RecordFlushReport::default();
         let mut stopped = false;
@@ -785,6 +797,7 @@ impl EvidenceStoreClient {
             let results = match answer {
                 Ok(results) => results,
                 Err(err) if !too_large(&err) && classify_record_submission_error(&err).1 => {
+                    self.pause_records(&err, wait);
                     if matches!(
                         err,
                         GenesisMeshError::RateLimit { .. }
@@ -848,8 +861,19 @@ impl EvidenceStoreClient {
                 RecordDelivery::admitted(ack)
             }
             (Err(err), wait) => {
+                self.pause_records(&err, wait);
                 RecordDelivery::queued(record_failed(outbox, entry, &err, wait).await)
             }
+        }
+    }
+
+    /// After a transient refusal that says when to try again (`Retry-After`),
+    /// no record is due before then (1.3.1): every record shares the NA's
+    /// submission rate.
+    fn pause_records(&self, err: &GenesisMeshError, wait: Option<Duration>) {
+        if wait.is_some() && classify_record_submission_error(err).1 {
+            let until = next_attempt(0, wait).timestamp_millis();
+            self.records_paused_until.fetch_max(until, Ordering::AcqRel);
         }
     }
 

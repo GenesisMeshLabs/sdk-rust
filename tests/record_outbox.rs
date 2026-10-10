@@ -725,7 +725,7 @@ async fn an_execution_record_waits_as_long_as_the_na_asks() {
 }
 
 #[tokio::test]
-async fn break_glass_records_are_flushed_one_at_a_time_in_order() {
+async fn break_glass_records_are_flushed_first_one_at_a_time() {
     let (url, task) = scripted(vec![
         unavailable(),
         unavailable(),
@@ -744,11 +744,11 @@ async fn break_glass_records_are_flushed_one_at_a_time_in_order() {
             EvaluationFailure::Timeout,
         ))
         .unwrap();
+    c.evidence_store.enqueue_record(observe(1)).await.unwrap();
     c.evidence_store
         .enqueue_record(record.clone())
         .await
         .unwrap();
-    c.evidence_store.enqueue_record(observe(1)).await.unwrap();
     let report = c
         .evidence_store
         .flush_records(FlushOptions {
@@ -757,10 +757,55 @@ async fn break_glass_records_are_flushed_one_at_a_time_in_order() {
         .await
         .unwrap();
     assert_eq!(report.admitted.len(), 2);
+    // 1.3.1: break-glass records first, though added later.
     let r = task.await.unwrap();
     assert_eq!(r[2].target, "/evidence/break-glass");
     assert_eq!(r[2].body, json!({ "record": record }));
     assert_eq!(r[3].target, "/evidence/observations/batch");
+}
+
+#[tokio::test]
+async fn no_record_is_due_while_the_na_asks_to_wait() {
+    let (url, task) = serve_raw(vec![
+        throttled(120),
+        raw(recorded()),
+        raw(batch_recorded(1)),
+    ])
+    .await;
+    let c = client(&url);
+    let record = recorder()
+        .sign_break_glass(genesis_mesh_sdk::BreakGlassInput::new(
+            "kv:v/s",
+            "rotate",
+            "sp-secret.rotate",
+            "incident 42",
+            json!({}),
+            EvaluationFailure::Timeout,
+        ))
+        .unwrap();
+    c.evidence_store.enqueue_record(record).await.unwrap();
+    // A record that never failed: due, but for the NA's request to wait.
+    let outbox = c.evidence_store.record_outbox().unwrap();
+    outbox
+        .add(&RecordOutboxEntry::new(observe(2)))
+        .await
+        .unwrap();
+    let waiting = c
+        .evidence_store
+        .flush_records(FlushOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(waiting.pending.len(), 2);
+    assert!(waiting.admitted.is_empty());
+    let report = c
+        .evidence_store
+        .flush_records(FlushOptions {
+            ignore_backoff: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.admitted.len(), 2);
+    assert_eq!(task.await.unwrap().len(), 3);
 }
 
 // ── governed_action_with_break_glass ─────────────────────────────────────────

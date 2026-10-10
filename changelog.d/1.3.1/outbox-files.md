@@ -11,3 +11,14 @@
   sharing one outbox directory. Two processes that share one submit each
   other's records and overwrite each other's changes, so give each process a
   directory of its own.
+
+### Changed
+
+- **An outbox file that cannot be read no longer stops every action.**
+  `FileOutbox` and `FileRecordOutbox` failed every read, and so every governed
+  action, while one entry file was not readable. They now move the file aside
+  as `<name>.unreadable` and fail the read that found it, once
+  (`GenesisMeshError::Outbox`, code `outbox_file_unreadable`), as the
+  TypeScript SDK does. The record it held is not submitted, so inspect the
+  file. A file of the other outbox's format is still refused, and left where
+  it is.

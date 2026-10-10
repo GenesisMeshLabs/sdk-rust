@@ -174,7 +174,9 @@ uses. It reads the directory once and keeps it in memory, so one process uses a
 directory at a time, and recovers what a crash left on that first read. Nothing
 enforces that: two processes sharing a directory submit each other's records
 and overwrite each other's changes, so give each process a directory of its
-own. A
+own. An entry file that cannot be read is moved aside as `<name>.unreadable`
+(1.3.1): the read that finds it fails once (`Outbox`, code
+`outbox_file_unreadable`) and the record it held is not submitted. A
 directory it creates is `0700` and its files `0600` on Unix; on Windows, or for
 a directory that already exists, restrict access to it yourself. Implement the
 `EvidenceOutbox` trait (its methods return boxed futures) to keep records in a
@@ -253,14 +255,15 @@ async fn start(url: &str) -> Result<GenesisMeshClient, Box<dyn std::error::Error
 
 `enqueue_record` keeps a record and submits it; a transient failure leaves it
 pending, and a refusal no retry can overcome (`RECORD_PERMANENT_REFUSALS`)
-keeps it as a dead letter. `flush_records` submits pending records in order,
+keeps it as a dead letter. `flush_records` submits pending break-glass
+records first (1.3.1), then observations, each in the order they were added,
 observations up to 100 per request. A batch the NA refuses as a whole (one
 record its strict reader cannot read, `invalid_json`) or finds too large is
 split in halves until the record it refuses is tried alone (1.3.1). A batch it
-throttles (`429`) halves the batches the client sends after it, and its
-records wait as long as the NA's `Retry-After` asks, so a submission rate
-(`NA_RATE_LIMIT_OBSERVATIONS_PER_MINUTE`) below 100 a minute still drains the
-backlog. A record the NA admits outside its time
+throttles (`429`) halves the batches the client sends after it, and no
+record is due again until the NA's `Retry-After` has passed, so a submission
+rate (`NA_RATE_LIMIT_OBSERVATIONS_PER_MINUTE`) below 100 a minute still drains
+the backlog. A record the NA admits outside its time
 bounds is kept by the NA as a quarantine entry and is listed in the run's
 `quarantined`. Implement the `RecordOutbox` trait to keep records elsewhere;
 `MemoryRecordOutbox` is for tests only.

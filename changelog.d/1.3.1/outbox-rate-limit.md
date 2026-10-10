@@ -9,4 +9,13 @@
 - **Outboxes wait as long as the NA asks.** After a refusal with a
   `Retry-After` header (seconds or an HTTP date), the next attempt of the
   record waits at least that long, at most 15 minutes. This holds for
-  `flush_pending`, `flush_records`, `enqueue` and `enqueue_record`.
+  `flush_pending`, `flush_records`, `enqueue` and `enqueue_record`. Since every
+  record shares the NA's submission rate, `flush_records` also submits no
+  record of the outbox until then (unless `ignore_backoff`).
+
+### Changed
+
+- `flush_records` submits break-glass records first, then observations, each
+  in the order they were added, as the TypeScript SDK does. They share the
+  NA's submission rate, and an observation of the same change then finds its
+  break-glass record.
