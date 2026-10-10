@@ -21,6 +21,14 @@
   stored record's signature (records stored before 1.1.1) is reported in the
   new `EvidenceVerification::warnings` as `unsigned_field` and the record is
   verified without it. `EvidenceVerification` gains the `warnings` field.
+- `GenesisMeshError` and its `ActionFailed`, `ActionUnrecorded`,
+  `MetadataRefused` and `EvidenceNotKept` variants are `#[non_exhaustive]`:
+  match with a wildcard arm and `..`. `ActionFailed` carries the failure
+  record and its outbox entry; `ActionUnrecorded` carries the record when it
+  was signed.
+- `GovernedActionResult` is `#[non_exhaustive]` and gains `queued`.
+  `ClientOptions` gains `outbox`. `governed_action`'s value type must be
+  `Send + 'static`.
 
 - **Records are valid only in their canonical form.** `verify_boundary_decision`
   refuses a decision signed over a timestamp the reference does not write
@@ -53,6 +61,27 @@
   `canonical::DECISION_OMITTED_WHEN_ABSENT`;
   `scripts/sync_canonical_registry.py` regenerates the embedded registry from
   a new copy of the suite, and CI checks the suite against the core's.
+- **An evidence outbox keeps signed evidence until the NA admits it.** With
+  `ClientOptions::with_outbox`, `governed_action` writes each signed record to
+  the outbox before submitting it and removes it once admitted. A failed
+  submission then is not an error: `GovernedActionResult::queued` is the
+  outbox entry, pending after a failure a later attempt can overcome or a dead
+  letter after a refusal no retry can overcome (`PERMANENT_REFUSALS`). Dead
+  letters are kept, never dropped. A resource with pending records chains from
+  the newest of them, which the next action on it submits first. Without an
+  outbox, `governed_action` behaves as in 1.1.
+- `FileOutbox` (one file per record, synced and renamed into place, crash
+  leftovers recovered, private permissions on Unix, the TypeScript SDK's
+  format), `MemoryOutbox` for tests, and the `EvidenceOutbox` trait, whose
+  methods return boxed futures (`OutboxFuture`) so other storage can be
+  asynchronous.
+- `EvidenceStoreClient::flush_pending`, `enqueue` and `pending_head`.
+- With an outbox, a secret-guard refusal of the metadata an action reported
+  still records the outcome, with the accepted parameters and a note naming
+  the dropped ones, and returns `MetadataRefused`; a failure to keep the
+  record returns `EvidenceNotKept`. Both carry the action's value
+  (`GenesisMeshError::take_action_value`). `Outbox`, `OutboxRequired` and
+  `FlushInProgress` errors.
 
 ## 1.1.1 - 2026-10-09
 

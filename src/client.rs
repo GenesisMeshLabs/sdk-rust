@@ -18,6 +18,7 @@ use crate::{
     evidence::EvidenceClient,
     evidence_store::EvidenceStoreClient,
     health::HealthClient,
+    outbox::EvidenceOutbox,
     policy::PolicyClient,
 };
 
@@ -36,6 +37,11 @@ pub struct ClientOptions {
     /// (signature version 2). When `None` it is read once from `/sovereign.json`
     /// (`network_authority.public_key`).
     pub audience: Option<String>,
+    /// Durable storage for signed execution records not yet admitted
+    /// (v1.2.0), e.g. a [`FileOutbox`](crate::FileOutbox). With one,
+    /// [`governed_action`](crate::governed_action) keeps every record until
+    /// the NA admits it; see [`EvidenceStoreClient::flush_pending`].
+    pub outbox: Option<Arc<dyn EvidenceOutbox>>,
 }
 
 impl std::fmt::Debug for ClientOptions {
@@ -49,6 +55,7 @@ impl std::fmt::Debug for ClientOptions {
             .field("key_id", &self.key_id)
             .field("timeout", &self.timeout)
             .field("audience", &self.audience)
+            .field("outbox", &self.outbox)
             .finish()
     }
 }
@@ -62,7 +69,14 @@ impl ClientOptions {
             key_id: None,
             timeout: None,
             audience: None,
+            outbox: None,
         }
+    }
+
+    /// Keep signed evidence in `outbox` until the NA admits it (v1.2.0).
+    pub fn with_outbox(mut self, outbox: Arc<dyn EvidenceOutbox>) -> Self {
+        self.outbox = Some(outbox);
+        self
     }
 
     /// Name the NA's public key for admin signatures instead of reading it
@@ -431,6 +445,7 @@ pub struct GenesisMeshClient {
 impl GenesisMeshClient {
     /// Construct a client from options.
     pub fn new(options: ClientOptions) -> Result<Self> {
+        let outbox = options.outbox.clone();
         let transport = Arc::new(HttpTransport::new(options)?);
 
         Ok(Self {
@@ -441,7 +456,7 @@ impl GenesisMeshClient {
             data_usage: DataUsageClient::new(Arc::clone(&transport)),
             disclosure: DisclosureClient::new(Arc::clone(&transport)),
             evidence: EvidenceClient::new(Arc::clone(&transport)),
-            evidence_store: EvidenceStoreClient::new(Arc::clone(&transport)),
+            evidence_store: EvidenceStoreClient::new(Arc::clone(&transport), outbox),
             health: HealthClient::new(Arc::clone(&transport)),
             policy: PolicyClient::new(transport),
         })

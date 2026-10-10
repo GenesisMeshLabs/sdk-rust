@@ -11,9 +11,10 @@ use uuid::Uuid;
 
 use crate::{
     boundary::BoundaryClient,
-    errors::{GenesisMeshError, Result},
+    errors::{ActionValue, GenesisMeshError, Result},
     evidence_store::EvidenceStoreClient,
-    execution::{ExecutionRecorder, PriorResource, RecordExecution},
+    execution::{check_metadata_only, ExecutionRecorder, PriorResource, RecordExecution},
+    outbox::OutboxEntry,
     verify::{verify_boundary_decision, VerifyDecisionOptions},
 };
 
@@ -152,6 +153,7 @@ pub struct GovernedActionParams {
 
 /// Outcome of [`governed_action`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GovernedActionResult<T> {
     /// `{decision, justification}` from the NA.
     pub evaluation: Value,
@@ -163,8 +165,103 @@ pub struct GovernedActionResult<T> {
     pub value: Option<T>,
     /// The signed execution evidence, when the action ran.
     pub evidence: Option<Value>,
-    /// The NA's acknowledgement of the evidence.
+    /// The NA's acknowledgement of the evidence, when it admitted it.
     pub submission: Option<Value>,
+    /// With an outbox (v1.2.0): the outbox entry holding the evidence when
+    /// the NA has not admitted it, pending for `flush_pending` or a dead
+    /// letter when it was refused. A failed submission then is not an error.
+    pub queued: Option<OutboxEntry>,
+}
+
+const GUARD_NOTE: &str = "secret guard dropped";
+
+/// The note naming what the guard dropped: plain field names only, others
+/// counted.
+fn guard_note(dropped: &[String]) -> String {
+    let nameable = |d: &String| {
+        !d.is_empty()
+            && d.len() <= 64
+            && d.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+    };
+    let mut parts: Vec<String> = dropped.iter().filter(|d| nameable(d)).cloned().collect();
+    let others = dropped.len() - parts.len();
+    if others > 0 {
+        parts.push(format!(
+            "{others} other field{}",
+            if others == 1 { "" } else { "s" }
+        ));
+    }
+    format!("[{GUARD_NOTE}: {}]", parts.join(", "))
+}
+
+/// Reported metadata without the parts the secret guard refuses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefusedMetadata {
+    /// The accepted parameters.
+    pub execution_parameters: Value,
+    /// The accepted detail, with a note naming what was dropped.
+    pub outcome_detail: String,
+    /// The refused field names, sorted (`outcome_detail` for the detail).
+    pub dropped: Vec<String>,
+}
+
+/// The reported metadata without the parts the secret guard refuses: each
+/// top-level parameter is checked alone, and the outcome detail names what
+/// was dropped. Everything is dropped when the rest is still refused (its
+/// size).
+pub fn without_refused_metadata(
+    execution_parameters: &Value,
+    outcome_detail: Option<&str>,
+) -> RefusedMetadata {
+    let empty = serde_json::Map::new();
+    let params = execution_parameters.as_object().unwrap_or(&empty);
+    let mut kept = serde_json::Map::new();
+    let mut dropped = Vec::new();
+    for (key, value) in params {
+        if check_metadata_only(&json!({ key: value }), None).is_none() {
+            kept.insert(key.clone(), value.clone());
+        } else {
+            dropped.push(key.clone());
+        }
+    }
+    let outcome_detail_given = outcome_detail.is_some();
+    let detail = outcome_detail.filter(|d| check_metadata_only(&json!({}), Some(d)).is_none());
+    if outcome_detail.is_some() && detail.is_none() {
+        dropped.push("outcome_detail".into());
+    }
+    if check_metadata_only(&Value::Object(kept.clone()), detail).is_some() {
+        dropped = params.keys().cloned().collect();
+        if outcome_detail.is_some() {
+            dropped.push("outcome_detail".into());
+        }
+        kept.clear();
+    }
+    dropped.sort();
+    let note = guard_note(&dropped);
+    let outcome_detail = match detail {
+        Some(detail) if !dropped.iter().any(|d| d == "outcome_detail") => {
+            format!("{detail} {note}")
+        }
+        _ => note,
+    };
+    if check_metadata_only(&Value::Object(kept.clone()), Some(&outcome_detail)).is_some() {
+        let mut all: Vec<String> = params.keys().cloned().collect();
+        if outcome_detail_given {
+            all.push("outcome_detail".into());
+        }
+        all.sort();
+        return RefusedMetadata {
+            execution_parameters: json!({}),
+            outcome_detail: format!("[{GUARD_NOTE}]"),
+            dropped: all,
+        };
+    }
+    RefusedMetadata {
+        execution_parameters: Value::Object(kept),
+        outcome_detail,
+        dropped,
+    }
 }
 
 /// The error type an action returns.
@@ -216,6 +313,16 @@ fn check_decision(decision: &Value, params: &GovernedActionParams, context_id: &
 /// `authorized: false` without running the action. If the action fails, a
 /// `failure` record is submitted and [`GenesisMeshError::ActionFailed`] is
 /// returned with the action's error.
+///
+/// With an outbox ([`ClientOptions::with_outbox`](crate::ClientOptions::with_outbox),
+/// v1.2.0) every record is kept until the NA admits it, and a failed
+/// submission is not an error: the result's `queued` is the outbox entry,
+/// which [`EvidenceStoreClient::flush_pending`] submits later. A resource with
+/// pending records chains from the newest of them, not from the NA's head. A
+/// guard refusal after the action records the outcome without the refused
+/// fields and returns [`GenesisMeshError::MetadataRefused`]; a failure to
+/// keep the record returns [`GenesisMeshError::EvidenceNotKept`]. Both carry
+/// the action's value.
 pub async fn governed_action<T, F, Fut>(
     boundary: &BoundaryClient,
     evidence_store: &EvidenceStoreClient,
@@ -224,6 +331,7 @@ pub async fn governed_action<T, F, Fut>(
     action: F,
 ) -> Result<GovernedActionResult<T>>
 where
+    T: Send + 'static,
     F: FnOnce(Value) -> Fut,
     Fut: Future<Output = std::result::Result<ActionReport<T>, ActionError>>,
 {
@@ -236,6 +344,12 @@ where
         return Err(GenesisMeshError::DecisionVerification(
             "verification_keys_required".into(),
         ));
+    }
+    let outbox = evidence_store.outbox();
+    if let Some(outbox) = outbox {
+        // An outbox that cannot be read fails here, before anything is
+        // evaluated or run.
+        outbox.list().await.map_err(GenesisMeshError::Outbox)?;
     }
     let mut request = params.evaluate.clone();
     if !request.is_object() {
@@ -264,16 +378,23 @@ where
             value: None,
             evidence: None,
             submission: None,
+            queued: None,
         });
     }
 
     let prior = match (&params.resource_id, &params.prior_resource) {
         (None, _) => None,
         (Some(_), Some(prior)) => prior.clone(),
-        (Some(resource_id), None) => evidence_store
-            .resource_head(resource_id)
-            .await?
-            .map(PriorResource::Head),
+        (Some(resource_id), None) => match match outbox {
+            Some(_) => evidence_store.pending_head(resource_id).await?,
+            None => None,
+        } {
+            Some(pending) => Some(PriorResource::Record(pending)),
+            None => evidence_store
+                .resource_head(resource_id)
+                .await?
+                .map(PriorResource::Head),
+        },
     };
     // Reading the head may outlast the decision's validity window.
     check_decision(&decision, &params, &context_id)?;
@@ -282,10 +403,10 @@ where
         .as_str()
         .unwrap_or_default()
         .to_owned();
-    let record_and_submit = |outcome: Option<String>,
-                             execution_parameters: Option<Value>,
-                             outcome_detail: Option<String>| {
-        let evidence = recorder.record(RecordExecution {
+    let record = |outcome: Option<String>,
+                  execution_parameters: Option<Value>,
+                  outcome_detail: Option<String>| {
+        recorder.record(RecordExecution {
             decision: decision.clone(),
             executed_capability: capability.clone(),
             outcome,
@@ -295,42 +416,117 @@ where
             resource_action: params.resource_action.clone(),
             prior_resource: prior.clone(),
             ..RecordExecution::default()
-        });
-        async move {
-            let evidence = evidence?;
-            let submission = evidence_store.submit(evidence.clone()).await?;
-            Ok::<_, GenesisMeshError>((evidence, submission))
+        })
+    };
+
+    let report = match action(decision.clone()).await {
+        Ok(report) => report,
+        Err(source) => {
+            // The error text is not recorded: it may carry secret material.
+            let evidence = match record(Some("failure".into()), None, Some("action failed".into()))
+            {
+                Ok(evidence) => evidence,
+                Err(evidence_error) => {
+                    return Err(GenesisMeshError::ActionUnrecorded {
+                        source,
+                        evidence_error: Box::new(evidence_error),
+                        evidence: None,
+                    })
+                }
+            };
+            let kept = match outbox {
+                Some(_) => evidence_store
+                    .enqueue(evidence.clone())
+                    .await
+                    .map(|d| d.queued),
+                None => evidence_store.submit(evidence.clone()).await.map(|_| None),
+            };
+            return Err(match kept {
+                Ok(queued) => GenesisMeshError::ActionFailed {
+                    source,
+                    evidence: Some(Box::new(evidence)),
+                    queued: queued.map(Box::new),
+                },
+                Err(evidence_error) => GenesisMeshError::ActionUnrecorded {
+                    source,
+                    evidence_error: Box::new(evidence_error),
+                    evidence: Some(Box::new(evidence)),
+                },
+            });
         }
     };
 
-    match action(decision.clone()).await {
-        Ok(report) => {
-            let (evidence, submission) = record_and_submit(
-                report.outcome,
-                report.execution_parameters,
-                report.outcome_detail,
-            )
-            .await?;
-            Ok(GovernedActionResult {
-                evaluation,
-                authorized: true,
-                summary,
-                value: report.value,
-                evidence: Some(evidence),
-                submission: Some(submission),
-            })
+    let ActionReport {
+        value,
+        execution_parameters,
+        outcome,
+        outcome_detail,
+    } = report;
+    if outbox.is_none() {
+        let evidence = record(outcome, execution_parameters, outcome_detail)?;
+        let submission = evidence_store.submit(evidence.clone()).await?;
+        return Ok(GovernedActionResult {
+            evaluation,
+            authorized: true,
+            summary,
+            value,
+            evidence: Some(evidence),
+            submission: Some(submission),
+            queued: None,
+        });
+    }
+
+    // The action ran: from here on its outcome is always recorded.
+    let not_kept = |source: GenesisMeshError, evidence: Option<Value>, value: Option<T>| {
+        GenesisMeshError::EvidenceNotKept {
+            source: Box::new(source),
+            evidence: evidence.map(Box::new),
+            value: ActionValue::new(value),
         }
-        Err(source) => {
-            // The error text is not recorded: it may carry secret material.
-            match record_and_submit(Some("failure".into()), None, Some("action failed".into()))
-                .await
-            {
-                Ok(_) => Err(GenesisMeshError::ActionFailed { source }),
-                Err(evidence_error) => Err(GenesisMeshError::ActionUnrecorded {
-                    source,
-                    evidence_error: Box::new(evidence_error),
-                }),
+    };
+    let (evidence, refused) = match record(
+        outcome.clone(),
+        execution_parameters.clone(),
+        outcome_detail.clone(),
+    ) {
+        Ok(evidence) => (evidence, None),
+        Err(GenesisMeshError::SecretMaterial(reason)) => {
+            let cleaned = without_refused_metadata(
+                execution_parameters.as_ref().unwrap_or(&json!({})),
+                outcome_detail.as_deref(),
+            );
+            match record(
+                outcome,
+                Some(cleaned.execution_parameters),
+                Some(cleaned.outcome_detail),
+            ) {
+                Ok(evidence) => (evidence, Some((reason, cleaned.dropped))),
+                Err(err) => return Err(not_kept(err, None, value)),
             }
         }
+        Err(err) => return Err(not_kept(err, None, value)),
+    };
+    let delivery = match evidence_store.enqueue(evidence.clone()).await {
+        Ok(delivery) => delivery,
+        Err(err) => return Err(not_kept(err, Some(evidence), value)),
+    };
+    if let Some((reason, dropped)) = refused {
+        return Err(GenesisMeshError::MetadataRefused {
+            reason,
+            dropped,
+            evidence: Box::new(evidence),
+            submission: delivery.submission.map(Box::new),
+            queued: delivery.queued.map(Box::new),
+            value: ActionValue::new(value),
+        });
     }
+    Ok(GovernedActionResult {
+        evaluation,
+        authorized: true,
+        summary,
+        value,
+        evidence: Some(evidence),
+        submission: delivery.submission,
+        queued: delivery.queued,
+    })
 }

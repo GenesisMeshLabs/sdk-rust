@@ -1,10 +1,16 @@
+use std::any::Any;
+
 use serde_json::Value;
+
+use crate::outbox::OutboxEntry;
 
 /// SDK result type.
 pub type Result<T> = std::result::Result<T, GenesisMeshError>;
 
-/// Error type for Genesis Mesh SDK operations.
+/// Error type for Genesis Mesh SDK operations. Non-exhaustive since 1.2.0:
+/// match the variants you handle and keep a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum GenesisMeshError {
     /// Invalid client configuration or route.
     #[error("configuration error: {0}")]
@@ -85,21 +91,110 @@ pub enum GenesisMeshError {
 
     /// A governed action failed; its failure was recorded as evidence.
     #[error("governed action failed: {source}")]
+    #[non_exhaustive]
     ActionFailed {
         /// The action's error.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
+        /// The signed failure record (v1.2.0).
+        evidence: Option<Box<Value>>,
+        /// With an outbox, the entry holding the failure record when the NA
+        /// has not admitted it (v1.2.0).
+        queued: Option<Box<OutboxEntry>>,
     },
 
-    /// A governed action failed and recording its failure also failed.
+    /// A governed action failed and its failure record could not be signed,
+    /// submitted or (with an outbox) kept.
     #[error("action failed and its failure could not be recorded: {evidence_error}")]
+    #[non_exhaustive]
     ActionUnrecorded {
         /// The action's error.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
         /// Why the failure evidence could not be recorded.
         evidence_error: Box<GenesisMeshError>,
+        /// The signed failure record, when signing succeeded (v1.2.0).
+        evidence: Option<Box<Value>>,
     },
+
+    /// With an outbox (v1.2.0): the governed action ran, but the secret guard
+    /// refused metadata it reported. The outcome was recorded without the
+    /// refused fields (`dropped`) as `evidence`; `submission` or `queued` say
+    /// what became of it. Do not rerun the action.
+    /// [`GenesisMeshError::take_action_value`] takes the action's value.
+    #[error("the action ran; its metadata was refused and recorded without {}: {reason}", dropped.join(", "))]
+    #[non_exhaustive]
+    MetadataRefused {
+        /// The guard's reason.
+        reason: String,
+        /// The refused field names (`outcome_detail` for the detail).
+        dropped: Vec<String>,
+        /// The recorded outcome.
+        evidence: Box<Value>,
+        /// The NA's acknowledgement, when it admitted the record.
+        submission: Option<Box<Value>>,
+        /// The outbox entry, when the NA has not admitted it.
+        queued: Option<Box<OutboxEntry>>,
+        /// The action's value.
+        value: ActionValue,
+    },
+
+    /// With an outbox (v1.2.0): the governed action ran, but its evidence
+    /// could not be signed or kept in the outbox. `evidence` is the signed
+    /// record when signing succeeded: pass it to
+    /// [`EvidenceStoreClient::enqueue`](crate::EvidenceStoreClient::enqueue)
+    /// once the outbox works. Do not rerun the action.
+    /// [`GenesisMeshError::take_action_value`] takes the action's value.
+    #[error("the action ran; its evidence was not kept: {source}")]
+    #[non_exhaustive]
+    EvidenceNotKept {
+        /// Why.
+        #[source]
+        source: Box<GenesisMeshError>,
+        /// The signed record, when signing succeeded.
+        evidence: Option<Box<Value>>,
+        /// The action's value.
+        value: ActionValue,
+    },
+
+    /// The evidence outbox failed to store, update, remove or list entries
+    /// (v1.2.0).
+    #[error("evidence outbox error: {0}")]
+    Outbox(#[source] std::io::Error),
+
+    /// No evidence outbox is configured
+    /// ([`ClientOptions::with_outbox`](crate::ClientOptions::with_outbox)); the
+    /// outbox methods need one (v1.2.0).
+    #[error("no evidence outbox is configured (ClientOptions::with_outbox)")]
+    OutboxRequired,
+
+    /// Another `flush_pending` run is in progress on this client (v1.2.0).
+    #[error("a flush of the evidence outbox is already running")]
+    FlushInProgress,
+}
+
+/// A governed action's value carried by an error that says the action ran
+/// (v1.2.0). Take it with [`GenesisMeshError::take_action_value`].
+pub struct ActionValue(std::sync::Mutex<Option<Box<dyn Any + Send>>>);
+
+impl ActionValue {
+    pub(crate) fn new<T: Send + 'static>(value: Option<T>) -> Self {
+        Self(std::sync::Mutex::new(
+            value.map(|v| Box::new(v) as Box<dyn Any + Send>),
+        ))
+    }
+
+    fn slot(&mut self) -> &mut Option<Box<dyn Any + Send>> {
+        self.0
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl std::fmt::Debug for ActionValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ActionValue(..)")
+    }
 }
 
 impl GenesisMeshError {
@@ -119,10 +214,35 @@ impl GenesisMeshError {
             Self::Verification(_) => "verification_failed",
             Self::ActionFailed { .. } => "governed_action_failed",
             Self::ActionUnrecorded { .. } => "governed_action_unrecorded",
+            Self::MetadataRefused { .. } => "governed_action_metadata_refused",
+            Self::EvidenceNotKept { .. } => "governed_action_evidence_unkept",
+            Self::Outbox(_) => "outbox_error",
+            Self::OutboxRequired => "outbox_required",
+            Self::FlushInProgress => "outbox_flush_in_progress",
             Self::Configuration(_) => "configuration",
             Self::Network(_) => "network",
             Self::Json(_) => "json",
             Self::SigningKey(_) | Self::MissingSigningKey => "signing_key",
+        }
+    }
+}
+
+impl GenesisMeshError {
+    /// Take the governed action's value out of an error that says the action
+    /// ran (`MetadataRefused`, `EvidenceNotKept`), when it is a `T`. Returns
+    /// `None` for another type, and after the value was taken.
+    pub fn take_action_value<T: 'static>(&mut self) -> Option<T> {
+        let (Self::MetadataRefused { value, .. } | Self::EvidenceNotKept { value, .. }) = self
+        else {
+            return None;
+        };
+        let slot = value.slot();
+        match slot.take()?.downcast::<T>() {
+            Ok(v) => Some(*v),
+            Err(other) => {
+                *slot = Some(other);
+                None
+            }
         }
     }
 }

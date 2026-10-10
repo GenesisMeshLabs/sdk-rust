@@ -7,6 +7,7 @@
 use std::{
     io::{BufRead, BufReader},
     process::{Child, Command, Stdio},
+    sync::Arc,
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -19,13 +20,15 @@ use genesis_mesh_sdk::{
         verify_justification_signature, verify_policy_signature, VerifyDecisionOptions,
         VerifyEvidenceOptions,
     },
-    ActionError, ActionReport, ClientOptions, ExecutionRecorder, GenesisMeshClient,
-    GenesisMeshError, GovernedActionParams, GovernedVerification, RecordExecution, Value,
+    ActionError, ActionReport, ClientOptions, EvidenceOutbox, ExecutionRecorder, FlushOptions,
+    GenesisMeshClient, GenesisMeshError, GovernedActionParams, GovernedVerification, MemoryOutbox,
+    OutboxState, RecordExecution, Value,
 };
 use uuid::Uuid;
 
 struct LiveNa {
     client: GenesisMeshClient,
+    options: ClientOptions,
     na_public_key: String,
     child: Option<Child>,
 }
@@ -65,14 +68,13 @@ fn live_na() -> Option<LiveNa> {
             .expect("NA printed its configuration");
         (serde_json::from_str::<Value>(&line).unwrap(), Some(child))
     };
-    let client = GenesisMeshClient::new(
-        ClientOptions::new(config["baseUrl"].as_str().unwrap())
-            .with_signing_key(config["signingKeyBase64"].as_str().unwrap())
-            .with_key_id(config["keyId"].as_str().unwrap()),
-    )
-    .unwrap();
+    let options = ClientOptions::new(config["baseUrl"].as_str().unwrap())
+        .with_signing_key(config["signingKeyBase64"].as_str().unwrap())
+        .with_key_id(config["keyId"].as_str().unwrap());
+    let client = GenesisMeshClient::new(options.clone()).unwrap();
     Some(LiveNa {
         client,
+        options,
         na_public_key: config["naPublicKey"].as_str().unwrap().to_owned(),
         child,
     })
@@ -102,6 +104,116 @@ async fn governed_lifecycle_against_a_live_na() {
     };
     admit_decide_record_audit_and_offboard(&na).await;
     observe_enforce_rollback_failures_conflicts_and_retired_keys(&na).await;
+    keep_evidence_while_the_na_is_unreachable_and_admit_it_in_order(&na).await;
+}
+
+/// v1.2.0: evidence that cannot be submitted stays in the outbox, a second
+/// change chains from it, and a flush admits both in order.
+async fn keep_evidence_while_the_na_is_unreachable_and_admit_it_in_order(na: &LiveNa) {
+    let gm = &na.client;
+    let id = Uuid::new_v4().to_string();
+    let attestation = gm
+        .attestation
+        .issue(json!({"subject_id": id, "roles": ["role:client"], "claims": {"capabilities": ["sdk.outbox"]}}))
+        .await
+        .unwrap();
+    let (recorder, executor_key) = executor(&id);
+    gm.evidence_store
+        .register_executor_key(
+            json!({"key_id": id, "public_key": executor_key, "executor_sovereign_id": id}),
+        )
+        .await
+        .unwrap();
+    let outbox: Arc<dyn EvidenceOutbox> = Arc::new(MemoryOutbox::default());
+    let live = GenesisMeshClient::new(na.options.clone().with_outbox(Arc::clone(&outbox))).unwrap();
+    // Nothing listens on the discard port: every submission fails to connect.
+    let unreachable = GenesisMeshClient::new(
+        ClientOptions::new("http://127.0.0.1:9").with_outbox(Arc::clone(&outbox)),
+    )
+    .unwrap();
+    let resource = format!("sdk:{id}");
+    let params = |prior| GovernedActionParams {
+        evaluate: json!({"attestation_id": attestation["attestation_id"], "requested_capability": "sdk.outbox"}),
+        resource_id: Some(resource.clone()),
+        resource_action: Some("rotate".into()),
+        prior_resource: prior,
+        verify: GovernedVerification {
+            operator_public_keys: vec![na.na_public_key.clone()],
+            expected_attestation: Some(attestation.clone()),
+            ..GovernedVerification::default()
+        },
+    };
+    let mut evidence = Vec::new();
+    for (prior, version) in [(Some(None), "v1"), (None, "v2")] {
+        let result = governed_action(
+            &live.boundary,
+            &unreachable.evidence_store,
+            &recorder,
+            params(prior),
+            |_| async move {
+                Ok::<_, ActionError>(ActionReport {
+                    value: Some(version),
+                    execution_parameters: Some(json!({"secret_version": version})),
+                    ..ActionReport::default()
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.value, Some(version));
+        assert_eq!(result.queued.unwrap().state, OutboxState::Pending);
+        evidence.push(result.evidence.unwrap());
+    }
+    assert_eq!(
+        evidence[1]["prev_resource_digest"],
+        execution_digest(&evidence[0]).unwrap()
+    );
+
+    let flushed = live
+        .evidence_store
+        .flush_pending(FlushOptions {
+            ignore_backoff: true,
+        })
+        .await
+        .unwrap();
+    let admitted: Vec<Value> = flushed.admitted.into_iter().map(|e| e.evidence).collect();
+    assert_eq!(admitted, evidence);
+    assert!(outbox.list().await.unwrap().is_empty());
+    let history = gm.evidence_store.resource_history(&resource).await.unwrap();
+    assert_eq!(history["verification"]["verified"], true);
+
+    // A guard refusal after the action: recorded without the refused field.
+    let mut err = governed_action(
+        &live.boundary,
+        &live.evidence_store,
+        &recorder,
+        params(None),
+        |_| async {
+            Ok::<_, ActionError>(ActionReport {
+                value: Some(3_u8),
+                execution_parameters: Some(
+                    json!({"secret_version": "v3", "client_secret": "not-for-evidence"}),
+                ),
+                ..ActionReport::default()
+            })
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.take_action_value::<u8>(), Some(3));
+    let GenesisMeshError::MetadataRefused {
+        evidence,
+        submission,
+        ..
+    } = err
+    else {
+        panic!("unexpected error");
+    };
+    assert_eq!(submission.unwrap()["status"], "recorded");
+    assert_eq!(
+        evidence["execution_parameters"],
+        json!({"secret_version": "v3"})
+    );
 }
 
 async fn admit_decide_record_audit_and_offboard(na: &LiveNa) {
