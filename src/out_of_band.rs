@@ -202,8 +202,19 @@ pub struct ObservationInput {
     pub version_id: Option<String>,
     /// Identifiers, versions and times; never values. Defaults to `{}`.
     pub metadata: Option<Value>,
-    /// Defaults to a new UUID.
+    /// Defaults (1.3.1) to [`observation_id`] of the observer, the source and
+    /// the source event, the same for every record of one source event: an
+    /// identical record signed again is a `duplicate` at the NA, not an
+    /// `observation_conflict`. Before 1.3.1, a new UUID.
     pub observation_id: Option<String>,
+}
+
+/// The default `observation_id` (1.3.1): the SHA-256, in hex, of what makes
+/// an observation one at the NA, its observer sovereign, source and source
+/// event id, joined by NUL characters. One source event gives one id, in
+/// every SDK.
+pub fn observation_id(observer_sovereign_id: &str, source: &str, source_event_id: &str) -> String {
+    sha256_hex(format!("{observer_sovereign_id}\u{0}{source}\u{0}{source_event_id}").as_bytes())
 }
 
 /// Builds and signs observations for one observer (v1.3.0). Submit them
@@ -343,12 +354,14 @@ impl ObservationRecorder {
             return Err(refused("observation_secret_material", secret));
         }
         let mut record = Map::new();
-        record.insert(
-            "observation_id".into(),
-            json!(input
-                .observation_id
-                .unwrap_or_else(|| Uuid::new_v4().to_string())),
-        );
+        let id = input.observation_id.unwrap_or_else(|| {
+            observation_id(
+                &self.observer_sovereign_id,
+                &input.source,
+                &input.source_event_id,
+            )
+        });
+        record.insert("observation_id".into(), json!(id));
         record.insert(
             "observer_sovereign_id".into(),
             json!(self.observer_sovereign_id),
@@ -418,7 +431,9 @@ impl FindingObservationOptions {
 /// `version` and `metadata`. The change is known only within the window
 /// between the two scans, so the NA judges it at both ends of the window.
 /// The source event is the scan and the resource, so a repeated scan does
-/// not record the finding twice.
+/// not record the finding twice: signed again, the observation is the same
+/// record (its id derived from the source event, 1.3.1), which the NA
+/// answers as a `duplicate`.
 pub fn observation_from_finding(
     finding: &Value,
     options: &FindingObservationOptions,

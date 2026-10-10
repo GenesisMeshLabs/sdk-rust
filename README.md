@@ -304,7 +304,9 @@ finding knows only that a resource
 changed between two scans: `observation_from_finding` turns one (the JSON the
 other SDKs' reconciliation returns) into an observation input with that
 window, which the NA judges at both ends, and returns `None` for a resource in
-sync.
+sync. An observation's id defaults to one derived from its observer, source and
+source event (`observation_id`, 1.3.1), so the same finding signed again is
+the same record, which the NA answers as a `duplicate`.
 
 ### Break-glass
 

@@ -409,9 +409,35 @@ fn a_reconciliation_finding_becomes_a_windowed_observation_once_per_scan() {
         observation_from_finding(&finding, &custom).unwrap().action,
         "rotate"
     );
-    let record = observer().record(input).unwrap();
+    let record = observer().record(input.clone()).unwrap();
     assert_eq!(record["changed_not_before"], "2026-01-01T00:00:00Z");
     assert!(record.get("changed_at").is_none());
+    // The same scan signed again is the same record, which the NA answers as
+    // a duplicate (1.3.1; a new random id made it an observation_conflict).
+    assert_eq!(observer().record(input.clone()).unwrap(), record);
+    let identity = format!(
+        "cloud-observer\u{0}reconciliation\u{0}{}",
+        input.source_event_id
+    );
+    let id: String = Sha256::digest(identity.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(record["observation_id"], id);
+    assert_eq!(
+        genesis_mesh_sdk::observation_id(
+            "cloud-observer",
+            "reconciliation",
+            &input.source_event_id
+        ),
+        id
+    );
+    // An id given is kept.
+    let given = ObservationInput {
+        observation_id: Some("obs-1".into()),
+        ..input
+    };
+    assert_eq!(observer().record(given).unwrap()["observation_id"], "obs-1");
 }
 
 fn executor() -> ExecutionRecorder {
