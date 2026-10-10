@@ -1182,6 +1182,54 @@ async fn a_guard_refusal_after_the_action_records_the_outcome_and_returns_the_va
 }
 
 #[tokio::test]
+async fn a_report_nested_too_deep_is_recorded_without_it() {
+    let v = vectors();
+    let (url, task) = scripted(vec![
+        ok(signed_evaluation(&v, true, "ctx-o13")),
+        ok(json!({"status": "recorded"})),
+    ])
+    .await;
+    let c = with_outbox(&url);
+    let mut p = params(&v, "ctx-o13");
+    p.prior_resource = Some(None);
+    // No reader takes JSON nested more than 64 deep (1.3.1).
+    let deep = (1..70).fold(json!({}), |inner, _| json!({ "a": inner }));
+    let err = governed_action(
+        &c.boundary,
+        &c.evidence_store,
+        &recorder(),
+        p,
+        |_| async move {
+            Ok::<_, ActionError>(ActionReport {
+                value: Some(7_u32),
+                execution_parameters: Some(json!({"deep": deep, "secret_version": "v2"})),
+                ..ActionReport::default()
+            })
+        },
+    )
+    .await
+    .unwrap_err();
+    let GenesisMeshError::MetadataRefused {
+        reason,
+        dropped,
+        evidence,
+        submission,
+        ..
+    } = err
+    else {
+        panic!("unexpected error {err}");
+    };
+    assert!(reason.contains("nested more than 64 deep"), "{reason}");
+    assert_eq!(dropped, ["deep"]);
+    assert_eq!(
+        evidence["execution_parameters"],
+        json!({"secret_version": "v2"})
+    );
+    assert_eq!(submission.unwrap()["status"], "recorded");
+    assert_eq!(task.await.unwrap()[1].body["evidence"], *evidence);
+}
+
+#[tokio::test]
 async fn an_outbox_failure_after_the_action_returns_the_value_and_the_record() {
     let v = vectors();
     let (url, task) = scripted(vec![ok(signed_evaluation(&v, true, "ctx-o11"))]).await;

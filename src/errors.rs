@@ -138,9 +138,10 @@ pub enum GenesisMeshError {
     },
 
     /// With an outbox (v1.2.0): the governed action ran, but the secret guard
-    /// refused metadata it reported. The outcome was recorded without the
-    /// refused fields (`dropped`) as `evidence`; `submission` or `queued` say
-    /// what became of it. Do not rerun the action.
+    /// refused metadata it reported (or, 1.3.1, metadata nested too deep for
+    /// every reader). The outcome was recorded without the refused fields
+    /// (`dropped`) as `evidence`; `submission` or `queued` say what became of
+    /// it. Do not rerun the action.
     /// [`GenesisMeshError::take_action_value`] takes the action's value.
     #[error("the action ran; its metadata was refused and recorded without {}: {reason}", dropped.join(", "))]
     #[non_exhaustive]

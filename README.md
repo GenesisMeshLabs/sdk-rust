@@ -155,7 +155,12 @@ async fn rotate(gm: &GenesisMeshClient, attestation: Value, policy: Value, na_ke
 A denial returns `authorized: false` without running the action. A failed action
 is recorded as a `failure` record without its error text (`ActionFailed`).
 Metadata that looks like secret material, or exceeds 16 KiB, is refused before
-signing (`SecretMaterial`). `verify::verify_evidence_events` checks an export
+signing (`SecretMaterial`), as is a resource action other than `create`,
+`rotate`, `revoke`, `update` or `delete` (`Configuration`). Since 1.3.1 a record
+no reader would take, nested more than 64 deep as it is submitted or kept in an
+outbox, is refused before signing as `StrictJson` (`invalid_json`); after an
+action has run, its outcome is then recorded without the parameters nested too
+deep (`MetadataRefused`). `verify::verify_evidence_events` checks an export
 offline with the same reason codes as the Python reference, and
 `verify::verify_boundary_decision` checks one decision.
 
@@ -282,9 +287,14 @@ async fn observe(gm: &GenesisMeshClient, observer_public_key: &str, observer_see
 ```
 
 `actor` is recorded as the source reported it and is not authenticated: use a
-pseudonymous identifier, never a credential. `metadata` passes the secret
-guard (`observation_secret_material`): names, versions and times, never
-values. Name the version (`version_id`) when the source reports one: the NA
+pseudonymous identifier, never a credential. `metadata`, and the `actor`,
+source event and version strings, pass the secret guard as the NA applies it
+(`observation_secret_material`): names, versions and times, never values, at
+most 16 KiB together as the NA counts them (since 1.3.1: text outside ASCII
+escaped, as `é`). A record the NA would find malformed is not signed
+either (`observation_malformed`): an action other than `create`, `rotate`,
+`revoke`, `update` or `delete`, a field of the wrong length, or a time outside
+the years 1 to 9999. Name the version (`version_id`) when the source reports one: the NA
 matches the observation to execution evidence for the same resource, action
 and capability that reports the same `execution_parameters.version_id`, and
 the change is then governed by that evidence's decision, unless the
@@ -335,8 +345,9 @@ decided, even denied), or any other error. It needs a record outbox
 naming its `requested_capability`. Before anything is evaluated or run it
 checks the justification (1 to 1024 characters), that the context's
 `request_parameters` and `attributes` are objects that, with the
-justification, leave room for the record, and the context and justification
-against the secret guard (`OutOfBandRecord` with `break_glass_malformed` or
+justification, leave room for the record (counted as the NA counts it, since
+1.3.1), and the context and justification against the secret guard
+(`OutOfBandRecord` with `break_glass_malformed` or
 `break_glass_secret_material`). A failed action is recorded as a `failure`
 record (`ActionFailed`, whose `queued_record` holds its entry while the NA is
 away). Once the action ran a record is always kept: an outcome detail is cut

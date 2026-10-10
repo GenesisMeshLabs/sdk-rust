@@ -822,7 +822,31 @@ async fn break_glass_checks_what_it_needs_before_anything_runs() {
     // Room is kept for the action's report within the metadata limit.
     let mut no_room = params(&v, "ctx-b4");
     no_room.evaluate["context"]["attributes"]["note"] = json!("a short note, ".repeat(1100));
+    // Measured as the NA measures it (1.3.1): text outside ASCII escaped, 5142
+    // bytes as UTF-8 but 15188 as the NA counts the record.
+    let mut no_room_escaped = params(&v, "ctx-b4");
+    no_room_escaped.evaluate["context"]["attributes"]["note"] = json!("é".repeat(2500));
+    // Nested deeper than every reader takes (1.3.1).
+    let mut too_deep = params(&v, "ctx-b4");
+    too_deep.evaluate["context"]["attributes"]["deep"] =
+        (1..61).fold(json!({}), |inner, _| json!({ "a": inner }));
+    let mut unknown_action = params(&v, "ctx-b4");
+    unknown_action.resource_action = Some("rotated".into());
     let cases = [
+        (
+            &c,
+            no_room_escaped,
+            justification(),
+            "break_glass_malformed",
+        ),
+        (&c, too_deep, justification(), "invalid_json"),
+        (&c, unknown_action, justification(), "configuration"),
+        (
+            &c,
+            changed("attestation_id", json!("a".repeat(129))),
+            justification(),
+            "break_glass_malformed",
+        ),
         (&c, agreement, justification(), "break_glass_malformed"),
         (
             &c,
@@ -982,6 +1006,33 @@ async fn a_break_glass_record_waits_while_the_na_is_down_without_refused_metadat
     );
     let executor_key = public_key_from_seed(&STANDARD.encode([5_u8; 32])).unwrap();
     assert!(verify_out_of_band_record(&result.record, &[executor_key]));
+}
+
+#[tokio::test]
+async fn a_report_that_leaves_no_room_with_the_justification_is_left_out() {
+    let v = vectors();
+    let (url, task) = scripted(vec![unavailable(), recorded()]).await;
+    let c = client(&url);
+    let mut p = params(&v, "ctx-b10");
+    p.evaluate["context"]["request_parameters"] = json!({"blob": "a b".repeat(4300)});
+    let report = Ok(ActionReport {
+        value: Some("done".into()),
+        execution_parameters: Some(json!({"versions": "v ".repeat(1300)})),
+        ..ActionReport::default()
+    });
+    // The NA counts the justification with the report (1.3.1): 16652 bytes.
+    let (outcome, _) = run(&c, &c, p, BreakGlassOptions::new("x ".repeat(512)), report).await;
+    let result = broke(outcome.unwrap());
+    assert_eq!(result.value.as_deref(), Some("done"));
+    assert_eq!(result.dropped, ["versions"]);
+    assert_eq!(result.record["execution_parameters"], json!({}));
+    assert_eq!(
+        result.record["outcome_detail"],
+        "[secret guard dropped the report]"
+    );
+    let executor_key = public_key_from_seed(&STANDARD.encode([5_u8; 32])).unwrap();
+    assert!(verify_out_of_band_record(&result.record, &[executor_key]));
+    assert_eq!(task.await.unwrap()[1].body["record"], result.record);
 }
 
 #[tokio::test]

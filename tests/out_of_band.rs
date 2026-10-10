@@ -215,6 +215,143 @@ fn an_observation_needs_one_change_time_and_no_secret_material() {
 }
 
 #[test]
+fn an_observation_is_guarded_as_the_na_guards_it() {
+    let recorder = observer();
+    // Text outside ASCII counts as the NA counts it, escaped (`é`, six
+    // bytes): 46 bytes and 2723 of them fit, 2724 do not (1.3.1).
+    let wide = |n: usize| ObservationInput {
+        source_event_id: "e".into(),
+        metadata: Some(json!({"note": "é".repeat(n)})),
+        ..observation("kv:prod/api-key", "e")
+    };
+    assert!(recorder.record(wide(2723)).is_ok());
+    let err = recorder.record(wide(2724)).unwrap_err();
+    assert!(err.to_string().contains("16390 bytes"), "{err}");
+    assert_eq!(refusal(err), "observation_secret_material");
+    // The source's own strings pass the guard too, under their names.
+    for (input, field) in [
+        (
+            ObservationInput {
+                actor: Some("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln".into()),
+                ..observation("kv:prod/api-key", "e")
+            },
+            "'actor'",
+        ),
+        (
+            ObservationInput {
+                version_id: Some("-----BEGIN PRIVATE KEY-----".into()),
+                ..observation("kv:prod/api-key", "e")
+            },
+            "'version_id'",
+        ),
+        (
+            observation("kv:prod/api-key", &"A".repeat(120)),
+            "'source_event_id'",
+        ),
+        (
+            ObservationInput {
+                metadata: Some(json!({"nested": {"api_key": "x"}})),
+                ..observation("kv:prod/api-key", "e")
+            },
+            "'metadata.nested.api_key'",
+        ),
+    ] {
+        let err = recorder.record(input).unwrap_err();
+        assert!(err.to_string().contains(field), "{err}");
+        assert_eq!(refusal(err), "observation_secret_material");
+    }
+}
+
+#[test]
+fn an_observation_the_na_would_find_malformed_is_not_signed() {
+    let recorder = observer();
+    let year_10000 = chrono::NaiveDate::from_ymd_opt(10_000, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    for input in [
+        ObservationInput {
+            action: "rotated".into(),
+            ..observation("kv:prod/api-key", "e")
+        },
+        observation(&"r".repeat(257), "e"),
+        observation("kv:prod/api-key", &"e".repeat(257)),
+        ObservationInput {
+            source: "s".repeat(129),
+            ..observation("kv:prod/api-key", "e")
+        },
+        ObservationInput {
+            capability: String::new(),
+            ..observation("kv:prod/api-key", "e")
+        },
+        ObservationInput {
+            actor: Some(String::new()),
+            ..observation("kv:prod/api-key", "e")
+        },
+        ObservationInput {
+            observation_id: Some("o".repeat(129)),
+            ..observation("kv:prod/api-key", "e")
+        },
+        ObservationInput {
+            observed_at: Some(year_10000),
+            ..observation("kv:prod/api-key", "e")
+        },
+    ] {
+        assert_eq!(
+            refusal(recorder.record(input).unwrap_err()),
+            "observation_malformed"
+        );
+    }
+    // The longest values the reference takes, counted in characters.
+    let longest = ObservationInput {
+        source: "é".repeat(128),
+        ..observation(&"é".repeat(256), "e")
+    };
+    assert!(recorder.record(longest).is_ok());
+}
+
+/// `depth` objects, one inside the other.
+fn nested(depth: usize) -> Value {
+    (1..depth).fold(json!({}), |inner, _| json!({ "a": inner }))
+}
+
+#[test]
+fn a_record_nested_deeper_than_every_reader_takes_is_not_signed() {
+    // An observation's metadata sits four deep in a batch request and in an
+    // outbox file: 61 more levels fit within the 64 every reader takes.
+    let deep = |depth: usize| ObservationInput {
+        metadata: Some(nested(depth)),
+        ..observation("kv:prod/api-key", "e")
+    };
+    let record = observer().record(deep(61)).unwrap();
+    let batch = serde_json::to_string(&json!({ "observations": [record] })).unwrap();
+    assert!(genesis_mesh_sdk::check_strict_json(&batch).is_ok());
+    let err = observer().record(deep(62)).unwrap_err();
+    assert!(
+        matches!(err, GenesisMeshError::StrictJson { ref reason, .. } if reason == "invalid_json"),
+        "{err}"
+    );
+    let err = executor()
+        .sign_break_glass(BreakGlassInput {
+            attributes: Some(nested(62)),
+            ..break_glass()
+        })
+        .unwrap_err();
+    assert_eq!(err.code(), "invalid_json");
+    let decision = json!({"decision_id": "d", "context_id": "c", "agreement_id": "a"});
+    let err = executor()
+        .record(genesis_mesh_sdk::RecordExecution {
+            decision,
+            executed_capability: "secret.rotate".into(),
+            execution_parameters: Some(nested(62)),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(err.code(), "invalid_json");
+}
+
+#[test]
 fn a_reconciliation_finding_becomes_a_windowed_observation_once_per_scan() {
     let finding = json!({
         "resource_id": "kv:prod/api-key", "status": "drifted",
@@ -352,6 +489,87 @@ fn a_break_glass_record_needs_a_justification_and_no_secret_material() {
             refusal(recorder.sign_break_glass(input).unwrap_err()),
             "break_glass_secret_material"
         );
+    }
+}
+
+#[test]
+fn a_break_glass_record_is_guarded_as_the_na_guards_it() {
+    let recorder = executor();
+    let justification = "incident 42 ".repeat(85);
+    // The justification counts toward the limit (1.3.1): 16554 bytes together.
+    let report = BreakGlassInput {
+        justification: justification.clone(),
+        execution_parameters: Some(json!({"version_id": "v7", "notes": "x ".repeat(7700)})),
+        ..break_glass()
+    };
+    let err = recorder.sign_break_glass(report).unwrap_err();
+    assert!(err.to_string().contains("16554 bytes"), "{err}");
+    assert_eq!(refusal(err), "break_glass_secret_material");
+    // Text outside ASCII counts escaped.
+    let wide = BreakGlassInput {
+        attributes: Some(json!({"region": "é".repeat(2800)})),
+        ..break_glass()
+    };
+    assert_eq!(
+        refusal(recorder.sign_break_glass(wide).unwrap_err()),
+        "break_glass_secret_material"
+    );
+    // The guard names the field as the NA names it.
+    let err = recorder
+        .sign_break_glass(BreakGlassInput {
+            justification: "pasted -----BEGIN PRIVATE KEY----- by mistake".into(),
+            ..break_glass()
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("'justification'"), "{err}");
+    let year_0 = chrono::NaiveDate::from_ymd_opt(0, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    for input in [
+        BreakGlassInput {
+            resource_action: "rotated".into(),
+            ..break_glass()
+        },
+        BreakGlassInput {
+            capability: "c".repeat(257),
+            ..break_glass()
+        },
+        BreakGlassInput {
+            attestation_id: Some("a".repeat(129)),
+            ..break_glass()
+        },
+        BreakGlassInput {
+            outcome_detail: Some("d ".repeat(513)),
+            ..break_glass()
+        },
+        BreakGlassInput {
+            executed_at: Some(year_0),
+            ..break_glass()
+        },
+    ] {
+        assert_eq!(
+            refusal(recorder.sign_break_glass(input).unwrap_err()),
+            "break_glass_malformed"
+        );
+    }
+}
+
+#[test]
+fn an_execution_record_with_an_unknown_action_is_not_signed() {
+    let decision = json!({"decision_id": "d", "context_id": "c", "agreement_id": "a"});
+    for (resource_id, action) in [("kv:prod/api-key", "rotated"), (&"r".repeat(257), "rotate")] {
+        let err = executor()
+            .record(genesis_mesh_sdk::RecordExecution {
+                decision: decision.clone(),
+                executed_capability: "secret.rotate".into(),
+                resource_id: Some(resource_id.into()),
+                resource_action: Some(action.into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, GenesisMeshError::Configuration(_)), "{err}");
     }
 }
 

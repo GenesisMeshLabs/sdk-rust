@@ -28,11 +28,83 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    auth::{canonical_digest, load_signing_key, sha256_hex, sign_canonical},
+    auth::{canonical_digest, canonical_json, load_signing_key, sha256_hex, sign_canonical},
     canonical::{out_of_band_canonical, python_timestamp},
     errors::{GenesisMeshError, Result},
-    execution::check_metadata_only,
+    execution::{secret_material, MAX_METADATA_BYTES},
+    strict::canonical_timestamp,
+    strict_json::check_strict_json,
 };
+
+/// What a resource change does (`ResourceAction` in the reference).
+pub(crate) const RESOURCE_ACTIONS: [&str; 5] = ["create", "rotate", "revoke", "update", "delete"];
+
+/// The size of named values as the NA measures a record's metadata: their
+/// canonical JSON, with text outside ASCII escaped and floats in Python's
+/// form (1.3.1).
+pub(crate) fn metadata_size(values: &[(&str, &Value)]) -> usize {
+    let object: Map<String, Value> = values
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).clone()))
+        .collect();
+    canonical_json(&Value::Object(object)).map_or(usize::MAX, |text| text.len())
+}
+
+/// Why a record's metadata would be refused as secret material, or `None`:
+/// the reference's `metadata_problem` (1.3.1). The NA applies it to an
+/// observation's `metadata`, `actor`, `source_event_id` and `version_id`, and
+/// to a break-glass record's parameters, attributes, outcome detail and
+/// justification: together at most [`MAX_METADATA_BYTES`] as
+/// [`metadata_size`] measures them, and no field named like a secret, PEM
+/// block, key or token.
+pub(crate) fn metadata_problem(values: &[(&str, &Value)]) -> Option<String> {
+    let size = metadata_size(values);
+    if size > MAX_METADATA_BYTES {
+        return Some(format!(
+            "metadata is {size} bytes, over the {MAX_METADATA_BYTES}-byte limit"
+        ));
+    }
+    values.iter().find_map(|(name, value)| match value {
+        Value::Object(_) | Value::Array(_) => secret_material(value, &format!("{name}.")),
+        other => secret_material(&json!({ *name: other }), ""),
+    })
+}
+
+/// Why a text field would be refused as malformed, or `None`: `min` to `max`
+/// characters, counted as the reference counts them (1.3.1).
+pub(crate) fn length_problem(name: &str, value: &str, min: usize, max: usize) -> Option<String> {
+    let count = value.chars().count();
+    (!(min..=max).contains(&count))
+        .then(|| format!("{name} must be {min} to {max} characters, not {count}"))
+}
+
+/// Why a resource action would be refused as malformed, or `None` (1.3.1).
+pub(crate) fn action_problem(name: &str, action: &str) -> Option<String> {
+    (!RESOURCE_ACTIONS.contains(&action))
+        .then(|| format!("{name} must be create, rotate, revoke, update or delete, not {action:?}"))
+}
+
+/// Why a time would be refused as malformed, or `None`: the reference reads
+/// the years 1 to 9999 only (1.3.1).
+pub(crate) fn time_problem(name: &str, at: Option<DateTime<Utc>>) -> Option<String> {
+    at.filter(|at| !canonical_timestamp(&python_timestamp(*at)))
+        .map(|_| format!("{name} must fall in the years 1 to 9999"))
+}
+
+/// Refuse a signed record no reader would take (1.3.1): its JSON nested
+/// deeper than every implementation reads ([`GenesisMeshError::StrictJson`],
+/// `invalid_json`), checked as deep as the record goes: in an outbox file,
+/// and an observation in a batch request.
+pub(crate) fn check_nesting(record: &Value) -> Result<()> {
+    let carried = json!({"entry": {"record": record}});
+    check_strict_json(&serde_json::to_string(&carried)?).map_err(|err| match err {
+        GenesisMeshError::StrictJson { reason, detail } => GenesisMeshError::StrictJson {
+            reason,
+            detail: format!("the record as submitted: {detail}"),
+        },
+        other => other,
+    })
+}
 
 /// Why a controller broke the glass: an evaluation failure a later attempt
 /// can overcome. A DENY is never one.
@@ -69,11 +141,22 @@ pub(crate) fn refused(code: &str, message: impl Into<String>) -> GenesisMeshErro
     }
 }
 
-/// Sign a record's canonical form and add the signature.
-fn signed(mut record: Map<String, Value>, key_id: &str, key: &SigningKey) -> Result<Value> {
-    let canonical = out_of_band_canonical(&Value::Object(record.clone()))?;
-    record.insert("signature".into(), sign_canonical(&canonical, key_id, key));
-    Ok(Value::Object(record))
+/// Sign a record's canonical form and add the signature, unless no reader
+/// would take it ([`check_nesting`]).
+fn signed(record: Map<String, Value>, key_id: &str, key: &SigningKey) -> Result<Value> {
+    let mut record = Value::Object(record);
+    check_nesting(&record)?;
+    let canonical = out_of_band_canonical(&record)?;
+    record["signature"] = sign_canonical(&canonical, key_id, key);
+    Ok(record)
+}
+
+/// The first problem found, as a refusal with `code`.
+fn first_problem(code: &str, problems: impl IntoIterator<Item = Option<String>>) -> Result<()> {
+    match problems.into_iter().flatten().next() {
+        Some(problem) => Err(refused(code, problem)),
+        None => Ok(()),
+    }
 }
 
 fn insert_some(record: &mut Map<String, Value>, key: &str, value: Option<Value>) {
@@ -170,9 +253,16 @@ impl ObservationRecorder {
     }
 
     /// Build and sign one observation. Refused before signing
-    /// ([`GenesisMeshError::OutOfBandRecord`]) without exactly one change
-    /// time (`observation_malformed`), or with secret material in its
-    /// metadata (`observation_secret_material`).
+    /// ([`GenesisMeshError::OutOfBandRecord`]) as the NA would refuse it:
+    /// `observation_malformed` without exactly one change time, with an
+    /// action other than `create`, `rotate`, `revoke`, `update` or `delete`,
+    /// a field of the wrong length or a time outside the years 1 to 9999
+    /// (1.3.1); `observation_secret_material` with secret material in its
+    /// `metadata`, `actor`, `source_event_id` or `version_id`, or with those
+    /// together over [`MAX_METADATA_BYTES`](crate::MAX_METADATA_BYTES) as the
+    /// NA counts them (text outside ASCII escaped, 1.3.1). Metadata nested
+    /// too deep for every reader is refused as
+    /// [`GenesisMeshError::StrictJson`] (`invalid_json`, 1.3.1).
     pub fn record(&self, input: ObservationInput) -> Result<Value> {
         let window = input.changed_not_before.is_some() || input.changed_not_after.is_some();
         if input.changed_at.is_some() && window {
@@ -201,6 +291,34 @@ impl ObservationRecorder {
                 ))
             }
         }
+        let observed_at = input.observed_at.unwrap_or_else(Utc::now);
+        first_problem(
+            "observation_malformed",
+            [
+                length_problem("observer_sovereign_id", &self.observer_sovereign_id, 1, 256),
+                input
+                    .observation_id
+                    .as_deref()
+                    .and_then(|id| length_problem("observation_id", id, 1, 128)),
+                length_problem("resource_id", &input.resource_id, 1, 256),
+                action_problem("action", &input.action),
+                length_problem("capability", &input.capability, 1, 256),
+                input
+                    .actor
+                    .as_deref()
+                    .and_then(|actor| length_problem("actor", actor, 1, 256)),
+                length_problem("source", &input.source, 1, 128),
+                length_problem("source_event_id", &input.source_event_id, 1, 256),
+                input
+                    .version_id
+                    .as_deref()
+                    .and_then(|version| length_problem("version_id", version, 1, 256)),
+                time_problem("changed_at", input.changed_at),
+                time_problem("changed_not_before", input.changed_not_before),
+                time_problem("changed_not_after", input.changed_not_after),
+                time_problem("observed_at", Some(observed_at)),
+            ],
+        )?;
         let metadata = input.metadata.unwrap_or_else(|| json!({}));
         if !metadata.is_object() {
             return Err(refused(
@@ -208,7 +326,20 @@ impl ObservationRecorder {
                 "metadata must be a JSON object",
             ));
         }
-        if let Some(secret) = check_metadata_only(&metadata, None) {
+        // The NA guards the source's own strings too: an actor is a pseudonym,
+        // never a credential.
+        let actor = input.actor.clone().map(Value::from);
+        let source_event_id = json!(input.source_event_id);
+        let version_id = input.version_id.clone().map(Value::from);
+        let mut guarded = vec![("metadata", &metadata)];
+        if let Some(actor) = &actor {
+            guarded.push(("actor", actor));
+        }
+        guarded.push(("source_event_id", &source_event_id));
+        if let Some(version_id) = &version_id {
+            guarded.push(("version_id", version_id));
+        }
+        if let Some(secret) = metadata_problem(&guarded) {
             return Err(refused("observation_secret_material", secret));
         }
         let mut record = Map::new();
@@ -236,10 +367,7 @@ impl ObservationRecorder {
             "changed_not_after",
             time(input.changed_not_after),
         );
-        record.insert(
-            "observed_at".into(),
-            json!(python_timestamp(input.observed_at.unwrap_or_else(Utc::now))),
-        );
+        record.insert("observed_at".into(), json!(python_timestamp(observed_at)));
         insert_some(&mut record, "actor", input.actor.map(Value::from));
         record.insert("source".into(), json!(input.source));
         record.insert("source_event_id".into(), json!(input.source_event_id));
@@ -406,10 +534,28 @@ pub(crate) fn check_justification(justification: &str) -> Result<()> {
             "a justification of 1 to 1024 characters is required",
         ));
     }
-    match check_metadata_only(&json!({}), Some(justification)) {
+    match metadata_problem(&[("justification", &json!(justification))]) {
         Some(secret) => Err(refused("break_glass_secret_material", secret)),
         None => Ok(()),
     }
+}
+
+/// What the NA guards in a break-glass record, in its order (1.3.1): an
+/// absent outcome detail counts as `""`.
+pub(crate) fn break_glass_metadata<'a>(
+    execution_parameters: &'a Value,
+    request_parameters: &'a Value,
+    attributes: &'a Value,
+    outcome_detail: &'a Value,
+    justification: &'a Value,
+) -> [(&'static str, &'a Value); 5] {
+    [
+        ("execution_parameters", execution_parameters),
+        ("request_parameters", request_parameters),
+        ("attributes", attributes),
+        ("outcome_detail", outcome_detail),
+        ("justification", justification),
+    ]
 }
 
 fn object_or_empty(value: Option<Value>, name: &str) -> Result<Value> {
@@ -431,15 +577,35 @@ pub(crate) fn sign_break_glass(
     input: BreakGlassInput,
 ) -> Result<Value> {
     check_justification(&input.justification)?;
+    let executed_at = input.executed_at.unwrap_or_else(Utc::now);
+    first_problem(
+        "break_glass_malformed",
+        [
+            length_problem("executor_sovereign_id", executor_sovereign_id, 1, 256),
+            length_problem("resource_id", &input.resource_id, 1, 256),
+            action_problem("resource_action", &input.resource_action),
+            length_problem("capability", &input.capability, 1, 256),
+            input
+                .attestation_id
+                .as_deref()
+                .and_then(|id| length_problem("attestation_id", id, 1, 128)),
+            input
+                .outcome_detail
+                .as_deref()
+                .and_then(|detail| length_problem("outcome_detail", detail, 0, 1024)),
+            time_problem("executed_at", Some(executed_at)),
+        ],
+    )?;
     let request_parameters = object_or_empty(input.request_parameters, "request_parameters")?;
     let attributes = object_or_empty(input.attributes, "attributes")?;
     let execution_parameters = object_or_empty(input.execution_parameters, "execution_parameters")?;
-    let reported = json!({
-        "execution_parameters": execution_parameters,
-        "request_parameters": request_parameters,
-        "attributes": attributes,
-    });
-    if let Some(secret) = check_metadata_only(&reported, input.outcome_detail.as_deref()) {
+    if let Some(secret) = metadata_problem(&break_glass_metadata(
+        &execution_parameters,
+        &request_parameters,
+        &attributes,
+        &json!(input.outcome_detail.as_deref().unwrap_or_default()),
+        &json!(input.justification),
+    )) {
         return Err(refused("break_glass_secret_material", secret));
     }
     let mut record = Map::new();
@@ -464,10 +630,7 @@ pub(crate) fn sign_break_glass(
         "evaluation_failure".into(),
         json!(input.evaluation_failure.as_str()),
     );
-    record.insert(
-        "executed_at".into(),
-        json!(python_timestamp(input.executed_at.unwrap_or_else(Utc::now))),
-    );
+    record.insert("executed_at".into(), json!(python_timestamp(executed_at)));
     record.insert(
         "outcome".into(),
         json!(input.outcome.unwrap_or_else(|| "success".into())),

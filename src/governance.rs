@@ -15,9 +15,13 @@ use crate::{
     errors::{ActionValue, GenesisMeshError, Result},
     evidence_store::EvidenceStoreClient,
     execution::{
-        check_metadata_only, ExecutionRecorder, PriorResource, RecordExecution, MAX_METADATA_BYTES,
+        check_metadata_only, resource_problem, ExecutionRecorder, PriorResource, RecordExecution,
+        MAX_METADATA_BYTES,
     },
-    out_of_band::{check_justification, refused, BreakGlassInput, EvaluationFailure},
+    out_of_band::{
+        break_glass_metadata, check_justification, check_nesting, length_problem, metadata_size,
+        refused, BreakGlassInput, EvaluationFailure,
+    },
     outbox::{OutboxEntry, RecordOutboxEntry},
     verify::{verify_boundary_decision, VerifyDecisionOptions},
 };
@@ -212,8 +216,8 @@ pub struct RefusedMetadata {
 
 /// The reported metadata without the parts the secret guard refuses: each
 /// top-level parameter is checked alone, and the outcome detail names what
-/// was dropped. Everything is dropped when the rest is still refused (its
-/// size).
+/// was dropped. A parameter nested too deep for every reader is dropped too
+/// (1.3.1). Everything is dropped when the rest is still refused (its size).
 pub fn without_refused_metadata(
     execution_parameters: &Value,
     outcome_detail: Option<&str>,
@@ -223,7 +227,10 @@ pub fn without_refused_metadata(
     let mut kept = serde_json::Map::new();
     let mut dropped = Vec::new();
     for (key, value) in params {
-        if check_metadata_only(&json!({ key: value }), None).is_none() {
+        let alone = json!({ key: value });
+        if check_metadata_only(&alone, None).is_none()
+            && check_nesting(&json!({ "execution_parameters": alone })).is_ok()
+        {
             kept.insert(key.clone(), value.clone());
         } else {
             dropped.push(key.clone());
@@ -270,6 +277,22 @@ pub fn without_refused_metadata(
 
 /// The error type an action returns.
 pub type ActionError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Why signing refused what an action reported, or `None` for another error:
+/// secret material or its size, or (1.3.1) values nested too deep for every
+/// reader. The outcome is then recorded without the refused parts.
+fn refused_report(err: &GenesisMeshError) -> Option<String> {
+    match err {
+        GenesisMeshError::SecretMaterial(reason) => Some(reason.clone()),
+        GenesisMeshError::OutOfBandRecord { code, message }
+            if code == "break_glass_secret_material" =>
+        {
+            Some(message.clone())
+        }
+        GenesisMeshError::StrictJson { detail, .. } => Some(detail.clone()),
+        _ => None,
+    }
+}
 
 fn check_decision(decision: &Value, params: &GovernedActionParams, context_id: &str) -> Result<()> {
     let attestation_id = params
@@ -508,6 +531,7 @@ where
 /// Everything break-glass needs is checked before anything is evaluated or run.
 async fn check_break_glass(
     store: &EvidenceStoreClient,
+    recorder: &ExecutionRecorder,
     params: &GovernedActionParams,
     options: &BreakGlassOptions,
 ) -> Result<()> {
@@ -539,6 +563,23 @@ async fn check_break_glass(
             "break-glass needs requested_capability",
         ));
     }
+    let text = |key: &str| params.evaluate[key].as_str().unwrap_or_default();
+    if let Some(problem) = [
+        length_problem(
+            "executor_sovereign_id",
+            recorder.executor_sovereign_id(),
+            1,
+            256,
+        ),
+        length_problem("attestation_id", text("attestation_id"), 1, 128),
+        length_problem("requested_capability", text("requested_capability"), 1, 256),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    {
+        return Err(refused("break_glass_malformed", problem));
+    }
     check_justification(&options.justification)?;
     // Everything the record carries besides the action's report is checked
     // now, with room left for the report, so a record can always be kept once
@@ -563,8 +604,16 @@ async fn check_break_glass(
     if let Some(secret) = check_metadata_only(&context, None) {
         return Err(refused("break_glass_secret_material", secret));
     }
-    carried.insert("justification".into(), json!(options.justification));
-    let size = serde_json::to_vec(&carried).map_or(usize::MAX, |bytes| bytes.len());
+    check_nesting(&Value::Object(carried.clone()))?;
+    // Measured as the NA measures the record (1.3.1): with the justification,
+    // an empty report, and text outside ASCII escaped.
+    let size = metadata_size(&break_glass_metadata(
+        &json!({}),
+        &carried["request_parameters"],
+        &carried["attributes"],
+        &json!(""),
+        &json!(options.justification),
+    ));
     if size > MAX_METADATA_BYTES - RECORD_RESERVE {
         return Err(refused(
             "break_glass_malformed",
@@ -666,9 +715,7 @@ where
         outcome_detail.clone(),
     ) {
         Ok(record) => (record, Vec::new()),
-        Err(GenesisMeshError::OutOfBandRecord { code, .. })
-            if code == "break_glass_secret_material" =>
-        {
+        Err(err) if refused_report(&err).is_some() => {
             let cleaned = without_refused_metadata(
                 execution_parameters.as_ref().unwrap_or(&json!({})),
                 outcome_detail.as_deref(),
@@ -679,9 +726,7 @@ where
                 Some(cleaned.outcome_detail),
             ) {
                 Ok(record) => (record, cleaned.dropped),
-                Err(GenesisMeshError::OutOfBandRecord { code, .. })
-                    if code == "break_glass_secret_material" =>
-                {
+                Err(err) if refused_report(&err).is_some() => {
                     // The report together with the context is still refused
                     // (its size): keep the outcome alone.
                     let mut all: Vec<String> = execution_parameters
@@ -738,6 +783,13 @@ where
             "resource_id and resource_action go together".into(),
         ));
     }
+    // A record the NA would refuse is refused before the action runs (1.3.1).
+    if let Some(problem) = resource_problem(
+        params.resource_id.as_deref(),
+        params.resource_action.as_deref(),
+    ) {
+        return Err(GenesisMeshError::Configuration(problem));
+    }
     if params.verify.operator_public_keys.is_empty() {
         return Err(GenesisMeshError::DecisionVerification(
             "verification_keys_required".into(),
@@ -750,7 +802,7 @@ where
         outbox.list().await.map_err(GenesisMeshError::Outbox)?;
     }
     if let Some(options) = break_glass {
-        check_break_glass(evidence_store, &params, options).await?;
+        check_break_glass(evidence_store, recorder, &params, options).await?;
     }
     let mut request = params.evaluate.clone();
     if !request.is_object() {
@@ -911,7 +963,10 @@ where
         outcome_detail.clone(),
     ) {
         Ok(evidence) => (evidence, None),
-        Err(GenesisMeshError::SecretMaterial(reason)) => {
+        Err(err) => {
+            let Some(reason) = refused_report(&err) else {
+                return Err(not_kept(err, None, value));
+            };
             let cleaned = without_refused_metadata(
                 execution_parameters.as_ref().unwrap_or(&json!({})),
                 outcome_detail.as_deref(),
@@ -925,7 +980,6 @@ where
                 Err(err) => return Err(not_kept(err, None, value)),
             }
         }
-        Err(err) => return Err(not_kept(err, None, value)),
     };
     let delivery = match evidence_store.enqueue(evidence.clone()).await {
         Ok(delivery) => delivery,
