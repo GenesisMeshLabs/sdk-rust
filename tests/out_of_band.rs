@@ -94,7 +94,7 @@ fn every_vector_gives_the_reference_outcome() {
         assert_eq!(got, v["expected"], "{}", v["id"]);
         ran += 1;
     }
-    assert_eq!(ran, 19);
+    assert_eq!(ran, 24);
 }
 
 #[test]
@@ -699,4 +699,66 @@ fn a_record_signed_with_a_non_utc_or_non_canonical_timestamp_does_not_verify() {
         json!({"record_id": "obs-x", "observation_sequence": 1}),
     )];
     assert_eq!(reasons(&run, &options), ["payload_invalid"]);
+}
+
+#[test]
+fn an_unknown_field_signed_by_a_key_of_another_role_is_named() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let mut record = observed("obs-x", "kv:v/s");
+    record["extra"] = json!(1);
+    let record = sign_record(record, "observer-1", &key);
+    let run = vec![event(
+        1,
+        "observation",
+        record,
+        None,
+        json!({"record_id": "obs-x", "observation_sequence": 1}),
+    )];
+    // The key the signature names signs for executors: still its signature.
+    let mut keys = observer_keys();
+    keys[0]["role"] = json!("executor");
+    let options = VerifyEvidenceOptions::new(vec![na_key()], keys);
+    assert_eq!(reasons(&run, &options), ["unknown_field"]);
+    // Outside the signature: a record the reference never stores.
+    let mut unsigned = observations(1, &[1], None);
+    unsigned[0]["payload"]["extra"] = json!(1);
+    unsigned[0]["entry"]["payload_digest"] =
+        json!(payload_digest(&unsigned[0]["payload"]).unwrap());
+    unsigned[0]["entry_digest"] = json!(entry_digest(&unsigned[0]["entry"]).unwrap());
+    let options = VerifyEvidenceOptions::new(vec![na_key()], observer_keys());
+    let result = verify_evidence_events(&unsigned, &options);
+    let found: Vec<&str> = result.failures.iter().map(|f| f.reason.as_str()).collect();
+    assert_eq!(found, ["payload_invalid"]);
+    assert_eq!(result.warnings[0].reason, "unsigned_field");
+    assert_eq!(result.observations, 0);
+}
+
+#[test]
+fn verify_out_of_band_record_checks_the_record_as_the_reference_reads_it() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let public = [public_key_from_seed(&seed(11)).unwrap()];
+    let record = observed("obs-x", "kv:v/s");
+    assert!(verify_out_of_band_record(&record, &public));
+    // Signed, but malformed: two change times.
+    let mut both = record.clone();
+    both["changed_not_before"] = json!("2026-01-01T00:00:00Z");
+    both["changed_not_after"] = json!("2026-01-01T00:03:00Z");
+    assert!(!verify_out_of_band_record(
+        &sign_record(both, "observer-1", &key),
+        &public
+    ));
+    // Signed without a field the reference fills when absent.
+    let mut bare = record.clone();
+    bare.as_object_mut().unwrap().remove("metadata");
+    let bare = sign_record(bare, "observer-1", &key);
+    assert!(!verify_out_of_band_record(&bare, &public));
+    let run = vec![event(
+        1,
+        "observation",
+        bare,
+        None,
+        json!({"record_id": "obs-x", "observation_sequence": 1}),
+    )];
+    let options = VerifyEvidenceOptions::new(vec![na_key()], observer_keys());
+    assert_eq!(reasons(&run, &options), ["non_canonical_form"]);
 }

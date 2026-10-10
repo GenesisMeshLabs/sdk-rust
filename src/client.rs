@@ -194,7 +194,7 @@ impl HttpTransport {
         // Fetched directly (not through `get`, which signs admin requests).
         let response = self.http.get(self.url("/sovereign.json")?).send().await?;
         let status = response.status().as_u16();
-        let bytes = response.bytes().await?;
+        let bytes = response.bytes().await.map_err(|e| unreadable(status, e))?;
         let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         let public_key = body
             .pointer("/network_authority/public_key")
@@ -274,7 +274,10 @@ impl HttpTransport {
     pub async fn admin_get_text(&self, path: &str, query: &[(String, String)]) -> Result<String> {
         let response = self.get(path, query, true).await?;
         let status = response.status();
-        let bytes = response.bytes().await?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| unreadable(status.as_u16(), e))?;
         if !status.is_success() {
             return Err(error_from_body(status.as_u16(), &bytes));
         }
@@ -287,7 +290,7 @@ impl HttpTransport {
     pub async fn public_get_status(&self, path: &str) -> Result<(u16, Value)> {
         let response = self.get(path, &[], false).await?;
         let status = response.status().as_u16();
-        let bytes = response.bytes().await?;
+        let bytes = response.bytes().await.map_err(|e| unreadable(status, e))?;
         let body = if bytes.is_empty() {
             json!({})
         } else {
@@ -352,7 +355,10 @@ impl HttpTransport {
         T: DeserializeOwned,
     {
         let status = response.status();
-        let bytes = response.bytes().await?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| unreadable(status.as_u16(), e))?;
         if !status.is_success() {
             return Err(error_from_body(status.as_u16(), &bytes));
         }
@@ -379,6 +385,12 @@ impl HttpTransport {
         }
         Ok(format!("{}{}", self.base_url, path))
     }
+}
+
+/// A response whose body could not be read (v1.3.0): the NA answered, so this
+/// is not a request that never arrived.
+fn unreadable(status: u16, source: reqwest::Error) -> GenesisMeshError {
+    GenesisMeshError::ResponseBodyUnreadable { status, source }
 }
 
 fn error_from_body(status: u16, bytes: &[u8]) -> GenesisMeshError {

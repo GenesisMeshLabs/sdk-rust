@@ -50,6 +50,22 @@ pub enum GenesisMeshError {
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
 
+    /// The NA answered, but its response body could not be read: the
+    /// connection broke or timed out while it arrived (v1.3.0). Code
+    /// `response_body_unreadable`. Unlike [`Network`](Self::Network), the
+    /// request reached the NA, which may have acted on it (decided, even
+    /// denied): it never breaks the glass. An outbox retries a submission
+    /// that ended so; the NA admits it once.
+    #[error("the response body could not be read (HTTP {status}): {source}")]
+    #[non_exhaustive]
+    ResponseBodyUnreadable {
+        /// The response's HTTP status.
+        status: u16,
+        /// The transport error.
+        #[source]
+        source: reqwest::Error,
+    },
+
     /// JSON serialization or parsing failure.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
@@ -248,6 +264,7 @@ impl GenesisMeshError {
             Self::RecordOutboxRequired => "record_outbox_required",
             Self::Configuration(_) => "configuration",
             Self::Network(_) => "network",
+            Self::ResponseBodyUnreadable { .. } => "response_body_unreadable",
             Self::Json(_) => "json",
             Self::SigningKey(_) | Self::MissingSigningKey => "signing_key",
         }

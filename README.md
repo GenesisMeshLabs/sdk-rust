@@ -242,7 +242,8 @@ async fn start(url: &str) -> Result<GenesisMeshClient, Box<dyn std::error::Error
 `enqueue_record` keeps a record and submits it; a transient failure leaves it
 pending, and a refusal no retry can overcome (`RECORD_PERMANENT_REFUSALS`)
 keeps it as a dead letter. `flush_records` submits pending records in order,
-observations up to 100 per request. A record the NA admits outside its time
+observations up to 100 per request (one at a time when the NA refuses a batch,
+or finds it too large). A record the NA admits outside its time
 bounds is kept by the NA as a quarantine entry and is listed in the run's
 `quarantined`. Implement the `RecordOutbox` trait to keep records elsewhere;
 `MemoryRecordOutbox` is for tests only.
@@ -326,16 +327,22 @@ async fn rotate(gm: &GenesisMeshClient, recorder: &ExecutionRecorder, params: Go
 
 A DENY never breaks the glass, nor does a decision that fails verification,
 the NA throttling failed operator signatures (`429 admin_auth_throttled`), an
-evaluation it could not store (`503 evidence_store_unavailable`), or any other
-error. It needs a record outbox (`RecordOutboxRequired`), `resource_id` and an
-attestation-based evaluation (`attestation_id`: an agreement-based one cannot
-be judged after the fact), and checks the justification (1 to 1024
-characters) and the evaluation context against the secret guard before
-anything is evaluated or run (`OutOfBandRecord` with `break_glass_malformed`
-or `break_glass_secret_material`). A failed action is recorded as a `failure`
+evaluation it could not store (`503 evidence_store_unavailable`), an answer
+whose body could not be read (`ResponseBodyUnreadable`: the NA may have
+decided, even denied), or any other error. It needs a record outbox
+(`RecordOutboxRequired`), `resource_id` and an attestation-based evaluation
+(`attestation_id`: an agreement-based one cannot be judged after the fact)
+naming its `requested_capability`. Before anything is evaluated or run it
+checks the justification (1 to 1024 characters), that the context's
+`request_parameters` and `attributes` are objects that, with the
+justification, leave room for the record, and the context and justification
+against the secret guard (`OutOfBandRecord` with `break_glass_malformed` or
+`break_glass_secret_material`). A failed action is recorded as a `failure`
 record (`ActionFailed`, whose `queued_record` holds its entry while the NA is
-away). Reported metadata the guard refuses is left out of the record and named
-in `dropped`. `ExecutionRecorder::sign_break_glass` signs a record directly.
+away). Once the action ran a record is always kept: an outcome detail is cut
+to 1024 characters, and reported metadata the guard refuses is left out of the
+record and named in `dropped` (the whole report, when the rest is still
+refused). `ExecutionRecorder::sign_break_glass` signs a record directly.
 `governed_action` itself never breaks the glass. Every use shows in the
 resource's changes, with its justification; a policy can forbid it for a
 capability (a `denylist.v1` gate on `parent_kind` with the value
@@ -383,7 +390,9 @@ the connection pool and parsed signing key. No runtime is created by the SDK.
 - `GenesisMeshError` distinguishes configuration, missing/invalid signing keys,
   transport, JSON, and HTTP failures. HTTP 400, 401, 404, 422, and 429 map to
   `BadRequest`, `Unauthorized`, `NotFound`, `Validation`, and `RateLimit`.
-  Other statuses retain their numeric code in `Http`.
+  Other statuses retain their numeric code in `Http`. A response whose body
+  could not be read is `ResponseBodyUnreadable` (`response_body_unreadable`),
+  not `Network`: the request reached the NA.
 - Non-JSON error responses preserve the HTTP status and response text. Empty
   successful responses deserialize from `{}`; malformed success JSON is an error.
 

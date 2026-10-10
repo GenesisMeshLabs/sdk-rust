@@ -701,7 +701,7 @@ impl EvidenceStoreClient {
             let records: Vec<Value> = batch.iter().map(|e| e.record.clone()).collect();
             let results = match self.submit_observations(&records).await {
                 Ok(results) => results,
-                Err(err) if classify_record_submission_error(&err).1 => {
+                Err(err) if !too_large(&err) && classify_record_submission_error(&err).1 => {
                     for e in batch {
                         let failed = record_failed(outbox, e.clone(), &err).await;
                         settle(&mut report, e, RecordDelivery::queued(failed));
@@ -710,7 +710,8 @@ impl EvidenceStoreClient {
                     continue;
                 }
                 Err(_) => {
-                    // The batch itself was refused: each observation is tried alone.
+                    // The batch itself was refused, or is larger than the NA
+                    // takes (413): each observation is tried alone.
                     for e in batch {
                         if stopped {
                             report.pending.push(e.clone());
@@ -921,6 +922,11 @@ async fn record_failed(
     };
     let _ = outbox.update(&next).await;
     next
+}
+
+/// A request larger than the NA (or a proxy before it) takes.
+fn too_large(err: &GenesisMeshError) -> bool {
+    matches!(err, GenesisMeshError::Http { status: 413, .. })
 }
 
 /// One refused result of a batch, as the error its single submission gives.

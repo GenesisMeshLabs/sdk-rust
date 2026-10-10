@@ -124,9 +124,14 @@ fn utc_timestamp() -> Check {
     Box::new(|v| {
         v.and_then(Value::as_str).is_some_and(|s| {
             parse_timestamp(s).is_ok()
-                && (s.ends_with(['Z', 'z']) || s.ends_with("+00:00") || s.ends_with("-00:00"))
+                && (s.ends_with('Z') || s.ends_with("+00:00") || s.ends_with("-00:00"))
         })
     })
+}
+/// A field the reference fills when absent: left out, the record is not in
+/// the form the reference writes (`non_canonical_form`), not malformed.
+fn filled(check: Check) -> Check {
+    optional(check)
 }
 fn gate_result() -> Check {
     shape(
@@ -418,7 +423,7 @@ validator!(valid_observation, {
             ("source", bounded(128, 1)),
             ("source_event_id", bounded(256, 1)),
             ("version_id", absent(bounded(256, 1))),
-            ("metadata", object()),
+            ("metadata", filled(object())),
             ("signature", optional(signature())),
         ],
         false,
@@ -436,8 +441,8 @@ validator!(
             ("resource_action", action()),
             ("capability", bounded(256, 1)),
             ("attestation_id", absent(bounded(128, 1))),
-            ("request_parameters", object()),
-            ("attributes", object()),
+            ("request_parameters", filled(object())),
+            ("attributes", filled(object())),
             ("justification", bounded(1024, 1)),
             ("evaluation_request_digest", sha256()),
             (
@@ -447,7 +452,7 @@ validator!(
             ("executed_at", utc_timestamp()),
             ("outcome", string()),
             ("outcome_detail", absent(bounded(1024, 0))),
-            ("execution_parameters", object()),
+            ("execution_parameters", filled(object())),
             ("signature", optional(signature())),
         ],
         false
@@ -472,7 +477,7 @@ validator!(
             ("evaluated_as_of", utc_timestamp()),
             ("evaluated_from", absent(utc_timestamp())),
             ("policy_binding", absent(policy_binding())),
-            ("gate_results", array(gate_result())),
+            ("gate_results", filled(array(gate_result()))),
             ("current_verdict", absent(verdict())),
             ("current_policy_set_digest", absent(string())),
             ("flagged_for_review", absent(boolean())),
@@ -500,7 +505,7 @@ validator!(
             ("record", object()),
             ("record_digest", sha256()),
             ("rejection_code", bounded(128, 1)),
-            ("detail", bounded(1024, 0)),
+            ("detail", filled(bounded(1024, 0))),
             ("resource_id", absent(bounded(256, 1))),
             ("quarantined_at", utc_timestamp()),
             ("issuer_sovereign_id", string()),
@@ -685,14 +690,16 @@ pub fn verify_execution_signature(evidence: &Value, executor_public_key: &str) -
     ) && unknown_fields("ExecutionEvidence", evidence).is_empty()
 }
 
-/// v1.3.0: the id field and model of each record of a change made outside
-/// the controlled path.
-const OUT_OF_BAND_IDS: [(&str, &str); 5] = [
-    ("observation_id", "ObservationRecord"),
-    ("break_glass_id", "BreakGlassRecord"),
-    ("judgement_id", "JudgementRecord"),
-    ("quarantine_id", "QuarantineRecord"),
-    ("registry_record_id", "RegistryRecord"),
+type Validator = fn(Option<&Value>) -> bool;
+
+/// v1.3.0: the id field, model and validator of each record of a change made
+/// outside the controlled path.
+const OUT_OF_BAND_IDS: [(&str, &str, Validator); 5] = [
+    ("observation_id", "ObservationRecord", valid_observation),
+    ("break_glass_id", "BreakGlassRecord", valid_break_glass),
+    ("judgement_id", "JudgementRecord", valid_judgement),
+    ("quarantine_id", "QuarantineRecord", valid_quarantine),
+    ("registry_record_id", "RegistryRecord", valid_registry),
 ];
 
 /// Whether a Stage 2 record's signature covers it as received under one of
@@ -703,18 +710,19 @@ fn out_of_band_verifies(model: &str, record: &Value, keys: &[String]) -> bool {
         && unknown_fields(model, record).is_empty()
 }
 
-/// True when the signature of a record of a change made outside the
-/// controlled path (v1.3.0: an observation, break-glass, judgement,
-/// quarantine or registry record, told by its id field) verifies under one of
-/// the keys, over its form as received. A record with a signed field this
-/// crate does not know, or not in the form the reference writes (a timestamp
-/// in another spelling, a field it always writes left out), does not verify.
+/// True when a record of a change made outside the controlled path (v1.3.0:
+/// an observation, break-glass, judgement, quarantine or registry record,
+/// told by its id field) is well formed, its signature verifies under one of
+/// the keys over its form as received, and it is in the form the reference
+/// writes with no signed field this crate does not know, as
+/// [`verify_evidence_events`] checks a stored one.
 pub fn verify_out_of_band_record(record: &Value, public_keys: &[String]) -> bool {
     OUT_OF_BAND_IDS
         .iter()
-        .find(|(id, _)| record.get(*id).is_some())
-        .is_some_and(|(_, model)| {
-            out_of_band_verifies(model, record, public_keys)
+        .find(|(id, ..)| record.get(*id).is_some())
+        .is_some_and(|(_, model, valid)| {
+            valid(Some(record))
+                && out_of_band_verifies(model, record, public_keys)
                 && non_canonical_fields(model, record).is_empty()
         })
 }
@@ -1118,10 +1126,24 @@ fn check_payload_fields(
             &options.na_public_keys,
         ),
         "retention_checkpoint" => checkpoint_signed(payload, &options.na_public_keys),
+        // v1.3.0: the key the signature names, whatever its role or sovereign,
+        // so an authentic record with a field this crate does not know is
+        // refused by name first, as the reference refuses it.
+        "observation" | "break_glass" => payload
+            .get("signature")
+            .and_then(|sig| str_field(sig, "key_id"))
+            .and_then(|id| executor_keys.get(id))
+            .is_some_and(|key| {
+                signed_by(
+                    out_of_band_canonical(payload),
+                    payload.get("signature"),
+                    &[str_field(key, "public_key").unwrap_or_default().to_owned()],
+                )
+            }),
         _ => signed_by(
             out_of_band_canonical(payload),
             payload.get("signature"),
-            &out_of_band_keys(kind, payload, &options.na_public_keys, executor_keys),
+            &options.na_public_keys,
         ),
     };
     if signed_as_received {
@@ -1378,6 +1400,18 @@ pub fn verify_evidence_events<'a>(
                 reason: "unsigned_field".to_owned(),
                 detail: checked.unsigned.join(", "),
             });
+            // v1.3.0: the reference stores these records exactly as signed; a
+            // field outside the signature is no part of one (the reference
+            // refuses it as it reads the record).
+            if out_of_band_model(kind).is_some() {
+                fail(
+                    &mut result,
+                    s,
+                    "payload_invalid",
+                    &checked.unsigned.join(", "),
+                );
+                continue;
+            }
         }
         let payload = &checked.payload;
         // v1.3.0: a record whose signature covers it as received, in a form

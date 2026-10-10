@@ -14,7 +14,9 @@ use crate::{
     boundary::BoundaryClient,
     errors::{ActionValue, GenesisMeshError, Result},
     evidence_store::EvidenceStoreClient,
-    execution::{check_metadata_only, ExecutionRecorder, PriorResource, RecordExecution},
+    execution::{
+        check_metadata_only, ExecutionRecorder, PriorResource, RecordExecution, MAX_METADATA_BYTES,
+    },
     out_of_band::{check_justification, refused, BreakGlassInput, EvaluationFailure},
     outbox::{OutboxEntry, RecordOutboxEntry},
     verify::{verify_boundary_decision, VerifyDecisionOptions},
@@ -363,9 +365,33 @@ pub enum GovernedActionOutcome<T> {
 }
 
 /// Refusals that look transient but are not: the NA throttling a caller whose
-/// operator signatures keep failing, and an evaluation the NA computed
-/// (perhaps a DENY) but could not store. Neither breaks the glass.
-const NOT_BREAKABLE: [&str; 2] = ["admin_auth_throttled", "evidence_store_unavailable"];
+/// operator signatures keep failing, an evaluation the NA computed (perhaps a
+/// DENY) but could not store, and an answer whose body could not be read
+/// (v1.3.0). None breaks the glass.
+const NOT_BREAKABLE: [&str; 3] = [
+    "admin_auth_throttled",
+    "evidence_store_unavailable",
+    "response_body_unreadable",
+];
+
+/// Room kept for the action's report within the metadata limit of a
+/// break-glass record.
+const RECORD_RESERVE: usize = 2048;
+
+/// The longest outcome detail a break-glass record carries (the reference's
+/// limit, in characters).
+const MAX_OUTCOME_DETAIL: usize = 1024;
+
+/// `text` cut to `max` characters, the last one an ellipsis when cut.
+fn clip(text: Option<String>, max: usize) -> Option<String> {
+    let text = text?;
+    if text.chars().count() <= max {
+        return Some(text);
+    }
+    let mut cut: String = text.chars().take(max - 1).collect();
+    cut.push('\u{2026}');
+    Some(cut)
+}
 
 /// The transient failure an evaluation error is (v1.3.0), or `None` for any
 /// other error: a network error, a timeout, HTTP `5xx` or `429`, but not
@@ -441,15 +467,19 @@ where
 /// ([`ClientOptions::with_record_outbox`](crate::ClientOptions::with_record_outbox),
 /// else [`GenesisMeshError::RecordOutboxRequired`]), `resource_id`, and an
 /// attestation-based evaluation (`attestation_id`; an agreement-based one
-/// cannot be judged after the fact: `break_glass_malformed`), and
-/// checks the justification (1 to 1024 characters) and the evaluation
-/// context against the secret guard
+/// cannot be judged after the fact: `break_glass_malformed`) naming its
+/// `requested_capability`, with the context's `request_parameters` and
+/// `attributes` objects that, with the justification, leave room for the
+/// record; and checks the justification (1 to 1024 characters) and the
+/// evaluation context against the secret guard
 /// ([`GenesisMeshError::OutOfBandRecord`], `break_glass_malformed` or
 /// `break_glass_secret_material`). If the action fails under break-glass, a
 /// `failure` record is kept and [`GenesisMeshError::ActionFailed`] carries it
-/// (`queued_record` while the NA has not admitted it). Reported metadata the
-/// guard refuses is left out of the record (`dropped`); a record that cannot
-/// be signed or kept returns [`GenesisMeshError::EvidenceNotKept`] with the
+/// (`queued_record` while the NA has not admitted it). Once the action ran a
+/// record is always signed: an outcome detail is cut to 1024 characters, and
+/// reported metadata the guard refuses is left out of the record (`dropped`;
+/// the whole report when the rest is still refused). A record that cannot be
+/// kept returns [`GenesisMeshError::EvidenceNotKept`] with the
 /// action's value.
 pub async fn governed_action_with_break_glass<T, F, Fut>(
     boundary: &BoundaryClient,
@@ -489,28 +519,60 @@ async fn check_break_glass(
             "break-glass needs resource_id and resource_action".into(),
         ));
     }
+    let named = |key: &str| {
+        params.evaluate[key]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    };
     // An agreement-based evaluation rests on the agreement, which a
     // break-glass record does not carry: the NA could not judge it after the
     // fact.
-    if params
-        .evaluate
-        .get("attestation_id")
-        .is_none_or(Value::is_null)
-    {
+    if !named("attestation_id") {
         return Err(refused(
             "break_glass_malformed",
             "break-glass needs an attestation-based evaluation (attestation_id)",
         ));
     }
+    if !named("requested_capability") {
+        return Err(refused(
+            "break_glass_malformed",
+            "break-glass needs requested_capability",
+        ));
+    }
     check_justification(&options.justification)?;
+    // Everything the record carries besides the action's report is checked
+    // now, with room left for the report, so a record can always be kept once
+    // the action has run.
     let context = params
         .evaluate
         .get("context")
         .filter(|c| !c.is_null())
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let mut carried = serde_json::Map::new();
+    for name in ["request_parameters", "attributes"] {
+        let value = context.get(name).cloned().unwrap_or_else(|| json!({}));
+        if !value.is_object() {
+            return Err(refused(
+                "break_glass_malformed",
+                format!("context.{name} must be a JSON object"),
+            ));
+        }
+        carried.insert(name.into(), value);
+    }
     if let Some(secret) = check_metadata_only(&context, None) {
         return Err(refused("break_glass_secret_material", secret));
+    }
+    carried.insert("justification".into(), json!(options.justification));
+    let size = serde_json::to_vec(&carried).map_or(usize::MAX, |bytes| bytes.len());
+    if size > MAX_METADATA_BYTES - RECORD_RESERVE {
+        return Err(refused(
+            "break_glass_malformed",
+            format!(
+                "the context and justification leave no room for the record within \
+                 {MAX_METADATA_BYTES} bytes"
+            ),
+        ));
     }
     outbox.list().await.map_err(GenesisMeshError::Outbox)?;
     Ok(())
@@ -541,7 +603,7 @@ where
             request_parameters: present(&context["request_parameters"]),
             attributes: present(&context["attributes"]),
             outcome,
-            outcome_detail,
+            outcome_detail: clip(outcome_detail, MAX_OUTCOME_DETAIL),
             execution_parameters,
             ..BreakGlassInput::new(
                 params.resource_id.clone().unwrap_or_default(),
@@ -612,11 +674,31 @@ where
                 outcome_detail.as_deref(),
             );
             match sign(
-                outcome,
+                outcome.clone(),
                 Some(cleaned.execution_parameters),
                 Some(cleaned.outcome_detail),
             ) {
                 Ok(record) => (record, cleaned.dropped),
+                Err(GenesisMeshError::OutOfBandRecord { code, .. })
+                    if code == "break_glass_secret_material" =>
+                {
+                    // The report together with the context is still refused
+                    // (its size): keep the outcome alone.
+                    let mut all: Vec<String> = execution_parameters
+                        .as_ref()
+                        .and_then(Value::as_object)
+                        .map(|p| p.keys().cloned().collect())
+                        .unwrap_or_default();
+                    if outcome_detail.is_some() {
+                        all.push("outcome_detail".into());
+                    }
+                    all.sort();
+                    let detail = "[secret guard dropped the report]".to_owned();
+                    match sign(outcome, Some(json!({})), Some(detail)) {
+                        Ok(record) => (record, all),
+                        Err(err) => return Err(not_kept(err, None, value)),
+                    }
+                }
                 Err(err) => return Err(not_kept(err, None, value)),
             }
         }

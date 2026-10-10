@@ -39,11 +39,26 @@ async fn scripted(responses: Vec<(u16, String)>) -> (String, JoinHandle<Vec<Requ
 
 /// Serve one scripted response per connection, in order, each after its delay.
 async fn serve(responses: Vec<(u16, String, Duration)>) -> (String, JoinHandle<Vec<Request>>) {
+    let raw = responses
+        .into_iter()
+        .map(|(status, reply, delay)| {
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            (response, delay)
+        })
+        .collect();
+    serve_raw(raw).await
+}
+
+/// Serve one raw HTTP response per connection, in order, each after its delay.
+async fn serve_raw(responses: Vec<(String, Duration)>) -> (String, JoinHandle<Vec<Request>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
         let mut seen = Vec::new();
-        for (status, reply, delay) in responses {
+        for (response, delay) in responses {
             let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
                 .await
                 .expect("client made fewer requests than scripted")
@@ -83,10 +98,6 @@ async fn serve(responses: Vec<(u16, String, Duration)>) -> (String, JoinHandle<V
             } else {
                 serde_json::from_slice(&bytes[offset..offset + length]).unwrap()
             };
-            let response = format!(
-                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
-                reply.len()
-            );
             tokio::time::sleep(delay).await;
             stream.write_all(response.as_bytes()).await.unwrap();
             seen.push(Request {
@@ -801,8 +812,32 @@ async fn break_glass_checks_what_it_needs_before_anything_runs() {
     let mut agreement = params(&v, "ctx-b4");
     agreement.evaluate["attestation_id"] = Value::Null;
     agreement.evaluate["agreement"] = json!({"agreement_id": "a"});
+    let changed = |key: &str, value: Value| {
+        let mut p = params(&v, "ctx-b4");
+        p.evaluate[key] = value;
+        p
+    };
+    let mut not_an_object = params(&v, "ctx-b4");
+    not_an_object.evaluate["context"]["request_parameters"] = json!("billing");
+    // Room is kept for the action's report within the metadata limit.
+    let mut no_room = params(&v, "ctx-b4");
+    no_room.evaluate["context"]["attributes"]["note"] = json!("a short note, ".repeat(1100));
     let cases = [
         (&c, agreement, justification(), "break_glass_malformed"),
+        (
+            &c,
+            changed("attestation_id", json!("")),
+            justification(),
+            "break_glass_malformed",
+        ),
+        (
+            &c,
+            changed("requested_capability", json!("")),
+            justification(),
+            "break_glass_malformed",
+        ),
+        (&c, not_an_object, justification(), "break_glass_malformed"),
+        (&c, no_room, justification(), "break_glass_malformed"),
         (
             &without,
             params(&v, "ctx-b4"),
@@ -1208,4 +1243,187 @@ async fn a_flush_leaves_a_record_enqueue_record_is_submitting_to_it() {
     let outbox = store.record_outbox().unwrap();
     assert!(outbox.list().await.unwrap().is_empty());
     assert_eq!(task.await.unwrap().len(), 1);
+}
+
+// ── Second review round (v1.3.0) ─────────────────────────────────────────────
+
+/// A response whose body ends before its announced length.
+fn truncated() -> (String, Duration) {
+    (
+        "HTTP/1.1 200 Test\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"decision\":"
+            .into(),
+        Duration::ZERO,
+    )
+}
+
+#[tokio::test]
+async fn an_answer_whose_body_cannot_be_read_never_breaks_the_glass() {
+    let v = vectors();
+    let (url, _task) = serve_raw(vec![truncated(), truncated()]).await;
+    let c = client(&url);
+    let (outcome, calls) = run(&c, &c, params(&v, "ctx-r1"), justification(), rotated()).await;
+    let err = outcome.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            GenesisMeshError::ResponseBodyUnreadable { status: 200, .. }
+        ),
+        "{err}"
+    );
+    assert_eq!(err.code(), "response_body_unreadable");
+    assert!(genesis_mesh_sdk::evaluation_failure(&err).is_none());
+    assert!(calls.is_empty());
+    let outbox = c.evidence_store.record_outbox().unwrap();
+    assert!(outbox.list().await.unwrap().is_empty());
+    // An unread answer to a submission is retried: the NA admits a record once.
+    let delivery = c.evidence_store.enqueue_record(observe(1)).await.unwrap();
+    let queued = delivery.queued.unwrap();
+    assert_eq!(queued.state, OutboxState::Pending);
+    assert_eq!(code(&queued), "response_body_unreadable");
+}
+
+#[tokio::test]
+async fn an_outcome_detail_is_cut_to_what_the_na_admits() {
+    let v = vectors();
+    let (url, _task) = scripted(vec![unavailable(), recorded()]).await;
+    let c = client(&url);
+    let report = Ok(ActionReport {
+        outcome_detail: Some("one more detail, ".repeat(90)),
+        ..ActionReport::default()
+    });
+    let (outcome, _) = run(&c, &c, params(&v, "ctx-r2"), justification(), report).await;
+    let result = broke(outcome.unwrap());
+    let detail = result.record["outcome_detail"].as_str().unwrap();
+    assert_eq!(detail.chars().count(), 1024);
+    assert!(detail.ends_with('\u{2026}'));
+}
+
+#[tokio::test]
+async fn a_record_is_always_kept_once_the_action_ran() {
+    let v = vectors();
+    let (url, _task) = scripted(vec![unavailable(), unavailable()]).await;
+    let c = client(&url);
+    let mut p = params(&v, "ctx-r3");
+    p.evaluate["context"]["attributes"]["note"] = json!("a short note, ".repeat(650));
+    let report: serde_json::Map<String, Value> = (0..300)
+        .map(|i| (format!("k{i}"), json!(format!("item {i} of the report"))))
+        .collect();
+    let report = Ok(ActionReport {
+        value: Some("done".into()),
+        execution_parameters: Some(Value::Object(report)),
+        outcome_detail: Some("a long detail, ".repeat(100)),
+        ..ActionReport::default()
+    });
+    let (outcome, _) = run(&c, &c, p, justification(), report).await;
+    let result = broke(outcome.unwrap());
+    assert_eq!(result.value.as_deref(), Some("done"));
+    assert_eq!(result.queued.unwrap().state, OutboxState::Pending);
+    assert_eq!(result.record["execution_parameters"], json!({}));
+    assert_eq!(
+        result.record["outcome_detail"],
+        "[secret guard dropped the report]"
+    );
+    assert_eq!(result.dropped.len(), 301);
+    assert!(result.dropped.iter().any(|d| d == "outcome_detail"));
+    let executor_key = public_key_from_seed(&STANDARD.encode([5_u8; 32])).unwrap();
+    assert!(verify_out_of_band_record(&result.record, &[executor_key]));
+}
+
+#[tokio::test]
+async fn a_batch_too_large_for_the_na_is_sent_one_observation_at_a_time() {
+    let (url, task) = scripted(vec![
+        unavailable(),
+        refusal(413, "request_entity_too_large"),
+        recorded(),
+    ])
+    .await;
+    let c = client(&url);
+    c.evidence_store.enqueue_record(observe(1)).await.unwrap();
+    let report = c
+        .evidence_store
+        .flush_records(FlushOptions {
+            ignore_backoff: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.admitted.len(), 1);
+    let targets: Vec<String> = task.await.unwrap().into_iter().map(|r| r.target).collect();
+    assert_eq!(
+        targets,
+        [
+            "/evidence/observations",
+            "/evidence/observations/batch",
+            "/evidence/observations"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn outboxes_read_the_compact_canonical_files_the_typescript_sdk_writes() {
+    let dir = TempDir::new();
+    // Signed over an integral float, as this crate and Python write it.
+    let record = observer()
+        .record(ObservationInput {
+            resource_id: "kv:prod/f".into(),
+            action: "rotate".into(),
+            capability: "secret.rotate".into(),
+            changed_at: Some(chrono::Utc::now() - chrono::Duration::minutes(1)),
+            source: "log".into(),
+            source_event_id: "f-1".into(),
+            metadata: Some(json!({"ratio": 1.0})),
+            ..ObservationInput::default()
+        })
+        .unwrap();
+    let canonical = genesis_mesh_sdk::canonical::out_of_band_canonical(&record).unwrap();
+    assert!(canonical.contains(r#""ratio":1.0"#), "{canonical}");
+    let entry = RecordOutboxEntry::new(record.clone());
+    let compact = |entry: Value, format: &str| {
+        format!(
+            "{{\"entry\":{},\"format\":\"{format}\"}}\n",
+            genesis_mesh_sdk::canonical_json(&entry).unwrap()
+        )
+    };
+    fs::create_dir_all(dir.records()).unwrap();
+    let file = dir
+        .records()
+        .join(format!("000000000001-{}.json", entry.id));
+    let text = compact(
+        serde_json::to_value(&entry).unwrap(),
+        "gm.evidence.record-outbox.v1",
+    );
+    assert!(text.contains(r#""ratio":1.0"#) && text.lines().count() == 1);
+    fs::write(&file, text).unwrap();
+    let key = [public_key_from_seed(&STANDARD.encode([11; 32])).unwrap()];
+    let outbox = FileRecordOutbox::new(dir.records());
+    let listed = outbox.list().await.unwrap();
+    assert_eq!(listed[0].record, record);
+    assert!(verify_out_of_band_record(&listed[0].record, &key));
+    // Written back by this crate, the record keeps the form it was signed over.
+    let mut updated = listed[0].clone();
+    updated.attempts = 1;
+    outbox.update(&updated).await.unwrap();
+    assert!(fs::read_to_string(&file)
+        .unwrap()
+        .contains(r#""ratio": 1.0"#));
+    let reread = FileRecordOutbox::new(dir.records()).list().await.unwrap();
+    assert_eq!(reread[0].attempts, 1);
+    assert!(verify_out_of_band_record(&reread[0].record, &key));
+
+    // The execution outbox reads the same layout.
+    let executions = dir.0.join("executions");
+    fs::create_dir_all(&executions).unwrap();
+    let evidence =
+        OutboxEntry::new(json!({"evidence_id": "e-1", "execution_parameters": {"ratio": 1.0}}));
+    fs::write(
+        executions.join("000000000001-e-1.json"),
+        compact(
+            serde_json::to_value(&evidence).unwrap(),
+            "gm.evidence.outbox.v1",
+        ),
+    )
+    .unwrap();
+    let listed = FileOutbox::new(&executions).list().await.unwrap();
+    assert_eq!(listed, [evidence]);
+    let canonical = genesis_mesh_sdk::canonical_json(&listed[0].evidence).unwrap();
+    assert!(canonical.contains(r#""ratio":1.0"#), "{canonical}");
 }

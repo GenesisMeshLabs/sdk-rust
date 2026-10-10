@@ -99,6 +99,31 @@
 - A flush while `enqueue` or `enqueue_record` submits a record leaves that
   record to it and reports it pending; it could submit it a second time and
   settle it twice.
+- A response the NA sent but whose body could not be read is the new
+  `GenesisMeshError::ResponseBodyUnreadable` (code
+  `response_body_unreadable`), not `Network`: it never breaks the glass (the
+  NA may have decided, even denied). An outbox retries a submission that ended
+  so.
+- `governed_action_with_break_glass` checks, before anything runs, that
+  `attestation_id` and `requested_capability` are non-empty strings, that the
+  context's `request_parameters` and `attributes` are objects, and that with
+  the justification they leave room for the record (`break_glass_malformed`).
+  Once the action ran a record is always kept: an outcome detail is cut to
+  1024 characters, and a report the guard still refuses after
+  `without_refused_metadata` is left out whole (`execution_parameters: {}`,
+  every reported field in `dropped`).
+- 1.3.0 records verify as the reference reads them: an unsigned extra field is
+  `payload_invalid` (and the entry is not counted); a field the reference
+  fills when absent (`metadata`, `request_parameters`, `attributes`,
+  `execution_parameters`, `gate_results`, `detail`) is `non_canonical_form`;
+  timestamps must be UTC (`Z` or `±00:00`). An unknown signed field is named
+  (`unknown_field`) under the key the signature names, whatever its role.
+  `verify_out_of_band_record` checks the record's form and fields too.
+- `flush_records` sends a batch the NA refuses as too large (`413`) one
+  observation at a time.
+- Outbox files the TypeScript SDK now writes as one line of canonical JSON
+  (`{"entry":...,"format":...}`) are read, and a record's integral floats
+  (`1.0`) keep their spelling when this crate writes the file back.
 
 ## 1.2.0 - Unreleased
 
