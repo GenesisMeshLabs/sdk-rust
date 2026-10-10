@@ -307,6 +307,40 @@ async fn file_record_outbox_refuses_a_directory_of_execution_records() {
 }
 
 #[tokio::test]
+async fn a_record_outbox_leaves_the_temporary_files_of_an_execution_outbox() {
+    let source = TempDir::new();
+    FileOutbox::new(source.records())
+        .add(&OutboxEntry::new(json!({"evidence_id": "e"})))
+        .await
+        .unwrap();
+    let name = fs::read_dir(source.records())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .into_owned();
+    // What a crash in `FileOutbox::add` leaves: a complete temporary file
+    // and no entry file.
+    let dir = TempDir::new();
+    fs::create_dir_all(dir.records()).unwrap();
+    let temporary = dir.records().join(format!(".{name}.abcd.tmp"));
+    fs::copy(source.records().join(&name), &temporary).unwrap();
+    let err = FileRecordOutbox::new(dir.records())
+        .list()
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    // 1.3.1: left for the outbox it belongs to, which recovers the record.
+    assert!(temporary.exists());
+    assert_eq!(
+        FileOutbox::new(dir.records()).list().await.unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn memory_record_outbox_refuses_an_id_twice() {
     let outbox = MemoryRecordOutbox::default();
     let entry = RecordOutboxEntry::new(observe(1));
@@ -507,19 +541,35 @@ async fn a_flush_stops_at_a_transient_failure_and_skips_records_in_backoff() {
     assert_eq!(task.await.unwrap().len(), 2);
 }
 
+fn batch_recorded(count: u64) -> (u16, String) {
+    let results: Vec<Value> = (0..count)
+        .map(|index| json!({"index": index, "status": "recorded"}))
+        .collect();
+    ok(json!({ "results": results }))
+}
+
 #[tokio::test]
-async fn a_refused_batch_is_tried_one_observation_at_a_time() {
+async fn a_batch_refused_as_a_whole_is_split_until_the_record_is_found() {
+    // The NA's strict reader refuses a request with one record it cannot
+    // read (`invalid_json`), whatever else it holds (1.3.1).
+    let unreadable = || refusal(400, "invalid_json");
     let (url, task) = scripted(vec![
         unavailable(),
         unavailable(),
-        refusal(400, "invalid_observation"),
-        recorded(),
-        refusal(422, "observation_malformed"),
+        unavailable(),
+        unavailable(),
+        unreadable(),      // 1, 2, 3, 4
+        batch_recorded(2), // 1, 2
+        unreadable(),      // 3, 4
+        unreadable(),      // 3
+        unreadable(),      // 3 alone, on its own route
+        batch_recorded(1), // 4
     ])
     .await;
     let c = client(&url);
-    c.evidence_store.enqueue_record(observe(1)).await.unwrap();
-    c.evidence_store.enqueue_record(observe(2)).await.unwrap();
+    for n in 1..=4 {
+        c.evidence_store.enqueue_record(observe(n)).await.unwrap();
+    }
     let report = c
         .evidence_store
         .flush_records(FlushOptions {
@@ -527,22 +577,155 @@ async fn a_refused_batch_is_tried_one_observation_at_a_time() {
         })
         .await
         .unwrap();
-    assert_eq!(report.admitted.len(), 1);
-    assert_eq!(code(&report.dead_lettered[0]), "observation_malformed");
+    assert_eq!(report.admitted.len(), 3);
+    // Final (1.3.1): sending the same record again cannot change the answer.
+    assert_eq!(report.dead_lettered.len(), 1);
+    assert_eq!(code(&report.dead_lettered[0]), "invalid_json");
+    assert_eq!(report.dead_lettered[0].record["resource_id"], "kv:prod/s3");
     let r = task.await.unwrap();
-    let targets: Vec<&str> = r.iter().map(|q| q.target.as_str()).collect();
+    let sent: Vec<(&str, usize)> = r[4..]
+        .iter()
+        .map(|q| {
+            let count = q.body["observations"].as_array().map_or(1, Vec::len);
+            (q.target.as_str(), count)
+        })
+        .collect();
     assert_eq!(
-        targets[2..],
+        sent,
         [
-            "/evidence/observations/batch",
-            "/evidence/observations",
-            "/evidence/observations"
+            ("/evidence/observations/batch", 4),
+            ("/evidence/observations/batch", 2),
+            ("/evidence/observations/batch", 2),
+            ("/evidence/observations/batch", 1),
+            ("/evidence/observations", 1),
+            ("/evidence/observations/batch", 1),
         ]
     );
 }
 
+/// A raw `429` asking the client to wait `seconds`.
+fn throttled(seconds: u64) -> (String, Duration) {
+    let body =
+        json!({"error": {"code": "rate_limit_exceeded", "message": "slow down"}}).to_string();
+    (
+        format!(
+            "HTTP/1.1 429 Test\r\nRetry-After: {seconds}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+        Duration::ZERO,
+    )
+}
+
+fn raw((status, reply): (u16, String)) -> (String, Duration) {
+    (
+        format!(
+            "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        ),
+        Duration::ZERO,
+    )
+}
+
+fn waits_at_least(entry: &RecordOutboxEntry, seconds: i64) -> bool {
+    let at: chrono::DateTime<chrono::Utc> =
+        entry.next_attempt_at.as_deref().unwrap().parse().unwrap();
+    at - chrono::Utc::now() > chrono::Duration::seconds(seconds)
+}
+
 #[tokio::test]
-async fn break_glass_records_are_flushed_one_at_a_time_in_order() {
+async fn a_throttled_batch_halves_the_batches_after_it_and_waits_as_asked() {
+    let (url, task) = serve_raw(vec![
+        raw(unavailable()),
+        raw(unavailable()),
+        raw(unavailable()),
+        raw(unavailable()),
+        throttled(120),
+        raw(batch_recorded(2)),
+        raw(batch_recorded(2)),
+    ])
+    .await;
+    let c = client(&url);
+    for n in 1..=4 {
+        c.evidence_store.enqueue_record(observe(n)).await.unwrap();
+    }
+    let throttled = c
+        .evidence_store
+        .flush_records(FlushOptions {
+            ignore_backoff: true,
+        })
+        .await
+        .unwrap();
+    // Every record waits as long as the NA asked, past its own backoff (1.3.1).
+    assert_eq!(throttled.pending.len(), 4);
+    assert!(throttled.pending.iter().all(|e| waits_at_least(e, 100)));
+    assert!(throttled
+        .pending
+        .iter()
+        .all(|e| e.last_error.as_ref().unwrap().status == 429));
+    let skipped = c
+        .evidence_store
+        .flush_records(FlushOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(skipped.pending.len(), 4);
+    // Batches of half the size from then on, so a limit below 100 a minute drains.
+    let report = c
+        .evidence_store
+        .flush_records(FlushOptions {
+            ignore_backoff: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.admitted.len(), 4);
+    let r = task.await.unwrap();
+    let counts: Vec<usize> = r[4..]
+        .iter()
+        .map(|q| q.body["observations"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(counts, [4, 2, 2]);
+}
+
+#[tokio::test]
+async fn an_execution_record_waits_as_long_as_the_na_asks() {
+    let (url, _task) = serve_raw(vec![throttled(300), throttled(7200)]).await;
+    let outbox = Arc::new(MemoryOutbox::default());
+    let c = GenesisMeshClient::new(options(&url).with_outbox(outbox.clone())).unwrap();
+    let v = vectors();
+    let decision = signed_evaluation(&v, true, "ctx-w")["decision"].clone();
+    let record = recorder()
+        .record(RecordExecution {
+            decision,
+            executed_capability: "sp-secret.rotate".into(),
+            ..RecordExecution::default()
+        })
+        .unwrap();
+    let entry = c
+        .evidence_store
+        .enqueue(record)
+        .await
+        .unwrap()
+        .queued
+        .unwrap();
+    let wait = |entry: &OutboxEntry| {
+        let at: chrono::DateTime<chrono::Utc> =
+            entry.next_attempt_at.as_deref().unwrap().parse().unwrap();
+        at - chrono::Utc::now()
+    };
+    assert!(wait(&entry) > chrono::Duration::seconds(290), "{entry:?}");
+    // At most 15 minutes, whatever the answer asks.
+    let report = c
+        .evidence_store
+        .flush_pending(FlushOptions {
+            ignore_backoff: true,
+        })
+        .await
+        .unwrap();
+    let again = wait(&report.pending[0]);
+    assert!(again > chrono::Duration::minutes(14) && again <= chrono::Duration::minutes(15));
+}
+
+#[tokio::test]
+async fn break_glass_records_are_flushed_first_one_at_a_time() {
     let (url, task) = scripted(vec![
         unavailable(),
         unavailable(),
@@ -561,11 +744,11 @@ async fn break_glass_records_are_flushed_one_at_a_time_in_order() {
             EvaluationFailure::Timeout,
         ))
         .unwrap();
+    c.evidence_store.enqueue_record(observe(1)).await.unwrap();
     c.evidence_store
         .enqueue_record(record.clone())
         .await
         .unwrap();
-    c.evidence_store.enqueue_record(observe(1)).await.unwrap();
     let report = c
         .evidence_store
         .flush_records(FlushOptions {
@@ -574,10 +757,55 @@ async fn break_glass_records_are_flushed_one_at_a_time_in_order() {
         .await
         .unwrap();
     assert_eq!(report.admitted.len(), 2);
+    // 1.3.1: break-glass records first, though added later.
     let r = task.await.unwrap();
     assert_eq!(r[2].target, "/evidence/break-glass");
     assert_eq!(r[2].body, json!({ "record": record }));
     assert_eq!(r[3].target, "/evidence/observations/batch");
+}
+
+#[tokio::test]
+async fn no_record_is_due_while_the_na_asks_to_wait() {
+    let (url, task) = serve_raw(vec![
+        throttled(120),
+        raw(recorded()),
+        raw(batch_recorded(1)),
+    ])
+    .await;
+    let c = client(&url);
+    let record = recorder()
+        .sign_break_glass(genesis_mesh_sdk::BreakGlassInput::new(
+            "kv:v/s",
+            "rotate",
+            "sp-secret.rotate",
+            "incident 42",
+            json!({}),
+            EvaluationFailure::Timeout,
+        ))
+        .unwrap();
+    c.evidence_store.enqueue_record(record).await.unwrap();
+    // A record that never failed: due, but for the NA's request to wait.
+    let outbox = c.evidence_store.record_outbox().unwrap();
+    outbox
+        .add(&RecordOutboxEntry::new(observe(2)))
+        .await
+        .unwrap();
+    let waiting = c
+        .evidence_store
+        .flush_records(FlushOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(waiting.pending.len(), 2);
+    assert!(waiting.admitted.is_empty());
+    let report = c
+        .evidence_store
+        .flush_records(FlushOptions {
+            ignore_backoff: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.admitted.len(), 2);
+    assert_eq!(task.await.unwrap().len(), 3);
 }
 
 // ── governed_action_with_break_glass ─────────────────────────────────────────
@@ -822,7 +1050,31 @@ async fn break_glass_checks_what_it_needs_before_anything_runs() {
     // Room is kept for the action's report within the metadata limit.
     let mut no_room = params(&v, "ctx-b4");
     no_room.evaluate["context"]["attributes"]["note"] = json!("a short note, ".repeat(1100));
+    // Measured as the NA measures it (1.3.1): text outside ASCII escaped, 5142
+    // bytes as UTF-8 but 15188 as the NA counts the record.
+    let mut no_room_escaped = params(&v, "ctx-b4");
+    no_room_escaped.evaluate["context"]["attributes"]["note"] = json!("é".repeat(2500));
+    // Nested deeper than every reader takes (1.3.1).
+    let mut too_deep = params(&v, "ctx-b4");
+    too_deep.evaluate["context"]["attributes"]["deep"] =
+        (1..61).fold(json!({}), |inner, _| json!({ "a": inner }));
+    let mut unknown_action = params(&v, "ctx-b4");
+    unknown_action.resource_action = Some("rotated".into());
     let cases = [
+        (
+            &c,
+            no_room_escaped,
+            justification(),
+            "break_glass_malformed",
+        ),
+        (&c, too_deep, justification(), "invalid_json"),
+        (&c, unknown_action, justification(), "configuration"),
+        (
+            &c,
+            changed("attestation_id", json!("a".repeat(129))),
+            justification(),
+            "break_glass_malformed",
+        ),
         (&c, agreement, justification(), "break_glass_malformed"),
         (
             &c,
@@ -985,6 +1237,33 @@ async fn a_break_glass_record_waits_while_the_na_is_down_without_refused_metadat
 }
 
 #[tokio::test]
+async fn a_report_that_leaves_no_room_with_the_justification_is_left_out() {
+    let v = vectors();
+    let (url, task) = scripted(vec![unavailable(), recorded()]).await;
+    let c = client(&url);
+    let mut p = params(&v, "ctx-b10");
+    p.evaluate["context"]["request_parameters"] = json!({"blob": "a b".repeat(4300)});
+    let report = Ok(ActionReport {
+        value: Some("done".into()),
+        execution_parameters: Some(json!({"versions": "v ".repeat(1300)})),
+        ..ActionReport::default()
+    });
+    // The NA counts the justification with the report (1.3.1): 16652 bytes.
+    let (outcome, _) = run(&c, &c, p, BreakGlassOptions::new("x ".repeat(512)), report).await;
+    let result = broke(outcome.unwrap());
+    assert_eq!(result.value.as_deref(), Some("done"));
+    assert_eq!(result.dropped, ["versions"]);
+    assert_eq!(result.record["execution_parameters"], json!({}));
+    assert_eq!(
+        result.record["outcome_detail"],
+        "[secret guard dropped the report]"
+    );
+    let executor_key = public_key_from_seed(&STANDARD.encode([5_u8; 32])).unwrap();
+    assert!(verify_out_of_band_record(&result.record, &[executor_key]));
+    assert_eq!(task.await.unwrap()[1].body["record"], result.record);
+}
+
+#[tokio::test]
 async fn governed_action_never_breaks_the_glass() {
     let v = vectors();
     let (url, _task) = scripted(vec![unavailable()]).await;
@@ -1030,7 +1309,22 @@ fn record_refusals_are_classified_by_their_own_list() {
         );
     }
     assert!(!classify_record_submission_error(&validation("break_glass_key_retired")).1);
-    assert_eq!(RECORD_PERMANENT_REFUSALS.len(), 14);
+    assert_eq!(RECORD_PERMANENT_REFUSALS.len(), 15);
+    // 1.3.1: the NA's strict reader refusing the request is final for both
+    // kinds of record; a response this crate could not read is not the NA's
+    // refusal, and is retried.
+    let unreadable_request = GenesisMeshError::BadRequest {
+        message: "request body is not accepted JSON".into(),
+        code: "invalid_json".into(),
+    };
+    assert!(!classify_record_submission_error(&unreadable_request).1);
+    assert!(!classify_submission_error(&unreadable_request).1);
+    let unreadable_response = GenesisMeshError::StrictJson {
+        reason: "invalid_json".into(),
+        detail: "text that is not UTF-8".into(),
+    };
+    assert!(classify_record_submission_error(&unreadable_response).1);
+    assert!(classify_submission_error(&unreadable_response).1);
 }
 
 #[test]

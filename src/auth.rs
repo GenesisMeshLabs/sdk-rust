@@ -98,20 +98,47 @@ fn write_string(value: &str, output: &mut String) -> Result<()> {
     Ok(())
 }
 
+/// Python's `repr` of a float: the fewest digits that read back as the value,
+/// the nearest such to it, and of two equally near the one ending in an even
+/// digit (1.3.1). Rust's shortest formatter gives the same count of digits
+/// but takes the larger of two equally near, so the digits are rounded again
+/// to that count, half to even, and kept when they read back as the value.
+/// Python writes scientific notation below 1e-4 and from 1e16, the exponent
+/// with a sign and at least two digits.
 fn python_float(value: f64) -> String {
-    // Rust's shortest float formatter supplies the digits. Python switches to
-    // scientific notation below 1e-4 and at 1e16, and pads exponent digits.
-    let scientific = format!("{value:e}");
-    let (mantissa, exponent) = scientific.split_once('e').expect("scientific float");
-    let exponent: i32 = exponent.parse().expect("float exponent");
-    if !(-4..16).contains(&exponent) {
-        format!("{mantissa}e{exponent:+03}")
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    let value = value.abs();
+    let shortest = format!("{value:e}");
+    let (mantissa, _) = shortest.split_once('e').expect("scientific float");
+    let count = mantissa.chars().filter(char::is_ascii_digit).count();
+    let even = format!("{value:.*e}", count - 1);
+    let chosen = if even.parse::<f64>() == Ok(value) {
+        even
     } else {
-        let mut decimal = value.to_string();
-        if !decimal.contains('.') {
-            decimal.push_str(".0");
-        }
-        decimal
+        shortest
+    };
+    let (mantissa, exponent) = chosen.split_once('e').expect("scientific float");
+    let exponent: i32 = exponent.parse().expect("float exponent");
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let digits = match digits.trim_end_matches('0') {
+        "" => "0",
+        trimmed => trimmed,
+    };
+    if !(-4..16).contains(&exponent) {
+        let (first, rest) = digits.split_at(1);
+        let point = if rest.is_empty() { "" } else { "." };
+        return format!("{sign}{first}{point}{rest}e{exponent:+03}");
+    }
+    if exponent < 0 {
+        let zeros = "0".repeat((-exponent - 1) as usize);
+        return format!("{sign}0.{zeros}{digits}");
+    }
+    let whole = exponent as usize + 1;
+    if digits.len() <= whole {
+        format!("{sign}{digits}{}.0", "0".repeat(whole - digits.len()))
+    } else {
+        let (int, frac) = digits.split_at(whole);
+        format!("{sign}{int}.{frac}")
     }
 }
 
@@ -269,6 +296,33 @@ mod tests {
             canonical_json(&value).unwrap(),
             r#"{"body":{"foo":"bar"},"key_id":"k","nonce":"n","timestamp":"t"}"#
         );
+    }
+
+    #[test]
+    fn writes_floats_as_python_repr_does() {
+        for (exact, python) in [
+            // Exactly halfway between two shortest forms: the even digit (1.3.1).
+            ("13509655414498.0625", "13509655414498.062"),
+            ("9627424922076.3125", "9627424922076.312"),
+            ("171699164099735.125", "171699164099735.12"),
+            ("1168512007578726.25", "1168512007578726.2"),
+            ("-1168512007578726.25", "-1168512007578726.2"),
+            // Not a tie: the nearest form.
+            ("13509655414498.064", "13509655414498.064"),
+            ("0.1", "0.1"),
+            ("123", "123.0"),
+            ("-0", "-0.0"),
+            ("1e15", "1000000000000000.0"),
+            ("1e16", "1e+16"),
+            ("1.5e16", "1.5e+16"),
+            ("0.0001", "0.0001"),
+            ("0.00001", "1e-05"),
+            ("5e-324", "5e-324"),
+            ("1.7976931348623157e308", "1.7976931348623157e+308"),
+        ] {
+            let value: f64 = exact.parse().unwrap();
+            assert_eq!(python_float(value), python, "{exact}");
+        }
     }
 
     #[test]

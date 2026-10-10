@@ -12,10 +12,15 @@ use crate::{
     canonical::{execution_canonical, execution_digest, parse_timestamp, python_timestamp},
     errors::{GenesisMeshError, Result},
     evidence_store::ResourceHead,
-    out_of_band::{sign_break_glass, BreakGlassInput},
+    out_of_band::{
+        action_problem, check_nesting, length_problem, sign_break_glass, time_problem,
+        BreakGlassInput,
+    },
 };
 
-/// Limit on `execution_parameters` plus `outcome_detail`, as enforced by the NA.
+/// Limit on `execution_parameters` plus `outcome_detail`, as enforced by the
+/// NA; for an observation or break-glass record (1.3.1), on the values its
+/// guard covers, counted as the NA counts them.
 pub const MAX_METADATA_BYTES: usize = 16 * 1024;
 
 const SECRET_KEYS: [&str; 18] = [
@@ -52,6 +57,9 @@ fn token_chars(part: &str) -> bool {
 }
 
 fn looks_like_key_material(value: &str) -> bool {
+    // The reference's patterns end in `$`, which also matches before a final
+    // newline (1.3.1).
+    let value = value.strip_suffix('\n').unwrap_or(value);
     let long_opaque = value.len() >= 120
         && value
             .bytes()
@@ -66,7 +74,9 @@ fn looks_like_key_material(value: &str) -> bool {
     long_opaque || jwt
 }
 
-fn secret_material(value: &Value, path: &str) -> Option<String> {
+/// The reference's `_secret_material`: the first field named like a secret,
+/// PEM block, key or token under `path`.
+pub(crate) fn secret_material(value: &Value, path: &str) -> Option<String> {
     match value {
         Value::Array(items) => items
             .iter()
@@ -82,7 +92,7 @@ fn secret_material(value: &Value, path: &str) -> Option<String> {
             }
         }),
         Value::String(text) => {
-            let field = path.strip_suffix('.').unwrap_or(path);
+            let field = path.trim_end_matches('.');
             if text.contains("-----BEGIN") {
                 Some(format!("field '{field}' contains a PEM block"))
             } else if looks_like_key_material(text) {
@@ -181,6 +191,14 @@ pub struct RecordExecution {
     pub evidence_id: Option<String>,
 }
 
+/// Why a record's resource would be refused as malformed, or `None`: its id
+/// 1 to 256 characters, its action one the reference knows (1.3.1).
+pub(crate) fn resource_problem(resource_id: Option<&str>, action: Option<&str>) -> Option<String> {
+    resource_id
+        .and_then(|id| length_problem("resource_id", id, 1, 256))
+        .or_else(|| action.and_then(|action| action_problem("resource_action", action)))
+}
+
 /// `now`, but never before the decision (1.1.0). The NA refuses evidence
 /// stamped before `decision_made_at`, which a host whose clock is behind the
 /// NA's produced for any action quicker than the skew.
@@ -238,10 +256,16 @@ impl ExecutionRecorder {
     /// Build and sign a break-glass record with this executor's key
     /// (v1.3.0). [`governed_action_with_break_glass`](crate::governed_action_with_break_glass)
     /// calls it when evaluation fails transiently. Refused before signing
-    /// ([`GenesisMeshError::OutOfBandRecord`]) without a justification of 1
-    /// to 1024 characters (`break_glass_malformed`), or with secret material
-    /// in the justification, the parameters, the attributes or the outcome
-    /// detail (`break_glass_secret_material`).
+    /// ([`GenesisMeshError::OutOfBandRecord`]) as the NA would refuse it:
+    /// `break_glass_malformed` without a justification of 1 to 1024
+    /// characters, with a resource action the reference does not know, a
+    /// field of the wrong length or a time outside the years 1 to 9999
+    /// (1.3.1); `break_glass_secret_material` with secret material in the
+    /// justification, the parameters, the attributes or the outcome detail,
+    /// or with those together over [`MAX_METADATA_BYTES`] as the NA counts
+    /// them (text outside ASCII escaped, 1.3.1). Values nested too deep for
+    /// every reader are refused as [`GenesisMeshError::StrictJson`]
+    /// (`invalid_json`, 1.3.1).
     pub fn sign_break_glass(&self, input: BreakGlassInput) -> Result<Value> {
         sign_break_glass(
             &self.executor_sovereign_id,
@@ -251,12 +275,27 @@ impl ExecutionRecorder {
         )
     }
 
-    /// Build and sign one ExecutionEvidence record.
+    /// Build and sign one ExecutionEvidence record. Refused before signing:
+    /// a `resource_id` without a `resource_action` or the other way round,
+    /// a `resource_id` that is not 1 to 256 characters, an action other than
+    /// `create`, `rotate`, `revoke`, `update` or `delete`, or an execution
+    /// time outside the years 1 to 9999 ([`GenesisMeshError::Configuration`],
+    /// 1.3.1); secret material ([`GenesisMeshError::SecretMaterial`]); and
+    /// parameters nested too deep for every reader
+    /// ([`GenesisMeshError::StrictJson`], `invalid_json`, 1.3.1).
     pub fn record(&self, params: RecordExecution) -> Result<Value> {
         if params.resource_id.is_some() != params.resource_action.is_some() {
             return Err(GenesisMeshError::Configuration(
                 "resource_id and resource_action go together".into(),
             ));
+        }
+        if let Some(problem) = resource_problem(
+            params.resource_id.as_deref(),
+            params.resource_action.as_deref(),
+        )
+        .or_else(|| time_problem("executed_at", params.executed_at))
+        {
+            return Err(GenesisMeshError::Configuration(problem));
         }
         let execution_parameters = params.execution_parameters.unwrap_or_else(|| json!({}));
         if !execution_parameters.is_object() {
@@ -340,6 +379,7 @@ impl ExecutionRecorder {
         }
         record.insert("signature".into(), Value::Null);
         let mut record = Value::Object(record);
+        check_nesting(&record)?;
         let signature = sign_canonical(
             &execution_canonical(&record)?,
             &self.key_id,
@@ -414,8 +454,17 @@ mod tests {
             json!({"cert": "-----BEGIN PRIVATE KEY-----"}),
             json!({"blob": "A".repeat(120)}),
             json!({"jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"}),
+            // The reference's `$` also matches before a final newline.
+            json!({"blob": format!("{}\n", "A".repeat(120))}),
+            json!({"jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig\n"}),
         ] {
             assert!(check_metadata_only(&bad, None).is_some(), "{bad}");
+        }
+        for fine in [
+            json!({"blob": format!("{}\n\n", "A".repeat(120))}),
+            json!({"blob": format!("{}\n", "A".repeat(119))}),
+        ] {
+            assert!(check_metadata_only(&fine, None).is_none(), "{fine}");
         }
         assert!(check_metadata_only(&json!({}), Some("-----BEGIN KEY")).is_some());
         assert!(

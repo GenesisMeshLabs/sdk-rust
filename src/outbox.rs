@@ -293,14 +293,20 @@ pub struct RecordFlushReport {
 }
 
 /// Local refusal code for a record whose predecessor in its chain is a dead
-/// letter.
+/// letter. Since 1.3.1 the record is submitted all the same, so the NA can
+/// quarantine one it refuses for good on its own account; it is given this
+/// code when the NA refuses it for the gap the dead letter left
+/// (`evidence_chain_gap`, `resource_chain_gap`), which never closes.
 pub const PREDECESSOR_DEAD_LETTERED: &str = "evidence_predecessor_dead_lettered";
 
 /// The NA's refusals that no retry of the same record can overcome. Every
 /// other failure (network, timeout, `5xx`, `429`, an unknown or not yet
 /// registered executor key, a chain gap behind a record not yet admitted, a
-/// disabled store, a proxy's error page) is retried.
-pub const PERMANENT_REFUSALS: [&str; 13] = [
+/// disabled store, a proxy's error page) is retried. Since 1.3.1 it includes
+/// `invalid_json`: the NA's strict JSON reader refused the request, which
+/// sending the same record again cannot change.
+pub const PERMANENT_REFUSALS: [&str; 14] = [
+    "invalid_json",
     "invalid_evidence",
     "evidence_malformed",
     // v1.3.0: a retired key, and a key whose role or resource prefix does not
@@ -320,8 +326,10 @@ pub const PERMANENT_REFUSALS: [&str; 13] = [
 
 /// The NA's refusals of an observation or break-glass record that no retry
 /// can overcome (v1.3.0). An unknown key is retried: it may not be
-/// registered yet; a retired one is not.
-pub const RECORD_PERMANENT_REFUSALS: [&str; 14] = [
+/// registered yet; a retired one is not. Since 1.3.1 it includes
+/// `invalid_json`, as [`PERMANENT_REFUSALS`] does.
+pub const RECORD_PERMANENT_REFUSALS: [&str; 15] = [
+    "invalid_json",
     "invalid_observation",
     "observation_malformed",
     "observation_invalid_signature",
@@ -364,15 +372,38 @@ fn classify(err: &GenesisMeshError, refusals: &[&str]) -> (SubmissionFailure, bo
         code: err.code().to_owned(),
         message: err.to_string(),
     };
-    let refused = refusals.contains(&err.code()) && (status == 0 || (400..500).contains(&status));
+    // A response this crate could not read strictly is not the NA's refusal:
+    // the NA may have admitted the record (1.3.1).
+    let read_locally = matches!(err, GenesisMeshError::StrictJson { .. });
+    let refused = !read_locally
+        && refusals.contains(&err.code())
+        && (status == 0 || (400..500).contains(&status));
     (failure, !refused)
 }
+
+/// The longest wait between attempts.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
 
 /// Delay before the next attempt after `attempts` failures: 5 s, doubling, at
 /// most 15 minutes.
 pub fn retry_delay(attempts: u32) -> Duration {
     let doublings = attempts.saturating_sub(1).min(16);
-    Duration::from_secs((5_u64 << doublings).min(15 * 60))
+    Duration::from_secs(5_u64 << doublings).min(MAX_RETRY_DELAY)
+}
+
+/// When to try a record again after `attempts` failures: its backoff, or
+/// later when the NA asked the caller to wait (`Retry-After`, 1.3.1), at most
+/// 15 minutes.
+pub(crate) fn next_attempt_at(attempts: u32, wait: Option<Duration>) -> String {
+    timestamp(next_attempt(attempts, wait))
+}
+
+/// [`next_attempt_at`] as a time.
+pub(crate) fn next_attempt(attempts: u32, wait: Option<Duration>) -> DateTime<Utc> {
+    let asked = wait.unwrap_or_default().min(MAX_RETRY_DELAY);
+    let delay = chrono::Duration::from_std(retry_delay(attempts).max(asked))
+        .unwrap_or(chrono::Duration::MAX);
+    Utc::now() + delay
 }
 
 pub(crate) fn timestamp(at: DateTime<Utc>) -> String {
@@ -537,45 +568,46 @@ impl<E: Entry> JsonFiles<E> {
 
     fn read(&self) -> io::Result<HashMap<String, Stored<E>>> {
         create_private_dir(&self.directory)?;
-        let names = || -> io::Result<Vec<String>> {
-            fs::read_dir(&self.directory)?
-                .map(|item| Ok(item?.file_name().to_string_lossy().into_owned()))
-                .collect()
+        let names: Vec<String> = fs::read_dir(&self.directory)?
+            .map(|item| Ok(item?.file_name().to_string_lossy().into_owned()))
+            .collect::<io::Result<_>>()?;
+        // Every file is read before any is changed: a directory of the other
+        // outbox's files is refused as it is found, its temporary files left
+        // for that outbox to recover (1.3.1; they were removed).
+        let other_format = |name: &str| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("outbox file {name} is not {}", E::FORMAT),
+            )
         };
-        let mut found = names()?;
-        let mut recovered = false;
-        for name in &found {
+        let mut temporary = Vec::new();
+        for name in &names {
             let Some(target) = temp_target(name) else {
                 continue;
             };
-            let path = self.directory.join(name);
-            let complete = fs::read_to_string(&path)
+            let body = fs::read(self.directory.join(name))
                 .ok()
-                .and_then(|text| parse_entry::<E>(&text))
-                .is_some();
-            if complete && !found.iter().any(|n| n == target) {
-                fs::rename(&path, self.directory.join(target))?;
-            } else {
-                fs::remove_file(&path)?;
+                .and_then(|bytes| json_of(&bytes));
+            if body.as_ref().is_some_and(of_other_format::<E>) {
+                return Err(other_format(name));
             }
-            recovered = true;
-        }
-        if recovered {
-            sync_dir(&self.directory)?;
-            found = names()?;
+            temporary.push((name, target, body.and_then(entry_of::<E>)));
         }
         let mut stored = HashMap::new();
-        for file in found {
-            let Some((sequence, stem)) = parse_entry_file(&file) else {
+        let mut unreadable = Vec::new();
+        for file in &names {
+            let Some((sequence, stem)) = parse_entry_file(file) else {
                 continue;
             };
-            let text = fs::read_to_string(self.directory.join(&file))?;
-            let entry = parse_entry::<E>(&text).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("outbox file {file} is unreadable or not {}", E::FORMAT),
-                )
-            })?;
+            let body = json_of(&fs::read(self.directory.join(file))?);
+            if body.as_ref().is_some_and(of_other_format::<E>) {
+                return Err(other_format(file));
+            }
+            let Some(entry) = body.and_then(entry_of::<E>) else {
+                unreadable.push(file.clone());
+                continue;
+            };
+            let file = file.clone();
             stored.insert(
                 stem,
                 Stored {
@@ -584,6 +616,55 @@ impl<E: Entry> JsonFiles<E> {
                     entry,
                 },
             );
+        }
+        // What a crash left: an entry being added is recovered, an update
+        // that did not finish is removed.
+        for (name, target, entry) in &temporary {
+            let path = self.directory.join(name);
+            match (entry, parse_entry_file(target)) {
+                (Some(entry), Some((sequence, stem))) if !names.iter().any(|n| n == target) => {
+                    fs::rename(&path, self.directory.join(target))?;
+                    let file = (*target).to_owned();
+                    let entry = entry.clone();
+                    stored.insert(
+                        stem,
+                        Stored {
+                            file,
+                            sequence,
+                            entry,
+                        },
+                    );
+                }
+                _ => fs::remove_file(&path)?,
+            }
+        }
+        // 1.3.1: a file that cannot be read is moved aside, so it does not
+        // stop every action; the read that finds it fails, once.
+        for file in &unreadable {
+            fs::rename(
+                self.directory.join(file),
+                self.directory.join(format!("{file}{UNREADABLE}")),
+            )?;
+        }
+        if !temporary.is_empty() || !unreadable.is_empty() {
+            sync_dir(&self.directory)?;
+        }
+        if !unreadable.is_empty() {
+            let (s, were) = if unreadable.len() == 1 {
+                ("", "was")
+            } else {
+                ("s", "were")
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                UnreadableFiles(format!(
+                    "outbox file{s} {} in {} could not be read as {} and {were} moved aside \
+                     (*{UNREADABLE}); the record{s} held there will not be submitted",
+                    unreadable.join(", "),
+                    self.directory.display(),
+                    E::FORMAT,
+                )),
+            ));
         }
         Ok(stored)
     }
@@ -667,9 +748,15 @@ impl<E: Entry> JsonFiles<E> {
 /// entries were added. The TypeScript SDK reads and writes the same format.
 ///
 /// One process uses a directory at a time: the directory is read once, then
-/// kept in memory. A temporary file left by a crash is recovered (an entry
-/// that was being added) or removed (an update that did not finish) on that
-/// first read. A directory the outbox creates is `0700` and its files `0600`
+/// kept in memory. Nothing enforces that (the file locks of the standard
+/// library are newer than this crate's minimum Rust): two processes sharing
+/// a directory submit each other's records and overwrite each other's
+/// changes, so give each its own. A temporary file left by a crash is
+/// recovered (an entry that was being added) or removed (an update that did
+/// not finish) on that first read. An entry file that cannot be read is
+/// moved aside as `<name>.unreadable` (1.3.1): the read that finds it fails
+/// once (`outbox_file_unreadable`), and the record it held is not submitted.
+/// A directory holding files of the other outbox's format is refused. A directory the outbox creates is `0700` and its files `0600`
 /// on Unix; on Windows, and for a directory that already exists, restrict
 /// access to it yourself. Its file operations are synchronous and brief, and
 /// run on the caller's task.
@@ -713,8 +800,35 @@ impl FileRecordOutbox {
 outbox_over!(FileRecordOutbox, RecordOutbox, RecordOutboxEntry);
 
 /// The entry in a file's text, when it is a well-formed file of its outbox.
-fn parse_entry<E: Entry>(text: &str) -> Option<E> {
-    let body: Value = serde_json::from_str(text).ok()?;
+/// The suffix an unreadable entry file is renamed with (1.3.1).
+const UNREADABLE: &str = ".unreadable";
+
+/// Entry files that could not be read and were moved aside (1.3.1): what the
+/// [`GenesisMeshError::Outbox`] error of the read that found them carries,
+/// with the code `outbox_file_unreadable`.
+#[derive(Debug)]
+pub(crate) struct UnreadableFiles(String);
+
+impl std::fmt::Display for UnreadableFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnreadableFiles {}
+
+/// A file's JSON, when it is JSON.
+fn json_of(bytes: &[u8]) -> Option<Value> {
+    serde_json::from_slice(bytes).ok()
+}
+
+/// A well-formed file of another format: the other outbox's, or a later one.
+fn of_other_format<E: Entry>(body: &Value) -> bool {
+    body["format"].is_string() && body["format"] != E::FORMAT
+}
+
+/// The entry in a file's JSON, when it is of its outbox's format.
+fn entry_of<E: Entry>(body: Value) -> Option<E> {
     if body["format"] != E::FORMAT {
         return None;
     }

@@ -189,30 +189,41 @@ async fn file_outbox_reads_entries_the_typescript_sdk_writes() {
 }
 
 #[tokio::test]
-async fn file_outbox_fails_loudly_on_an_unreadable_entry() {
+async fn file_outbox_moves_an_unreadable_entry_aside_and_fails_once() {
     let dir = TempDir::new();
     FileOutbox::new(dir.outbox())
         .add(&entry("a"))
         .await
         .unwrap();
     fs::write(dir.outbox().join("000000000002-b.json"), "{not json").unwrap();
-    let err = FileOutbox::new(dir.outbox())
-        .list()
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("000000000002-b.json"), "{err}");
+    fs::write(dir.outbox().join("000000000003-c.json"), [0xff, 0xfe]).unwrap();
+    let outbox = FileOutbox::new(dir.outbox());
+    let err = GenesisMeshError::Outbox(outbox.list().await.unwrap_err());
+    assert_eq!(err.code(), "outbox_file_unreadable");
+    let text = err.to_string();
+    assert!(
+        text.contains("000000000002-b.json, 000000000003-c.json"),
+        "{text}"
+    );
+    // 1.3.1: moved aside, so the file no longer stops every action.
+    assert!(dir.outbox().join("000000000002-b.json.unreadable").exists());
+    assert!(dir.outbox().join("000000000003-c.json.unreadable").exists());
+    assert_eq!(ids(&outbox).await, ["a"]);
+    // A file of another format is refused, and left where it is.
     fs::write(
         dir.outbox().join("000000000002-b.json"),
         r#"{"format":"other"}"#,
     )
     .unwrap();
+    let err = FileOutbox::new(dir.outbox()).list().await.unwrap_err();
+    assert_eq!(GenesisMeshError::Outbox(err).code(), "outbox_error");
     let err = FileOutbox::new(dir.outbox())
         .list()
         .await
         .unwrap_err()
         .to_string();
     assert!(err.contains("gm.evidence.outbox.v1"), "{err}");
+    assert!(dir.outbox().join("000000000002-b.json").exists());
 }
 
 #[cfg(unix)]
