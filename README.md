@@ -171,7 +171,10 @@ writes each record there before submitting it and removes it once the NA admits
 it. `FileOutbox` keeps one JSON file per record in a directory, written to a
 temporary file, synced and renamed into place, in the format the TypeScript SDK
 uses. It reads the directory once and keeps it in memory, so one process uses a
-directory at a time, and recovers what a crash left on that first read. A
+directory at a time, and recovers what a crash left on that first read. Nothing
+enforces that: two processes sharing a directory submit each other's records
+and overwrite each other's changes, so give each process a directory of its
+own. A
 directory it creates is `0700` and its files `0600` on Unix; on Windows, or for
 a directory that already exists, restrict access to it yourself. Implement the
 `EvidenceOutbox` trait (its methods return boxed futures) to keep records in a
@@ -183,15 +186,19 @@ NA's acknowledgement when it admitted the record; otherwise `result.queued` is
 the outbox entry: `OutboxState::Pending` after a failure a later attempt can
 overcome (network, timeout, `5xx`, `429`, an executor key not registered yet, a
 chain gap, a disabled store, a proxy's error page), or `OutboxState::DeadLetter`
-after a refusal no retry can overcome (`PERMANENT_REFUSALS`), or when a record it
-chains from was refused (`evidence_predecessor_dead_lettered`), with the code in
-`last_error`. Dead letters are kept, never dropped. Without an outbox,
-`governed_action` behaves as in 1.1.
+after a refusal no retry can overcome (`PERMANENT_REFUSALS`; since 1.3.1 also
+`invalid_json`, the NA's strict reader refusing the request), with the code in
+`last_error`. A record that chains from a dead letter is still submitted
+(1.3.1), so the NA can quarantine it when it refuses it for good on its own
+account; refused for the gap the dead letter left, it is a dead letter with
+`evidence_predecessor_dead_lettered`. Dead letters are kept, never dropped.
+Without an outbox, `governed_action` behaves as in 1.1.
 
 `gm.evidence_store.flush_pending(FlushOptions::default())` submits pending
 records in the order they were added; run it at startup and on a timer, one run
 at a time (`FlushInProgress` otherwise). A record waits behind a pending
-predecessor. Retries back off from 5 s to 15 minutes;
+predecessor. Retries back off from 5 s to 15 minutes, and wait at least as
+long as the NA's `Retry-After` asks (1.3.1, at most 15 minutes);
 `FlushOptions { ignore_backoff: true }` retries at once. A transient error ends
 the run. A resource with pending records chains from the newest of them, not
 from the NA's head, and the next action on it submits them first (up to 100),
@@ -247,8 +254,13 @@ async fn start(url: &str) -> Result<GenesisMeshClient, Box<dyn std::error::Error
 `enqueue_record` keeps a record and submits it; a transient failure leaves it
 pending, and a refusal no retry can overcome (`RECORD_PERMANENT_REFUSALS`)
 keeps it as a dead letter. `flush_records` submits pending records in order,
-observations up to 100 per request (one at a time when the NA refuses a batch,
-or finds it too large). A record the NA admits outside its time
+observations up to 100 per request. A batch the NA refuses as a whole (one
+record its strict reader cannot read, `invalid_json`) or finds too large is
+split in halves until the record it refuses is tried alone (1.3.1). A batch it
+throttles (`429`) halves the batches the client sends after it, and its
+records wait as long as the NA's `Retry-After` asks, so a submission rate
+(`NA_RATE_LIMIT_OBSERVATIONS_PER_MINUTE`) below 100 a minute still drains the
+backlog. A record the NA admits outside its time
 bounds is kept by the NA as a quarantine entry and is listed in the run's
 `quarantined`. Implement the `RecordOutbox` trait to keep records elsewhere;
 `MemoryRecordOutbox` is for tests only.
