@@ -54,6 +54,17 @@ pub enum GenesisMeshError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// JSON every implementation would not read alike (v1.2.0): `reason` is
+    /// `invalid_json`, `duplicate_key`, `non_finite_number`,
+    /// `integer_out_of_range`, `negative_zero` or `lone_surrogate`.
+    #[error("JSON refused ({reason}): {detail}")]
+    StrictJson {
+        /// Why, as every implementation names it.
+        reason: String,
+        /// Where.
+        detail: String,
+    },
+
     /// Signing key decode or validation failure.
     #[error("signing key error: {0}")]
     SigningKey(String),
@@ -198,6 +209,7 @@ impl GenesisMeshError {
             | Self::BadRequest { code, .. }
             | Self::Http { code, .. } => code,
             Self::DecisionVerification(reason) => reason,
+            Self::StrictJson { reason, .. } => reason,
             Self::SecretMaterial(_) => "evidence_secret_material",
             Self::Verification(_) => "verification_failed",
             Self::ActionFailed { .. } => "governed_action_failed",

@@ -276,7 +276,7 @@ impl HttpTransport {
         let body = if bytes.is_empty() {
             json!({})
         } else {
-            serde_json::from_slice(&bytes)?
+            crate::strict_json::parse_strict_json_bytes(&bytes)?
         };
         Ok((status, body))
     }
@@ -346,6 +346,12 @@ impl HttpTransport {
         if bytes.is_empty() {
             Ok(serde_json::from_slice(b"{}")?)
         } else {
+            // v1.2.0: refuse JSON every implementation would not read alike.
+            let text = std::str::from_utf8(&bytes).map_err(|_| GenesisMeshError::StrictJson {
+                reason: "invalid_json".into(),
+                detail: "text that is not UTF-8".into(),
+            })?;
+            crate::strict_json::check_strict_json(text)?;
             Ok(serde_json::from_slice(&bytes)?)
         }
     }
