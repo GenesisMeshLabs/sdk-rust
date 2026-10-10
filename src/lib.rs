@@ -17,6 +17,7 @@ mod execution;
 mod governance;
 mod health;
 mod policy;
+pub mod strict;
 pub mod verify;
 
 pub use agreement::AgreementClient;

@@ -58,11 +58,13 @@ jobs:
           path: core
       - name: The signing vectors are the core's
         run: |
-          if [ -f core/conformance/vectors/admin_auth.json ]; then
-            cmp core/conformance/vectors/admin_auth.json tests/fixtures/admin_auth.json
-          else
-            echo "::notice::The core revision has no admin_auth vectors yet; skipped."
-          fi
+          for suite in admin_auth field_registry; do
+            if [ -f "core/conformance/vectors/$suite.json" ]; then
+              cmp "core/conformance/vectors/$suite.json" "tests/fixtures/$suite.json"
+            else
+              echo "::notice::The core revision has no $suite vectors yet; skipped."
+            fi
+          done
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # stable
         with:
           toolchain: stable

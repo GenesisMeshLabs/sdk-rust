@@ -12,6 +12,10 @@ use crate::{
 };
 
 /// Resource-chain fields (v0.59), omitted from the execution canonical form when absent.
+/// Decision fields omitted from the signed form when absent (checked against
+/// the field registry).
+pub const DECISION_OMITTED_WHEN_ABSENT: [&str; 2] = ["policy_binding", "attestation_binding"];
+
 pub const RESOURCE_CHAIN_FIELDS: [&str; 4] = [
     "resource_id",
     "resource_action",
@@ -39,7 +43,7 @@ pub fn decision_canonical(decision: &Value) -> Result<String> {
     canonical_json(&without(
         decision,
         &["signature"],
-        &["policy_binding", "attestation_binding"],
+        &DECISION_OMITTED_WHEN_ABSENT,
     ))
 }
 
