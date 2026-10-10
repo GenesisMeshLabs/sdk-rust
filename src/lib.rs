@@ -18,6 +18,7 @@ mod governance;
 mod health;
 mod policy;
 pub mod strict;
+mod strict_json;
 pub mod verify;
 
 pub use agreement::AgreementClient;
@@ -45,3 +46,4 @@ pub use governance::{
 pub use health::HealthClient;
 pub use policy::PolicyClient;
 pub use serde_json::{json, Value};
+pub use strict_json::{check_strict_json, parse_strict_json};

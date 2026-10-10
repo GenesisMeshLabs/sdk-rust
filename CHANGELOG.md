@@ -22,8 +22,33 @@
   new `EvidenceVerification::warnings` as `unsigned_field` and the record is
   verified without it. `EvidenceVerification` gains the `warnings` field.
 
+- **Records are valid only in their canonical form.** `verify_boundary_decision`
+  refuses a decision signed over a timestamp the reference does not write
+  (`+00:00` rather than `Z`, a fraction `.000`) as `non_canonical_form`.
+  Records the NA signs are always canonical.
+- **JSON is read strictly.** HTTP responses and `parse_export_lines` refuse
+  JSON every implementation would not read alike with the new
+  `GenesisMeshError::StrictJson` (`code()` is the reason): `duplicate_key`,
+  `non_finite_number` (`1e400`), `integer_out_of_range` (outside
+  `-2**63 .. 2**64 - 1`; `serde_json` read a larger integer as a float),
+  `negative_zero`, `lone_surrogate` or `invalid_json` (not JSON, a byte
+  order mark, text that is not UTF-8, or arrays and objects nested more than
+  64 deep). A malformed response is now `StrictJson` rather than `Json`.
+  The new variant is a breaking change for an exhaustive `match` on
+  `GenesisMeshError`; the enum becomes `#[non_exhaustive]` with the outbox
+  (*Changed (breaking)*), so later variants are not.
+- **A decision without `denial_reason` or `freshness_proof` is no longer
+  `payload_invalid`.** The NA signs both as `null`, so one received without
+  them fails as `invalid_signature`, as in every implementation.
+- `parse_export_lines` strips only JSON whitespace around a line (`trim`
+  also removed other Unicode spaces, which every other implementation
+  refuses).
+
 ### Added
 
+- `check_strict_json`, `parse_strict_json`, `strict::canonical_timestamp`
+  and `strict::non_canonical_timestamps`; the shared conformance suite
+  `canonical`, compared with the core's in CI.
 - `genesis_mesh_sdk::strict::{unknown_fields, is_known_entry_kind}` and
   `canonical::DECISION_OMITTED_WHEN_ABSENT`;
   `scripts/sync_canonical_registry.py` regenerates the embedded registry from

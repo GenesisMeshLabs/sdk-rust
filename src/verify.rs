@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::strict::{
-    is_known_entry_kind, prefixed_unknown_fields, unknown_fields, without_unknown_fields,
+    is_known_entry_kind, non_canonical_timestamps, prefixed_unknown_fields, unknown_fields,
+    without_unknown_fields,
 };
 use crate::{
     auth::verify_canonical,
@@ -116,7 +117,9 @@ validator!(
             ("context_id", string()),
             ("agreement_id", string()),
             ("authorized", boolean()),
-            ("denial_reason", nullable(string())),
+            // Absent is read as absent, so a decision whose signature covers a
+            // null fails at the signature, as in every implementation.
+            ("denial_reason", optional(nullable(string()))),
             (
                 "gate_results",
                 array(shape(
@@ -133,7 +136,7 @@ validator!(
             ("operator_sovereign_id", string()),
             (
                 "freshness_proof",
-                nullable(shape(
+                optional(nullable(shape(
                     vec![
                         ("proof_id", string()),
                         ("feed_sovereign_id", string()),
@@ -145,7 +148,7 @@ validator!(
                         ("signature", optional(signature())),
                     ],
                     false
-                ))
+                )))
             ),
             (
                 "policy_binding",
@@ -566,6 +569,10 @@ pub fn verify_boundary_decision(
     {
         return reject("unknown_field");
     }
+    // v1.2.0: a decision signed over a form the reference does not write.
+    if !non_canonical_timestamps("BoundaryDecision", decision).is_empty() {
+        return reject("non_canonical_form");
+    }
 
     let proof = decision.get("freshness_proof").filter(|p| !p.is_null());
     if let Some(proof) = proof {
@@ -866,8 +873,14 @@ fn check_payload_fields(
 /// Parse `gm.evidence.event` JSON Lines (blank lines ignored).
 pub fn parse_export_lines(text: &str) -> Result<Vec<Value>> {
     let mut events = Vec::new();
-    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let event: Value = serde_json::from_str(line)?;
+    // JSON whitespace only, as every implementation (`trim` also removes other spaces).
+    let json_space = |c: char| matches!(c, ' ' | '\t' | '\r' | '\n');
+    for line in text
+        .lines()
+        .map(|l| l.trim_matches(json_space))
+        .filter(|l| !l.is_empty())
+    {
+        let event = crate::strict_json::parse_strict_json(line)?;
         if !valid_event(Some(&event)) {
             return Err(GenesisMeshError::Verification(
                 "invalid evidence event envelope or unsupported schema".into(),
