@@ -22,8 +22,11 @@ them into `CHANGELOG.md` and removes them:
 
 ```bash
 python scripts/changelog.py preview 1.3.0
-python scripts/changelog.py release 1.3.0 --heading "## [1.3.0] - 2026-10-11"
+python scripts/changelog.py release 1.3.0 --heading "## 1.3.0 - 2026-10-11"
 ```
+
+This crate's headings are `## X.Y.Z - YYYY-MM-DD`, without brackets;
+`scripts/check_release.py` requires that form for the version released.
 
 CI (`Changelog fragments`) checks every fragment and refuses lines a
 pull request other than a release adds to `CHANGELOG.md`, so a feature

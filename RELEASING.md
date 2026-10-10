@@ -9,8 +9,11 @@
 4. Confirm repository visibility, license, private vulnerability reporting,
    crate ownership, and package name availability in the publishing account.
 5. Run `cargo publish --dry-run --locked` from the clean release commit.
-6. Publish only after release approval: `cargo publish --locked`. Tag that exact
-   commit as `v<VERSION>` and publish release notes. The tag CI checks its version.
+6. Publish only after release approval, and only once the Genesis Mesh core
+   release `v<VERSION>` is tagged: `python scripts/check_release.py --publish`
+   checks the tag, then `cargo publish --locked`. Tag that exact commit as
+   `v<VERSION>`. The tag CI checks its version and the core tag, runs the crate
+   against that core release, and only then creates the GitHub release.
 7. Verify the registry artifact and docs.rs build, then update installation
    instructions with the published version. Test installation in a fresh project.
 
