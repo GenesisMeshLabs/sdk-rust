@@ -275,6 +275,132 @@ route_test!(
     false
 );
 
+/// v1.3.0 routes: the call, then the request it must send.
+macro_rules! out_of_band_route_test {
+    ($name:ident, |$client:ident| $call:expr, $method:literal, $route:literal, $body:expr, $admin:literal) => {
+        #[tokio::test]
+        async fn $name() {
+            let response =
+                r#"{"results":[{"index":0,"status":"recorded"}],"holders":[{"key_id":"k"}]}"#;
+            let (url, request) = server(200, response, "", Duration::ZERO).await;
+            let $client = GenesisMeshClient::new(signed_options(&url)).unwrap();
+            $call.await.unwrap();
+            verify_request(&request.await.unwrap(), $method, $route, $body, $admin);
+        }
+    };
+}
+
+out_of_band_route_test!(
+    submit_observation,
+    |c| c
+        .evidence_store
+        .submit_observation(json!({"observation_id": "o"})),
+    "POST",
+    "/evidence/observations",
+    json!({"observation": {"observation_id": "o"}}),
+    false
+);
+out_of_band_route_test!(
+    submit_break_glass,
+    |c| c
+        .evidence_store
+        .submit_break_glass(json!({"break_glass_id": "b"})),
+    "POST",
+    "/evidence/break-glass",
+    json!({"record": {"break_glass_id": "b"}}),
+    false
+);
+out_of_band_route_test!(
+    judge_observation,
+    |c| c.evidence_store.judge_observation("a/b"),
+    "POST",
+    "/admin/evidence/observations/a%2Fb/judge",
+    json!({}),
+    true
+);
+out_of_band_route_test!(
+    judge_break_glass,
+    |c| c.evidence_store.judge_break_glass("a/b"),
+    "POST",
+    "/admin/evidence/break-glass/a%2Fb/judge",
+    json!({}),
+    true
+);
+out_of_band_route_test!(
+    resource_changes,
+    |c| c.evidence_store.resource_changes("kv:vault/name #"),
+    "GET",
+    "/admin/evidence/changes/kv%3Avault/name%20%23",
+    Value::Null,
+    true
+);
+out_of_band_route_test!(
+    propose_holder,
+    |c| c.evidence_store.propose_holder("a/b", "team-b"),
+    "POST",
+    "/admin/operator-keys/a%2Fb/holder",
+    json!({"holder": "team-b"}),
+    true
+);
+out_of_band_route_test!(
+    approve_holder,
+    |c| c.evidence_store.approve_holder("p/1"),
+    "POST",
+    "/admin/operator-keys/holder-changes/p%2F1/approve",
+    json!({}),
+    true
+);
+
+#[tokio::test]
+async fn submit_observations_returns_one_result_per_observation() {
+    let response = r#"{"results":[{"index":0,"status":"recorded"}]}"#;
+    let (url, request) = server(200, response, "", Duration::ZERO).await;
+    let client = GenesisMeshClient::new(signed_options(&url)).unwrap();
+    let results = client
+        .evidence_store
+        .submit_observations(&[json!({"observation_id": "o"})])
+        .await
+        .unwrap();
+    assert_eq!(results, vec![json!({"index": 0, "status": "recorded"})]);
+    verify_request(
+        &request.await.unwrap(),
+        "POST",
+        "/evidence/observations/batch",
+        json!({"observations": [{"observation_id": "o"}]}),
+        false,
+    );
+}
+
+#[tokio::test]
+async fn operator_holders_returns_the_holders() {
+    let (url, request) = server(200, r#"{"holders":[{"key_id":"k"}]}"#, "", Duration::ZERO).await;
+    let client = GenesisMeshClient::new(signed_options(&url)).unwrap();
+    let holders = client.evidence_store.operator_holders().await.unwrap();
+    assert_eq!(holders, vec![json!({"key_id": "k"})]);
+    verify_request(
+        &request.await.unwrap(),
+        "GET",
+        "/admin/evidence/operator-holders",
+        Value::Null,
+        true,
+    );
+}
+
+#[tokio::test]
+async fn out_of_band_routes_refuse_dot_segments_before_sending() {
+    let client = GenesisMeshClient::new(signed_options("http://127.0.0.1:9")).unwrap();
+    let store = &client.evidence_store;
+    for err in [
+        store.judge_observation("..").await.unwrap_err(),
+        store.judge_break_glass("").await.unwrap_err(),
+        store.resource_changes("kv:v/../admin").await.unwrap_err(),
+        store.propose_holder(".", "h").await.unwrap_err(),
+        store.approve_holder("..").await.unwrap_err(),
+    ] {
+        assert!(matches!(err, GenesisMeshError::Configuration(_)), "{err}");
+    }
+}
+
 #[tokio::test]
 async fn evidence_build_wraps_decision() {
     let (url, request) = server(201, "{}", "", Duration::ZERO).await;

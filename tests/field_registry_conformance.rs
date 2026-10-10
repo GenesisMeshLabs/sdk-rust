@@ -4,7 +4,10 @@
 //! every verifier refuses.
 
 use chrono::{DateTime, Utc};
-use genesis_mesh_sdk::canonical::{DECISION_OMITTED_WHEN_ABSENT, RESOURCE_CHAIN_FIELDS};
+use genesis_mesh_sdk::canonical::{
+    CHECKPOINT_OMITTED_WHEN_ABSENT, DECISION_OMITTED_WHEN_ABSENT, ENVELOPE_OMITTED_WHEN_ABSENT,
+    RESOURCE_CHAIN_FIELDS,
+};
 use genesis_mesh_sdk::strict::{
     embedded_registry, is_known_entry_kind, registry_list, unknown_fields,
 };
@@ -55,6 +58,15 @@ fn keeps_this_crates_canonical_rules_equal_to_the_registrys() {
         DECISION_OMITTED_WHEN_ABSENT.to_vec(),
         registry_list("BoundaryDecision", "omit_when_none")
     );
+    // v1.3.0: envelope and checkpoint fields left out when absent.
+    assert_eq!(
+        ENVELOPE_OMITTED_WHEN_ABSENT.to_vec(),
+        registry_list("EvidenceStoreEntry", "omit_when_none")
+    );
+    assert_eq!(
+        CHECKPOINT_OMITTED_WHEN_ABSENT.to_vec(),
+        registry_list("RetentionCheckpoint", "omit_when_none")
+    );
 }
 
 #[test]
@@ -85,7 +97,12 @@ fn every_vector_gives_the_reference_outcome() {
             "verify_agreement" => continue,
             "export" => {
                 let events = parse_export_lines(input["lines"].as_str().unwrap()).unwrap();
-                let result = verify_evidence_events(events.iter(), &no_keys());
+                // v1.3.0: a vector may name the NA keys its records are signed by.
+                let options = VerifyEvidenceOptions {
+                    na_public_keys: input.get("na_public_keys").map(strings).unwrap_or_default(),
+                    ..no_keys()
+                };
+                let result = verify_evidence_events(events.iter(), &options);
                 let failures: Vec<Value> = result
                     .failures
                     .iter()

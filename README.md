@@ -91,7 +91,7 @@ can also be verified locally (see [Governed actions](#governed-actions)).
 | `disclosure` | `commit`, `nullifier` | `prove`, `verify` |
 | `evidence` | `build` | `verify` |
 | `policy` | `validate`, `publish`, `list`, `active`, `history`, `activate`, `deactivate` | `verify` |
-| `evidence_store` | `search`, `search_all`, `status`, `verify`, `resource_history`, `vendor_history`, `resource_head`, `export_text`, `export`, `export_all`, `list_executor_keys`, `register_executor_key`, `retire_executor_key`, `apply_retention`, `latest_checkpoint` | `submit` (executor-signed) |
+| `evidence_store` | `search`, `search_all`, `status`, `verify`, `resource_history`, `vendor_history`, `resource_head`, `export_text`, `export`, `export_all`, `list_executor_keys`, `register_executor_key`, `retire_executor_key`, `apply_retention`, `latest_checkpoint`, `judge_observation`, `judge_break_glass`, `resource_changes`, `operator_holders`, `propose_holder`, `approve_holder` | `submit` (executor-signed), `submit_observation`, `submit_observations` (observer-signed), `submit_break_glass` (executor-signed) |
 | `health` | | `liveness`, `readiness`, `health` |
 
 `evidence.build(decision)` wraps its argument as `{"decision": decision}`.
@@ -203,6 +203,176 @@ outbox failed; it carries the signed `evidence` when there is one. Both carry
 the action's value: `err.take_action_value::<T>()`. A failed action's
 `ActionFailed` carries its failure record and, with an outbox, its entry.
 
+## Changes outside the controlled path
+
+From Genesis Mesh 1.3.0 the Network Authority (NA) records changes that did
+not go through `governed_action`, and judges each one once, as of the time it
+happened:
+
+- an **observation**: a change an observer saw at its source (a cloud
+  activity log entry, or a reconciliation finding), signed by an observer key;
+- a **break-glass record**: a change a controller made while the NA could not
+  be reached, with its caller's justification, signed by the executor key.
+
+The NA must run with `EVIDENCE_STORE=on` and `EVIDENCE_OUT_OF_BAND=on`. Until
+then the routes answer `404 out_of_band_disabled`, and records in the record
+outbox wait. The operator's side is described in *Changes Outside the
+Controlled Path* in the NA runbooks.
+
+### Record outbox
+
+Observations and break-glass records are kept in a record outbox until the NA
+admits them, as `FileOutbox` keeps execution records. Give it a directory of
+its own (`FileRecordOutbox`, format `gm.evidence.record-outbox.v1`, shared with
+the TypeScript SDK):
+
+```no_run
+use std::sync::Arc;
+use genesis_mesh_sdk::{ClientOptions, FileRecordOutbox, FlushOptions, GenesisMeshClient};
+
+async fn start(url: &str) -> Result<GenesisMeshClient, Box<dyn std::error::Error>> {
+    let records = Arc::new(FileRecordOutbox::new("/var/lib/controller/gm-records"));
+    let gm = GenesisMeshClient::new(ClientOptions::new(url).with_record_outbox(records))?;
+    // At startup and on a timer.
+    gm.evidence_store.flush_records(FlushOptions::default()).await?;
+    Ok(gm)
+}
+```
+
+`enqueue_record` keeps a record and submits it; a transient failure leaves it
+pending, and a refusal no retry can overcome (`RECORD_PERMANENT_REFUSALS`)
+keeps it as a dead letter. `flush_records` submits pending records in order,
+observations up to 100 per request (one at a time when the NA refuses a batch,
+or finds it too large). A record the NA admits outside its time
+bounds is kept by the NA as a quarantine entry and is listed in the run's
+`quarantined`. Implement the `RecordOutbox` trait to keep records elsewhere;
+`MemoryRecordOutbox` is for tests only.
+
+### Observers
+
+Register the observer's key with `"role": "observer"`, scoped to the
+resources it watches (privileged operator key), then sign each change it sees
+with an `ObservationRecorder` holding that key:
+
+```no_run
+use genesis_mesh_sdk::{json, GenesisMeshClient, ObservationInput, ObservationRecorder};
+
+async fn observe(gm: &GenesisMeshClient, observer_public_key: &str, observer_seed: &str)
+    -> Result<(), Box<dyn std::error::Error>> {
+    gm.evidence_store.register_executor_key(json!({
+        "key_id": "activity-log-observer", "public_key": observer_public_key,
+        "executor_sovereign_id": "cloud-observer", "role": "observer", "resource_prefix": "kv:prod/",
+    })).await?;
+    let observer = ObservationRecorder::new("cloud-observer", "activity-log-observer", observer_seed)?;
+    let observation = observer.record(ObservationInput {
+        resource_id: "kv:prod/api-key".into(),
+        action: "rotate".into(),
+        capability: "secret.rotate".into(),
+        changed_at: Some(chrono::Utc::now()),
+        source: "cloud-activity-log".into(),
+        source_event_id: "event-7".into(),
+        actor: Some("principal-7f3a".into()),
+        version_id: Some("v8".into()),
+        metadata: Some(json!({"lifetime_days": 30})),
+        ..ObservationInput::default()
+    })?;
+    gm.evidence_store.enqueue_record(observation).await?;
+    Ok(())
+}
+```
+
+`actor` is recorded as the source reported it and is not authenticated: use a
+pseudonymous identifier, never a credential. `metadata` passes the secret
+guard (`observation_secret_material`): names, versions and times, never
+values. Name the version (`version_id`) when the source reports one: the NA
+matches the observation to execution evidence for the same resource, action
+and capability that reports the same `execution_parameters.version_id`, and
+the change is then governed by that evidence's decision, unless the
+observer's own facts are denied by the policies active then. A second
+observer's report of the same version is the same change. A reconciliation
+finding knows only that a resource
+changed between two scans: `observation_from_finding` turns one (the JSON the
+other SDKs' reconciliation returns) into an observation input with that
+window, which the NA judges at both ends, and returns `None` for a resource in
+sync.
+
+### Break-glass
+
+`governed_action_with_break_glass` runs the action even when the evaluation
+fails transiently (network error, timeout, `5xx`, `429`; see
+`evaluation_failure`), and keeps a break-glass record signed by the executor
+key in the record outbox. The action then gets no decision (`None`), and the
+outcome is `GovernedActionOutcome::BrokeGlass`:
+
+```no_run
+use genesis_mesh_sdk::{
+    governed_action_with_break_glass, ActionError, ActionReport, BreakGlassOptions,
+    ExecutionRecorder, GenesisMeshClient, GovernedActionOutcome, GovernedActionParams,
+};
+
+async fn rotate(gm: &GenesisMeshClient, recorder: &ExecutionRecorder, params: GovernedActionParams)
+    -> Result<(), Box<dyn std::error::Error>> {
+    let justification = BreakGlassOptions::new("incident 42: rotate the leaked key now");
+    let outcome = governed_action_with_break_glass(
+        &gm.boundary, &gm.evidence_store, recorder, params, justification,
+        |_decision| async move { Ok::<_, ActionError>(ActionReport::<()>::default()) },
+    ).await?;
+    if let GovernedActionOutcome::BrokeGlass(result) = outcome {
+        eprintln!("ran without a decision ({}); recorded as {}",
+                  result.failure.as_str(), result.record["break_glass_id"]);
+    }
+    Ok(())
+}
+```
+
+A DENY never breaks the glass, nor does a decision that fails verification,
+the NA throttling failed operator signatures (`429 admin_auth_throttled`), an
+evaluation it could not store (`503 evidence_store_unavailable`), an answer
+whose body could not be read (`ResponseBodyUnreadable`: the NA may have
+decided, even denied), or any other error. It needs a record outbox
+(`RecordOutboxRequired`), `resource_id` and an attestation-based evaluation
+(`attestation_id`: an agreement-based one cannot be judged after the fact)
+naming its `requested_capability`. Before anything is evaluated or run it
+checks the justification (1 to 1024 characters), that the context's
+`request_parameters` and `attributes` are objects that, with the
+justification, leave room for the record, and the context and justification
+against the secret guard (`OutOfBandRecord` with `break_glass_malformed` or
+`break_glass_secret_material`). A failed action is recorded as a `failure`
+record (`ActionFailed`, whose `queued_record` holds its entry while the NA is
+away). Once the action ran a record is always kept: an outcome detail is cut
+to 1024 characters, and reported metadata the guard refuses is left out of the
+record and named in `dropped` (the whole report, when the rest is still
+refused). `ExecutionRecorder::sign_break_glass` signs a record directly.
+`governed_action` itself never breaks the glass. Every use shows in the
+resource's changes, with its justification; a policy can forbid it for a
+capability (a `denylist.v1` gate on `parent_kind` with the value
+`break_glass`).
+
+### Judgements and the state of a resource
+
+The NA judges each record at admission unless that is turned off; the
+operator judges the rest with `judge_observation` and `judge_break_glass`.
+`resource_changes` lists every change to a resource, with how it was governed
+(`prior_decision` or `after_the_fact`) and its state (`recorded`, `matched`,
+`judged_allowed`, `judged_denied`, `indeterminate`, `observed`,
+`quarantined`). A judgement has no `authorized` field: it is never an
+approval, and `verify_evidence_events` refuses execution evidence that cites
+one (`evidence_cites_judgement`). `operator_holders`, `propose_holder` and
+`approve_holder` record which holder each operator key belongs to.
+
+`verify::verify_evidence_events` verifies the new entry kinds offline:
+observations under observer keys and break-glass records under executor keys
+(`list_executor_keys` returns each key's `role`; an execution record signed by
+an observer key does not verify); judgements, quarantine and registry entries
+under the NA keys; each resource's observation positions
+(`observation_chain_break`), one judgement per record (`duplicate_judgement`)
+that names it as stored (`judgement_subject_mismatch`,
+`judgement_subject_missing`), and execution evidence matched once
+(`match_reused`). The result counts them in `observations`, `break_glass`,
+`judgements` and `quarantined`. `canonical::out_of_band_canonical`,
+`canonical::out_of_band_digest` and `verify::verify_out_of_band_record` give
+one record's signed form and check its signature.
+
 ## Transport and errors
 
 Construct one client and clone it for concurrent work. Clones and sub-clients share
@@ -220,7 +390,9 @@ the connection pool and parsed signing key. No runtime is created by the SDK.
 - `GenesisMeshError` distinguishes configuration, missing/invalid signing keys,
   transport, JSON, and HTTP failures. HTTP 400, 401, 404, 422, and 429 map to
   `BadRequest`, `Unauthorized`, `NotFound`, `Validation`, and `RateLimit`.
-  Other statuses retain their numeric code in `Http`.
+  Other statuses retain their numeric code in `Http`. A response whose body
+  could not be read is `ResponseBodyUnreadable` (`response_body_unreadable`),
+  not `Network`: the request reached the NA.
 - Non-JSON error responses preserve the HTTP status and response text. Empty
   successful responses deserialize from `{}`; malformed success JSON is an error.
 

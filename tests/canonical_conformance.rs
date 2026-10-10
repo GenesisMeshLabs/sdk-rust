@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use genesis_mesh_sdk::{
     canonical_json, parse_strict_json,
-    strict::{canonical_timestamp, non_canonical_timestamps},
+    strict::{canonical_timestamp, non_canonical_fields, non_canonical_timestamps},
     verify::{parse_export_lines, verify_boundary_decision, VerifyDecisionOptions},
     GenesisMeshError,
 };
@@ -69,6 +69,48 @@ fn names_timestamp_paths_at_any_depth() {
     assert_eq!(
         non_canonical_timestamps("AgreementRecord", &agreement["input"]["agreement"]),
         ["agreed_terms.valid_from"]
+    );
+}
+
+#[test]
+fn names_fields_the_reference_always_writes_when_left_out() {
+    let suite = suite();
+    let decision = |id: &str| {
+        suite["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == id)
+            .unwrap()["input"]["decision"]
+            .clone()
+    };
+    assert_eq!(
+        non_canonical_fields(
+            "BoundaryDecision",
+            &decision("verify-decision-signed-without-a-field")
+        ),
+        ["denial_reason"]
+    );
+    let mut written = decision("verify-decision-canonical");
+    assert!(non_canonical_fields("BoundaryDecision", &written).is_empty());
+    // A field the reference leaves out when absent reads the same as null.
+    written["policy_binding"] = Value::Null;
+    written
+        .as_object_mut()
+        .unwrap()
+        .remove("attestation_binding");
+    assert!(non_canonical_fields("BoundaryDecision", &written).is_empty());
+    // Any depth; the signature is outside the signed projection.
+    written["gate_results"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("detail");
+    for key in ["freshness_proof", "signature"] {
+        written.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(
+        non_canonical_fields("BoundaryDecision", &written),
+        ["freshness_proof", "gate_results.0.detail"]
     );
 }
 

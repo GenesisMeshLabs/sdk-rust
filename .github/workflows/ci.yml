@@ -46,9 +46,15 @@ jobs:
       - name: Choose the core revision
         env:
           BRANCH: ${{ github.head_ref || github.ref_name }}
+        # A release tag is tested against the core release of the same version
+        # (the core leads the train), never core main, which may already be ahead.
         run: |
           ref=main
-          if git ls-remote --exit-code --heads https://github.com/GenesisMeshLabs/genesismesh.git "refs/heads/$BRANCH" > /dev/null; then ref="$BRANCH"; fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            ref="$GITHUB_REF_NAME"
+          elif git ls-remote --exit-code --heads https://github.com/GenesisMeshLabs/genesismesh.git "refs/heads/$BRANCH" > /dev/null; then
+            ref="$BRANCH"
+          fi
           echo "Testing with core revision: $ref"
           echo "CORE_REF=$ref" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,7 +64,7 @@ jobs:
           path: core
       - name: The signing vectors are the core's
         run: |
-          for suite in admin_auth field_registry canonical; do
+          for suite in admin_auth field_registry canonical out_of_band; do
             if [ -f "core/conformance/vectors/$suite.json" ]; then
               cmp "core/conformance/vectors/$suite.json" "tests/fixtures/$suite.json"
             else
@@ -153,3 +159,19 @@ jobs:
           awk -v v="$version" '/^## /{ if (p) exit; if (index($0, "[" v "]") || index($0, "## " v " ")) p = 1; next } p' CHANGELOG.md > release-notes.md
           [ -s release-notes.md ] || echo "Coordinated Genesis Mesh $tag release." > release-notes.md
           gh release create "$tag" --title "$tag" --notes-file release-notes.md --verify-tag
+
+  changelog:
+    name: Changelog fragments
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # Pull requests add changelog.d/<version>/<name>.md; only a release PR
+      # (branch release/...) folds them into CHANGELOG.md, so a feature PR for
+      # the next version never conflicts with the release of this one.
+      - name: Pull requests add fragments; only a release edits CHANGELOG.md
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: python3 scripts/changelog.py check ${BASE_REF:+--base origin/$BASE_REF} --branch "$HEAD_REF"

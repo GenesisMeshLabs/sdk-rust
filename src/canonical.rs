@@ -102,14 +102,60 @@ pub fn freshness_proof_canonical(proof: &Value) -> Result<String> {
     canonical_json(&without(proof, &["signature"], &[]))
 }
 
+/// Checkpoint fields omitted from the signed form when absent (v1.3.0;
+/// checked against the field registry).
+pub const CHECKPOINT_OMITTED_WHEN_ABSENT: [&str; 1] = ["observation_heads"];
+
 /// `RetentionCheckpoint.to_canonical_json()`.
 pub fn checkpoint_canonical(checkpoint: &Value) -> Result<String> {
-    canonical_json(&without(checkpoint, &["signature"], &[]))
+    canonical_json(&without(
+        checkpoint,
+        &["signature"],
+        &CHECKPOINT_OMITTED_WHEN_ABSENT,
+    ))
 }
+
+/// Envelope fields left out of the entry digest when absent (v1.3.0; checked
+/// against the field registry), so 1.2 digests hold. A `null` reads as absent.
+pub const ENVELOPE_OMITTED_WHEN_ABSENT: [&str; 4] = [
+    "record_id",
+    "subject_id",
+    "matched_evidence_id",
+    "observation_sequence",
+];
 
 /// `EvidenceStoreEntry.digest()`: every envelope field.
 pub fn entry_digest(entry: &Value) -> Result<String> {
-    canonical_digest(entry)
+    canonical_digest(&without(entry, &[], &ENVELOPE_OMITTED_WHEN_ABSENT))
+}
+
+/// A Stage 2 record's signed fields (v1.3.0): every field but `signature`,
+/// with top-level fields that are absent or `null` left out. Nested values
+/// keep their form.
+fn out_of_band_fields(record: &Value) -> Value {
+    let Some(object) = record.as_object() else {
+        return record.clone();
+    };
+    Value::Object(
+        object
+            .iter()
+            .filter(|(key, value)| *key != "signature" && !value.is_null())
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+/// The signed form of a record of a change made outside the controlled path
+/// (v1.3.0): an observation, break-glass, judgement, quarantine or registry
+/// record. Every field but `signature`; an absent optional field is left
+/// out, never `null`. Frozen from 1.3.0 on (`_SignedRecord.to_canonical_json()`).
+pub fn out_of_band_canonical(record: &Value) -> Result<String> {
+    canonical_json(&out_of_band_fields(record))
+}
+
+/// SHA-256 of [`out_of_band_canonical`] (`_SignedRecord.digest()`).
+pub fn out_of_band_digest(record: &Value) -> Result<String> {
+    canonical_digest(&out_of_band_fields(record))
 }
 
 /// SHA-256 of a stored payload's canonical JSON.
@@ -200,6 +246,27 @@ mod tests {
         ] {
             assert!(parse_timestamp(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn omits_new_envelope_and_record_fields_only_when_absent() {
+        let entry = json!({"store_sequence": 1, "record_id": null, "resource_id": null});
+        assert_eq!(
+            entry_digest(&entry).unwrap(),
+            canonical_digest(&json!({"store_sequence": 1, "resource_id": null})).unwrap()
+        );
+        let checkpoint = json!({"a": 1, "observation_heads": null, "signature": null});
+        assert_eq!(checkpoint_canonical(&checkpoint).unwrap(), r#"{"a":1}"#);
+        let heads = json!({"a": 1, "observation_heads": {}});
+        assert_eq!(
+            checkpoint_canonical(&heads).unwrap(),
+            r#"{"a":1,"observation_heads":{}}"#
+        );
+        let record = json!({"b": null, "nested": {"x": null}, "signature": {"sig": "s"}});
+        assert_eq!(
+            out_of_band_canonical(&record).unwrap(),
+            r#"{"nested":{"x":null}}"#
+        );
     }
 
     #[test]

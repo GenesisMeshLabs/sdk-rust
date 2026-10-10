@@ -7,7 +7,7 @@
 //! No network access; every key is supplied by the caller.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::OnceLock,
 };
 
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::strict::{
-    is_known_entry_kind, non_canonical_timestamps, prefixed_unknown_fields, unknown_fields,
+    is_known_entry_kind, non_canonical_fields, prefixed_unknown_fields, unknown_fields,
     without_unknown_fields,
 };
 use crate::{
@@ -24,8 +24,8 @@ use crate::{
     canonical::{
         attestation_digest, checkpoint_canonical, decision_canonical, entry_digest,
         execution_canonical, execution_digest, freshness_proof_canonical, justification_canonical,
-        micros, parse_timestamp, payload_digest, policy_canonical, policy_digest,
-        policy_set_digest,
+        micros, out_of_band_canonical, parse_timestamp, payload_digest, policy_canonical,
+        policy_digest, policy_set_digest,
     },
     errors::{GenesisMeshError, Result},
     evidence_store::ResourceHead,
@@ -99,6 +99,99 @@ fn shape(fields: Vec<(&'static str, Check)>, exact: bool) -> Check {
 fn signature() -> Check {
     nullable(shape(vec![("key_id", string()), ("sig", string())], false))
 }
+/// Absent, `null` (read as absent) or valid.
+fn absent(check: Check) -> Check {
+    optional(nullable(check))
+}
+/// A string of `min..=max` characters.
+fn bounded(max: usize, min: usize) -> Check {
+    Box::new(move |v| {
+        v.and_then(Value::as_str)
+            .is_some_and(|s| (min..=max).contains(&s.chars().count()))
+    })
+}
+fn sha256() -> Check {
+    bounded(64, 64)
+}
+fn action() -> Check {
+    one_of(&["create", "rotate", "revoke", "update", "delete"])
+}
+fn verdict() -> Check {
+    one_of(&["allow", "deny", "indeterminate"])
+}
+/// v1.3.0 records' timestamps are UTC, as the reference requires.
+fn utc_timestamp() -> Check {
+    Box::new(|v| {
+        v.and_then(Value::as_str).is_some_and(|s| {
+            parse_timestamp(s).is_ok()
+                && (s.ends_with('Z') || s.ends_with("+00:00") || s.ends_with("-00:00"))
+        })
+    })
+}
+/// A field the reference fills when absent: left out, the record is not in
+/// the form the reference writes (`non_canonical_form`), not malformed.
+fn filled(check: Check) -> Check {
+    optional(check)
+}
+fn gate_result() -> Check {
+    shape(
+        vec![
+            ("gate_name", string()),
+            ("passed", boolean()),
+            ("detail", string()),
+        ],
+        false,
+    )
+}
+fn policy_binding() -> Check {
+    shape(
+        vec![
+            (
+                "policies",
+                array(shape(
+                    vec![
+                        ("policy_id", string()),
+                        ("version", positive()),
+                        ("policy_digest", string()),
+                        ("signed_by", string()),
+                    ],
+                    false,
+                )),
+            ),
+            ("policy_set_digest", string()),
+            (
+                "gate_evaluations",
+                array(shape(
+                    vec![
+                        ("policy_id", string()),
+                        ("policy_version", positive()),
+                        ("gate_id", string()),
+                        ("gate_type", string()),
+                        ("order", nonnegative()),
+                        ("mode", one_of(&["observe", "enforce"])),
+                        ("passed", boolean()),
+                        (
+                            "outcome",
+                            one_of(&[
+                                "pass",
+                                "fail",
+                                "missing_context",
+                                "invalid_context",
+                                "gate_error",
+                            ]),
+                        ),
+                    ],
+                    false,
+                )),
+            ),
+            ("context_digest", string()),
+            ("registry_gate_types", array(string())),
+            ("resolution_status", one_of(&["resolved", "failed"])),
+            ("resolution_failure", nullable(string())),
+        ],
+        false,
+    )
+}
 
 macro_rules! validator {
     ($name:ident, $build:expr) => {
@@ -120,17 +213,7 @@ validator!(
             // Absent is read as absent, so a decision whose signature covers a
             // null fails at the signature, as in every implementation.
             ("denial_reason", optional(nullable(string()))),
-            (
-                "gate_results",
-                array(shape(
-                    vec![
-                        ("gate_name", string()),
-                        ("passed", boolean()),
-                        ("detail", string())
-                    ],
-                    false
-                ))
-            ),
+            ("gate_results", array(gate_result())),
             ("decision_made_at", timestamp()),
             ("decision_valid_until", timestamp()),
             ("operator_sovereign_id", string()),
@@ -150,56 +233,7 @@ validator!(
                     false
                 )))
             ),
-            (
-                "policy_binding",
-                optional(nullable(shape(
-                    vec![
-                        (
-                            "policies",
-                            array(shape(
-                                vec![
-                                    ("policy_id", string()),
-                                    ("version", positive()),
-                                    ("policy_digest", string()),
-                                    ("signed_by", string()),
-                                ],
-                                false
-                            ))
-                        ),
-                        ("policy_set_digest", string()),
-                        (
-                            "gate_evaluations",
-                            array(shape(
-                                vec![
-                                    ("policy_id", string()),
-                                    ("policy_version", positive()),
-                                    ("gate_id", string()),
-                                    ("gate_type", string()),
-                                    ("order", nonnegative()),
-                                    ("mode", one_of(&["observe", "enforce"])),
-                                    ("passed", boolean()),
-                                    (
-                                        "outcome",
-                                        one_of(&[
-                                            "pass",
-                                            "fail",
-                                            "missing_context",
-                                            "invalid_context",
-                                            "gate_error"
-                                        ])
-                                    ),
-                                ],
-                                false
-                            ))
-                        ),
-                        ("context_digest", string()),
-                        ("registry_gate_types", array(string())),
-                        ("resolution_status", one_of(&["resolved", "failed"])),
-                        ("resolution_failure", nullable(string())),
-                    ],
-                    false
-                )))
-            ),
+            ("policy_binding", optional(nullable(policy_binding()))),
             (
                 "attestation_binding",
                 optional(nullable(shape(
@@ -342,6 +376,179 @@ validator!(
                     true
                 ))
             ),
+            // v1.3.0, left out when absent.
+            ("observation_heads", absent(dictionary(nonnegative()))),
+        ],
+        false
+    )
+);
+
+// v1.3.0: records of changes made outside the controlled path. An absent
+// optional field is left out of the signed form; a null reads as absent.
+
+/// Exactly one change time: `changed_at`, or both bounds of a window in order.
+fn change_time(record: &Value) -> bool {
+    let at = |key: &str| {
+        record
+            .get(key)
+            .filter(|v| !v.is_null())
+            .and_then(Value::as_str)
+    };
+    match (
+        at("changed_at"),
+        at("changed_not_before"),
+        at("changed_not_after"),
+    ) {
+        (Some(_), None, None) => true,
+        (None, Some(from), Some(until)) => {
+            matches!((micros(from), micros(until)), (Ok(from), Ok(until)) if from <= until)
+        }
+        _ => false,
+    }
+}
+
+validator!(valid_observation, {
+    let fields = shape(
+        vec![
+            ("observation_id", bounded(128, 1)),
+            ("observer_sovereign_id", bounded(256, 1)),
+            ("resource_id", bounded(256, 1)),
+            ("action", action()),
+            ("capability", bounded(256, 1)),
+            ("changed_at", absent(utc_timestamp())),
+            ("changed_not_before", absent(utc_timestamp())),
+            ("changed_not_after", absent(utc_timestamp())),
+            ("observed_at", utc_timestamp()),
+            ("actor", absent(bounded(256, 1))),
+            ("source", bounded(128, 1)),
+            ("source_event_id", bounded(256, 1)),
+            ("version_id", absent(bounded(256, 1))),
+            ("metadata", filled(object())),
+            ("signature", optional(signature())),
+        ],
+        false,
+    );
+    Box::new(move |v| fields(v) && v.is_some_and(change_time))
+});
+
+validator!(
+    valid_break_glass,
+    shape(
+        vec![
+            ("break_glass_id", bounded(128, 1)),
+            ("executor_sovereign_id", bounded(256, 1)),
+            ("resource_id", bounded(256, 1)),
+            ("resource_action", action()),
+            ("capability", bounded(256, 1)),
+            ("attestation_id", absent(bounded(128, 1))),
+            ("request_parameters", filled(object())),
+            ("attributes", filled(object())),
+            ("justification", bounded(1024, 1)),
+            ("evaluation_request_digest", sha256()),
+            (
+                "evaluation_failure",
+                one_of(&["network_error", "timeout", "server_error", "rate_limited"])
+            ),
+            ("executed_at", utc_timestamp()),
+            ("outcome", string()),
+            ("outcome_detail", absent(bounded(1024, 0))),
+            ("execution_parameters", filled(object())),
+            ("signature", optional(signature())),
+        ],
+        false
+    )
+);
+
+validator!(
+    valid_judgement,
+    shape(
+        vec![
+            ("judgement_id", bounded(128, 1)),
+            ("subject_kind", one_of(&["observation", "break_glass"])),
+            ("subject_id", bounded(128, 1)),
+            ("subject_digest", sha256()),
+            ("subject_store_sequence", positive()),
+            ("resource_id", bounded(256, 1)),
+            ("action", action()),
+            ("capability", bounded(256, 1)),
+            ("governed_by", one_of(&["prior_decision", "after_the_fact"])),
+            ("verdict", verdict()),
+            ("reason", absent(bounded(1024, 0))),
+            ("evaluated_as_of", utc_timestamp()),
+            ("evaluated_from", absent(utc_timestamp())),
+            ("policy_binding", absent(policy_binding())),
+            ("gate_results", filled(array(gate_result()))),
+            ("current_verdict", absent(verdict())),
+            ("current_policy_set_digest", absent(string())),
+            ("flagged_for_review", absent(boolean())),
+            ("matched_evidence_id", absent(string())),
+            ("matched_decision_id", absent(string())),
+            ("possible_match_evidence_id", absent(string())),
+            ("judged_at", utc_timestamp()),
+            ("issuer_sovereign_id", string()),
+            ("issued_by", string()),
+            ("signature", optional(signature())),
+        ],
+        false
+    )
+);
+
+validator!(
+    valid_quarantine,
+    shape(
+        vec![
+            ("quarantine_id", bounded(128, 1)),
+            (
+                "record_kind",
+                one_of(&["execution", "observation", "break_glass"])
+            ),
+            ("record", object()),
+            ("record_digest", sha256()),
+            ("rejection_code", bounded(128, 1)),
+            ("detail", filled(bounded(1024, 0))),
+            ("resource_id", absent(bounded(256, 1))),
+            ("quarantined_at", utc_timestamp()),
+            ("issuer_sovereign_id", string()),
+            ("issued_by", string()),
+            ("signature", optional(signature())),
+        ],
+        false
+    )
+);
+
+validator!(
+    valid_registry,
+    shape(
+        vec![
+            ("registry_record_id", bounded(128, 1)),
+            (
+                "event",
+                one_of(&[
+                    "policy_history_started",
+                    "policy_activated",
+                    "policy_deactivated",
+                    "executor_key_registered",
+                    "executor_key_retired",
+                    "operator_key_holder",
+                ])
+            ),
+            ("effective_at", utc_timestamp()),
+            ("reconstructed", absent(boolean())),
+            ("policy_id", absent(string())),
+            ("policy_version", absent(positive())),
+            ("policy_digest", absent(string())),
+            ("key_id", absent(string())),
+            ("public_key", absent(string())),
+            ("executor_sovereign_id", absent(string())),
+            ("key_role", absent(one_of(&["executor", "observer"]))),
+            ("resource_prefix", absent(string())),
+            ("operator_tier", absent(string())),
+            ("holder", absent(string())),
+            ("approved_by", absent(string())),
+            ("recorded_by", absent(string())),
+            ("issuer_sovereign_id", string()),
+            ("issued_by", string()),
+            ("signature", optional(signature())),
         ],
         false
     )
@@ -374,6 +581,11 @@ validator!(
                         ("resource_id", nullable(string())),
                         ("resource_action", nullable(string())),
                         ("resource_sequence", nullable(integer())),
+                        // v1.3.0, left out when absent.
+                        ("record_id", absent(string())),
+                        ("subject_id", absent(string())),
+                        ("matched_evidence_id", absent(string())),
+                        ("observation_sequence", absent(positive())),
                     ],
                     true
                 )
@@ -478,6 +690,43 @@ pub fn verify_execution_signature(evidence: &Value, executor_public_key: &str) -
     ) && unknown_fields("ExecutionEvidence", evidence).is_empty()
 }
 
+type Validator = fn(Option<&Value>) -> bool;
+
+/// v1.3.0: the id field, model and validator of each record of a change made
+/// outside the controlled path.
+const OUT_OF_BAND_IDS: [(&str, &str, Validator); 5] = [
+    ("observation_id", "ObservationRecord", valid_observation),
+    ("break_glass_id", "BreakGlassRecord", valid_break_glass),
+    ("judgement_id", "JudgementRecord", valid_judgement),
+    ("quarantine_id", "QuarantineRecord", valid_quarantine),
+    ("registry_record_id", "RegistryRecord", valid_registry),
+];
+
+/// Whether a Stage 2 record's signature covers it as received under one of
+/// the keys, with no signed field the registry does not list. Its form is
+/// checked apart ([`non_canonical_fields`]).
+fn out_of_band_verifies(model: &str, record: &Value, keys: &[String]) -> bool {
+    signed_by(out_of_band_canonical(record), record.get("signature"), keys)
+        && unknown_fields(model, record).is_empty()
+}
+
+/// True when a record of a change made outside the controlled path (v1.3.0:
+/// an observation, break-glass, judgement, quarantine or registry record,
+/// told by its id field) is well formed, its signature verifies under one of
+/// the keys over its form as received, and it is in the form the reference
+/// writes with no signed field this crate does not know, as
+/// [`verify_evidence_events`] checks a stored one.
+pub fn verify_out_of_band_record(record: &Value, public_keys: &[String]) -> bool {
+    OUT_OF_BAND_IDS
+        .iter()
+        .find(|(id, ..)| record.get(*id).is_some())
+        .is_some_and(|(_, model, valid)| {
+            valid(Some(record))
+                && out_of_band_verifies(model, record, public_keys)
+                && non_canonical_fields(model, record).is_empty()
+        })
+}
+
 // ── Boundary decisions ────────────────────────────────────────────────────────
 
 const ATTESTATION_GATE_NAMES: [&str; 2] = ["attestation_status", "attestation_validity"];
@@ -569,8 +818,9 @@ pub fn verify_boundary_decision(
     {
         return reject("unknown_field");
     }
-    // v1.2.0: a decision signed over a form the reference does not write.
-    if !non_canonical_timestamps("BoundaryDecision", decision).is_empty() {
+    // v1.2.0: a decision signed over a form the reference does not write
+    // (v1.3.0: also one that leaves out a field the reference always writes).
+    if !non_canonical_fields("BoundaryDecision", decision).is_empty() {
         return reject("non_canonical_form");
     }
 
@@ -731,12 +981,29 @@ pub struct EvidenceVerification {
     pub decisions: u64,
     /// Execution entries checked.
     pub executions: u64,
+    /// Observation entries checked (v1.3.0); left out of the JSON form when
+    /// zero, as the NA leaves it out.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub observations: u64,
+    /// Break-glass entries checked (v1.3.0); left out when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub break_glass: u64,
+    /// Judgement entries checked (v1.3.0); left out when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub judgements: u64,
+    /// Quarantine entries checked (v1.3.0); left out when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub quarantined: u64,
     /// Every failure, in order.
     pub failures: Vec<VerificationFailure>,
     /// Findings that do not fail verification (v1.2.0), such as
     /// `unsigned_field`: a field outside a stored record's signature.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<VerificationFailure>,
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 /// How to verify a run of evidence events.
@@ -746,7 +1013,9 @@ pub struct VerifyEvidenceOptions {
     pub na_public_keys: Vec<String>,
     /// Executor keys as listed by `GET /admin/evidence/executor-keys`
     /// (`key_id`, `public_key`, `executor_sovereign_id`); retired keys still
-    /// verify old records.
+    /// verify old records. v1.3.0: a key's `role` is `executor` (the default
+    /// when absent), which signs execution evidence and break-glass records,
+    /// or `observer`, which signs observations only.
     pub executor_keys: Vec<Value>,
     /// True for an unbroken run of the store (an export or the whole store);
     /// false for a filtered history, where store links are checked only
@@ -830,7 +1099,10 @@ fn check_payload_fields(
         "justification" => "JustificationProof",
         "execution" => "ExecutionEvidence",
         "retention_checkpoint" => "RetentionCheckpoint",
-        _ => return none(payload),
+        other => match out_of_band_model(other) {
+            Some(model) => model,
+            None => return none(payload),
+        },
     };
     let found = unknown_fields(model, payload);
     if found.is_empty() {
@@ -853,7 +1125,26 @@ fn check_payload_fields(
             payload.get("signature"),
             &options.na_public_keys,
         ),
-        _ => checkpoint_signed(payload, &options.na_public_keys),
+        "retention_checkpoint" => checkpoint_signed(payload, &options.na_public_keys),
+        // v1.3.0: the key the signature names, whatever its role or sovereign,
+        // so an authentic record with a field this crate does not know is
+        // refused by name first, as the reference refuses it.
+        "observation" | "break_glass" => payload
+            .get("signature")
+            .and_then(|sig| str_field(sig, "key_id"))
+            .and_then(|id| executor_keys.get(id))
+            .is_some_and(|key| {
+                signed_by(
+                    out_of_band_canonical(payload),
+                    payload.get("signature"),
+                    &[str_field(key, "public_key").unwrap_or_default().to_owned()],
+                )
+            }),
+        _ => signed_by(
+            out_of_band_canonical(payload),
+            payload.get("signature"),
+            &options.na_public_keys,
+        ),
     };
     if signed_as_received {
         CheckedPayload {
@@ -868,6 +1159,50 @@ fn check_payload_fields(
             payload: without_unknown_fields(model, payload),
         }
     }
+}
+
+/// v1.3.0: the model each Stage 2 entry kind holds.
+fn out_of_band_model(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "observation" => "ObservationRecord",
+        "break_glass" => "BreakGlassRecord",
+        "judgement" => "JudgementRecord",
+        "quarantine" => "QuarantineRecord",
+        "registry" => "RegistryRecord",
+        _ => return None,
+    })
+}
+
+/// What a registered key signs (v1.3.0): `executor` unless it says otherwise.
+fn key_role(key: &Value) -> &str {
+    str_field(key, "role").unwrap_or("executor")
+}
+
+/// The keys that may sign a Stage 2 record: the registered key it names, when
+/// that key belongs to the record's sovereign and has the role its kind needs
+/// (an observer key for an observation, an executor key for a break-glass
+/// record), or the NA's for the kinds the NA signs.
+fn out_of_band_keys(
+    kind: &str,
+    payload: &Value,
+    na_public_keys: &[String],
+    executor_keys: &HashMap<&str, &Value>,
+) -> Vec<String> {
+    let (role, sovereign) = match kind {
+        "observation" => ("observer", "observer_sovereign_id"),
+        "break_glass" => ("executor", "executor_sovereign_id"),
+        _ => return na_public_keys.to_vec(),
+    };
+    payload
+        .get("signature")
+        .and_then(|sig| str_field(sig, "key_id"))
+        .and_then(|id| executor_keys.get(id))
+        .filter(|key| {
+            str_field(key, "executor_sovereign_id") == str_field(payload, sovereign)
+                && key_role(key) == role
+        })
+        .map(|key| vec![str_field(key, "public_key").unwrap_or_default().to_owned()])
+        .unwrap_or_default()
 }
 
 /// Parse `gm.evidence.event` JSON Lines (blank lines ignored).
@@ -891,6 +1226,28 @@ pub fn parse_export_lines(text: &str) -> Result<Vec<Value>> {
     Ok(events)
 }
 
+/// The model a Stage 2 entry kind holds (v1.3.0).
+fn model_of(kind: &str) -> &'static str {
+    out_of_band_model(kind).unwrap_or_default()
+}
+
+/// Whether a Stage 2 payload's signature covers it as received under the key
+/// its kind allows (v1.3.0).
+fn out_of_band_signed(
+    kind: &str,
+    payload: &Value,
+    options: &VerifyEvidenceOptions,
+    executor_keys: &HashMap<&str, &Value>,
+) -> bool {
+    out_of_band_model(kind).is_some_and(|model| {
+        out_of_band_verifies(
+            model,
+            payload,
+            &out_of_band_keys(kind, payload, &options.na_public_keys, executor_keys),
+        )
+    })
+}
+
 fn fail(result: &mut EvidenceVerification, seq: Option<i64>, reason: &str, detail: &str) {
     result.verified = false;
     result.failures.push(VerificationFailure {
@@ -901,7 +1258,11 @@ fn fail(result: &mut EvidenceVerification, seq: Option<i64>, reason: &str, detai
 }
 
 /// Verify stored entries: envelopes, the store chain, every signature, and
-/// the decision and resource chains.
+/// the decision and resource chains. v1.3.0: also the records of changes
+/// made outside the controlled path (observations, break-glass records,
+/// judgements, quarantine and registry entries), each resource's observation
+/// positions, one judgement per record that names it as stored, and
+/// execution evidence matched once.
 pub fn verify_evidence_events<'a>(
     events: impl IntoIterator<Item = &'a Value>,
     options: &VerifyEvidenceOptions,
@@ -911,6 +1272,10 @@ pub fn verify_evidence_events<'a>(
         checked_entries: 0,
         decisions: 0,
         executions: 0,
+        observations: 0,
+        break_glass: 0,
+        judgements: 0,
+        quarantined: 0,
         failures: Vec::new(),
         warnings: Vec::new(),
     };
@@ -928,6 +1293,20 @@ pub fn verify_evidence_events<'a>(
         .and_then(|c| c.get("resource_heads"))
         .and_then(|h| serde_json::from_value(h.clone()).ok())
         .unwrap_or_default();
+    // v1.3.0: observation positions per resource, judged records, matched evidence.
+    let mut observation_heads: HashMap<String, i64> = checkpoint
+        .and_then(|c| c.get("observation_heads"))
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(resource, position)| Some((resource.clone(), position.as_i64()?)))
+        .collect();
+    let mut subjects: HashMap<String, (String, i64)> = HashMap::new();
+    let mut judged: HashSet<String> = HashSet::new();
+    let mut matched: HashSet<String> = HashSet::new();
+    let mut not_decisions: HashSet<String> = HashSet::new();
+    let mut first_sequence: Option<i64> = None;
+    let mut from_start = false;
     let mut prev: Option<Value> = None;
 
     if let Some(checkpoint) = checkpoint {
@@ -995,6 +1374,13 @@ pub fn verify_evidence_events<'a>(
             }
             _ => {}
         }
+        if first_sequence.is_none() {
+            first_sequence = Some(seq);
+            from_start = seq == 1
+                || checkpoint.is_some_and(|c| {
+                    c["removed_through_sequence"].as_i64().map(|n| n + 1) == Some(seq)
+                });
+        }
         prev = Some(entry.clone());
 
         let kind = str_field(entry, "entry_kind").unwrap_or_default();
@@ -1014,8 +1400,36 @@ pub fn verify_evidence_events<'a>(
                 reason: "unsigned_field".to_owned(),
                 detail: checked.unsigned.join(", "),
             });
+            // v1.3.0: the reference stores these records exactly as signed; a
+            // field outside the signature is no part of one (the reference
+            // refuses it as it reads the record).
+            if out_of_band_model(kind).is_some() {
+                fail(
+                    &mut result,
+                    s,
+                    "payload_invalid",
+                    &checked.unsigned.join(", "),
+                );
+                continue;
+            }
         }
         let payload = &checked.payload;
+        // v1.3.0: a record whose signature covers it as received, in a form
+        // the reference does not write, is refused by name, as the reference
+        // refuses it (checked when the whole record was signed, not after
+        // unsigned fields were set aside).
+        let whole = checked.unsigned.is_empty();
+        let signature = |result: &mut EvidenceVerification,
+                         signed: bool,
+                         model: &str,
+                         record: &Value,
+                         detail: &str| {
+            if !signed {
+                fail(result, s, "invalid_signature", detail);
+            } else if whole && !non_canonical_fields(model, record).is_empty() {
+                fail(result, s, "non_canonical_form", detail);
+            }
+        };
         match kind {
             "decision" => {
                 let decision = &payload["decision"];
@@ -1023,9 +1437,13 @@ pub fn verify_evidence_events<'a>(
                     fail(&mut result, s, "payload_invalid", "");
                     continue;
                 }
-                if !verify_decision_signature(decision, &options.na_public_keys) {
-                    fail(&mut result, s, "invalid_signature", "decision");
-                }
+                signature(
+                    &mut result,
+                    verify_decision_signature(decision, &options.na_public_keys),
+                    "BoundaryDecision",
+                    decision,
+                    "decision",
+                );
                 result.decisions += 1;
                 let id = str_field(decision, "decision_id")
                     .unwrap_or_default()
@@ -1042,9 +1460,13 @@ pub fn verify_evidence_events<'a>(
                     fail(&mut result, s, "payload_invalid", "");
                     continue;
                 }
-                if !verify_justification_signature(payload, &options.na_public_keys) {
-                    fail(&mut result, s, "invalid_signature", "justification");
-                }
+                signature(
+                    &mut result,
+                    verify_justification_signature(payload, &options.na_public_keys),
+                    "JustificationProof",
+                    payload,
+                    "justification",
+                );
             }
             "execution" => {
                 if !valid_execution(Some(payload)) {
@@ -1056,17 +1478,17 @@ pub fn verify_evidence_events<'a>(
                     .get("signature")
                     .and_then(|sig| str_field(sig, "key_id"))
                     .and_then(|id| executor_keys.get(id));
+                // v1.3.0: only an executor key signs execution evidence.
                 let signed = key.is_some_and(|key| {
                     str_field(key, "executor_sovereign_id")
                         == str_field(ev, "executor_sovereign_id")
+                        && key_role(key) == "executor"
                         && verify_execution_signature(
                             ev,
                             str_field(key, "public_key").unwrap_or_default(),
                         )
                 });
-                if !signed {
-                    fail(&mut result, s, "invalid_signature", "execution");
-                }
+                signature(&mut result, signed, "ExecutionEvidence", ev, "execution");
                 result.executions += 1;
                 let decision_id = str_field(ev, "decision_id").unwrap_or_default().to_owned();
                 let decision = decisions.get(&decision_id);
@@ -1087,6 +1509,10 @@ pub fn verify_evidence_events<'a>(
                     }) {
                         fail(&mut result, s, "evidence_capability_mismatch", "");
                     }
+                }
+                // v1.3.0: execution evidence never rests on a judgement or a record of one.
+                if not_decisions.contains(&decision_id) {
+                    fail(&mut result, s, "evidence_cites_judgement", &decision_id);
                 }
                 let sequence_no = ev["sequence_no"].as_i64();
                 let prev_digest = str_field(ev, "prev_evidence_digest");
@@ -1124,9 +1550,120 @@ pub fn verify_evidence_events<'a>(
                     fail(&mut result, s, "payload_invalid", "");
                     continue;
                 }
-                if !verify_retention_checkpoint(payload, &options.na_public_keys) {
-                    fail(&mut result, s, "invalid_signature", "retention_checkpoint");
+                signature(
+                    &mut result,
+                    verify_retention_checkpoint(payload, &options.na_public_keys),
+                    "RetentionCheckpoint",
+                    payload,
+                    "retention_checkpoint",
+                );
+            }
+            "observation" | "break_glass" => {
+                let observation = kind == "observation";
+                let valid = if observation {
+                    valid_observation(Some(payload))
+                } else {
+                    valid_break_glass(Some(payload))
+                };
+                if !valid {
+                    fail(&mut result, s, "payload_invalid", "");
+                    continue;
                 }
+                let signed = out_of_band_signed(kind, payload, options, &executor_keys);
+                signature(&mut result, signed, model_of(kind), payload, kind);
+                let id_field = if observation {
+                    "observation_id"
+                } else {
+                    "break_glass_id"
+                };
+                let record_id = str_field(payload, id_field).unwrap_or_default().to_owned();
+                let resource = str_field(payload, "resource_id")
+                    .unwrap_or_default()
+                    .to_owned();
+                if str_field(entry, "record_id") != Some(record_id.as_str())
+                    || str_field(entry, "resource_id") != Some(resource.as_str())
+                {
+                    fail(&mut result, s, "envelope_mismatch", kind);
+                }
+                let digest = str_field(entry, "payload_digest").unwrap_or_default();
+                subjects.insert(record_id.clone(), (digest.to_owned(), seq));
+                not_decisions.insert(record_id);
+                if observation {
+                    result.observations += 1;
+                    let position = entry["observation_sequence"].as_i64();
+                    let head = observation_heads.get(&resource).copied();
+                    if (head.is_some() || from_start) && position != Some(head.unwrap_or(0) + 1) {
+                        fail(&mut result, s, "observation_chain_break", &resource);
+                    }
+                    let next = position.filter(|&p| p != 0).unwrap_or(head.unwrap_or(0));
+                    observation_heads.insert(resource, next);
+                } else {
+                    result.break_glass += 1;
+                }
+            }
+            "judgement" => {
+                if !valid_judgement(Some(payload)) {
+                    fail(&mut result, s, "payload_invalid", "");
+                    continue;
+                }
+                let signed = out_of_band_signed(kind, payload, options, &executor_keys);
+                signature(&mut result, signed, model_of(kind), payload, kind);
+                result.judgements += 1;
+                let judgement_id = str_field(payload, "judgement_id").unwrap_or_default();
+                let subject_id = str_field(payload, "subject_id").unwrap_or_default();
+                not_decisions.insert(judgement_id.to_owned());
+                if str_field(entry, "subject_id") != Some(subject_id)
+                    || str_field(entry, "record_id") != Some(judgement_id)
+                {
+                    fail(&mut result, s, "envelope_mismatch", "judgement");
+                }
+                if !judged.insert(subject_id.to_owned()) {
+                    fail(&mut result, s, "duplicate_judgement", subject_id);
+                }
+                let subject_sequence = payload["subject_store_sequence"].as_i64();
+                match subjects.get(subject_id) {
+                    Some((digest, sequence)) => {
+                        if Some(digest.as_str()) != str_field(payload, "subject_digest")
+                            || Some(*sequence) != subject_sequence
+                        {
+                            fail(&mut result, s, "judgement_subject_mismatch", subject_id);
+                        }
+                    }
+                    None => {
+                        if options.contiguous
+                            && first_sequence.is_some_and(|first| subject_sequence >= Some(first))
+                        {
+                            fail(&mut result, s, "judgement_subject_missing", subject_id);
+                        }
+                    }
+                }
+                if let Some(evidence_id) = str_field(payload, "matched_evidence_id") {
+                    if !matched.insert(evidence_id.to_owned()) {
+                        fail(&mut result, s, "match_reused", evidence_id);
+                    }
+                }
+            }
+            "quarantine" => {
+                if !valid_quarantine(Some(payload)) {
+                    fail(&mut result, s, "payload_invalid", "");
+                    continue;
+                }
+                let signed = out_of_band_signed(kind, payload, options, &executor_keys);
+                signature(&mut result, signed, model_of(kind), payload, kind);
+                result.quarantined += 1;
+                if payload_digest(&payload["record"]).ok().as_deref()
+                    != str_field(payload, "record_digest")
+                {
+                    fail(&mut result, s, "quarantine_digest_mismatch", "");
+                }
+            }
+            "registry" => {
+                if !valid_registry(Some(payload)) {
+                    fail(&mut result, s, "payload_invalid", "");
+                    continue;
+                }
+                let signed = out_of_band_signed(kind, payload, options, &executor_keys);
+                signature(&mut result, signed, model_of(kind), payload, kind);
             }
             other => fail(&mut result, s, "unknown_entry_kind", other),
         }

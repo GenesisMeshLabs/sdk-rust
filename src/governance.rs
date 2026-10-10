@@ -1,6 +1,7 @@
 //! Controller-side composition for governed resource lifecycles (e.g.
 //! secrets): evaluate, act only on a verified ALLOW, and record the outcome on
-//! the resource chain.
+//! the resource chain. With break-glass (v1.3.0), act when the NA cannot be
+//! reached, and record that.
 
 use std::future::Future;
 
@@ -13,8 +14,11 @@ use crate::{
     boundary::BoundaryClient,
     errors::{ActionValue, GenesisMeshError, Result},
     evidence_store::EvidenceStoreClient,
-    execution::{check_metadata_only, ExecutionRecorder, PriorResource, RecordExecution},
-    outbox::OutboxEntry,
+    execution::{
+        check_metadata_only, ExecutionRecorder, PriorResource, RecordExecution, MAX_METADATA_BYTES,
+    },
+    out_of_band::{check_justification, refused, BreakGlassInput, EvaluationFailure},
+    outbox::{OutboxEntry, RecordOutboxEntry},
     verify::{verify_boundary_decision, VerifyDecisionOptions},
 };
 
@@ -308,6 +312,110 @@ fn check_decision(decision: &Value, params: &GovernedActionParams, context_id: &
     Ok(())
 }
 
+/// Break-glass for [`governed_action_with_break_glass`] (v1.3.0).
+#[derive(Debug, Clone)]
+pub struct BreakGlassOptions {
+    /// Why the change cannot wait for the NA: 1 to 1024 characters, no
+    /// secret values. Recorded, and shown with the resource's changes.
+    pub justification: String,
+}
+
+impl BreakGlassOptions {
+    /// Break-glass with this justification.
+    pub fn new(justification: impl Into<String>) -> Self {
+        Self {
+            justification: justification.into(),
+        }
+    }
+}
+
+/// The evaluation failed transiently and the action ran under break-glass
+/// (v1.3.0). The NA judges the record after the fact, as the failed
+/// evaluation would have gone.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct BreakGlassResult<T> {
+    /// How the evaluation failed.
+    pub failure: EvaluationFailure,
+    /// The evaluation's error.
+    pub evaluation_error: GenesisMeshError,
+    /// The action's value.
+    pub value: Option<T>,
+    /// The signed break-glass record.
+    pub record: Value,
+    /// The NA's answer, when it was reachable again by then.
+    pub submission: Option<Value>,
+    /// The record outbox entry holding the record otherwise, pending for
+    /// [`EvidenceStoreClient::flush_records`] or a dead letter.
+    pub queued: Option<RecordOutboxEntry>,
+    /// Reported metadata the secret guard refused, left out of the record
+    /// (named in its `outcome_detail`); empty when none was.
+    pub dropped: Vec<String>,
+}
+
+/// What [`governed_action_with_break_glass`] did (v1.3.0).
+#[derive(Debug)]
+pub enum GovernedActionOutcome<T> {
+    /// The NA answered: the action ran on a verified ALLOW, or did not run
+    /// on a DENY, as with [`governed_action`].
+    Evaluated(GovernedActionResult<T>),
+    /// The evaluation failed transiently and the action ran without a
+    /// decision.
+    BrokeGlass(BreakGlassResult<T>),
+}
+
+/// Refusals that look transient but are not: the NA throttling a caller whose
+/// operator signatures keep failing, an evaluation the NA computed (perhaps a
+/// DENY) but could not store, and an answer whose body could not be read
+/// (v1.3.0). None breaks the glass.
+const NOT_BREAKABLE: [&str; 3] = [
+    "admin_auth_throttled",
+    "evidence_store_unavailable",
+    "response_body_unreadable",
+];
+
+/// Room kept for the action's report within the metadata limit of a
+/// break-glass record.
+const RECORD_RESERVE: usize = 2048;
+
+/// The longest outcome detail a break-glass record carries (the reference's
+/// limit, in characters).
+const MAX_OUTCOME_DETAIL: usize = 1024;
+
+/// `text` cut to `max` characters, the last one an ellipsis when cut.
+fn clip(text: Option<String>, max: usize) -> Option<String> {
+    let text = text?;
+    if text.chars().count() <= max {
+        return Some(text);
+    }
+    let mut cut: String = text.chars().take(max - 1).collect();
+    cut.push('\u{2026}');
+    Some(cut)
+}
+
+/// The transient failure an evaluation error is (v1.3.0), or `None` for any
+/// other error: a network error, a timeout, HTTP `5xx` or `429`, but not
+/// `429 admin_auth_throttled` nor `503 evidence_store_unavailable`. A DENY is
+/// not an error.
+pub fn evaluation_failure(err: &GenesisMeshError) -> Option<EvaluationFailure> {
+    if NOT_BREAKABLE.contains(&err.code()) {
+        return None;
+    }
+    match err {
+        // A request that could not be built never reached the NA's network.
+        GenesisMeshError::Network(error) if error.is_builder() => None,
+        GenesisMeshError::Network(error) if error.is_timeout() => Some(EvaluationFailure::Timeout),
+        GenesisMeshError::Network(_) => Some(EvaluationFailure::NetworkError),
+        GenesisMeshError::RateLimit { .. } | GenesisMeshError::Http { status: 429, .. } => {
+            Some(EvaluationFailure::RateLimited)
+        }
+        GenesisMeshError::Http {
+            status: 500..=599, ..
+        } => Some(EvaluationFailure::ServerError),
+        _ => None,
+    }
+}
+
 /// Evaluate, run `action` only on a verified ALLOW, then sign and submit the
 /// execution evidence linked to the resource chain. A DENY returns
 /// `authorized: false` without running the action. If the action fails, a
@@ -335,6 +443,296 @@ where
     F: FnOnce(Value) -> Fut,
     Fut: Future<Output = std::result::Result<ActionReport<T>, ActionError>>,
 {
+    // Without break-glass the action always gets a decision.
+    let action = |decision: Option<Value>| action(decision.unwrap_or_default());
+    match run(boundary, evidence_store, recorder, params, None, action).await? {
+        GovernedActionOutcome::Evaluated(result) => Ok(result),
+        GovernedActionOutcome::BrokeGlass(_) => unreachable!("break-glass is off"),
+    }
+}
+
+/// [`governed_action`] that runs the action even when the NA cannot be
+/// reached (v1.3.0). When the evaluation fails transiently (network error,
+/// timeout, `5xx`, `429`; see [`evaluation_failure`]), the action runs with
+/// no decision (`None`), and a break-glass record signed by the executor key,
+/// with `break_glass.justification`, is kept in the record outbox and
+/// submitted: the outcome is [`GovernedActionOutcome::BrokeGlass`]. A DENY,
+/// a decision that fails verification, the NA throttling failed operator
+/// signatures (`429 admin_auth_throttled`), an evaluation it could not store
+/// (`503 evidence_store_unavailable`), or any other error never breaks the
+/// glass: those go as with [`governed_action`]
+/// ([`GovernedActionOutcome::Evaluated`] or the error).
+///
+/// Before anything is evaluated or run, it needs a record outbox
+/// ([`ClientOptions::with_record_outbox`](crate::ClientOptions::with_record_outbox),
+/// else [`GenesisMeshError::RecordOutboxRequired`]), `resource_id`, and an
+/// attestation-based evaluation (`attestation_id`; an agreement-based one
+/// cannot be judged after the fact: `break_glass_malformed`) naming its
+/// `requested_capability`, with the context's `request_parameters` and
+/// `attributes` objects that, with the justification, leave room for the
+/// record; and checks the justification (1 to 1024 characters) and the
+/// evaluation context against the secret guard
+/// ([`GenesisMeshError::OutOfBandRecord`], `break_glass_malformed` or
+/// `break_glass_secret_material`). If the action fails under break-glass, a
+/// `failure` record is kept and [`GenesisMeshError::ActionFailed`] carries it
+/// (`queued_record` while the NA has not admitted it). Once the action ran a
+/// record is always signed: an outcome detail is cut to 1024 characters, and
+/// reported metadata the guard refuses is left out of the record (`dropped`;
+/// the whole report when the rest is still refused). A record that cannot be
+/// kept returns [`GenesisMeshError::EvidenceNotKept`] with the
+/// action's value.
+pub async fn governed_action_with_break_glass<T, F, Fut>(
+    boundary: &BoundaryClient,
+    evidence_store: &EvidenceStoreClient,
+    recorder: &ExecutionRecorder,
+    params: GovernedActionParams,
+    break_glass: BreakGlassOptions,
+    action: F,
+) -> Result<GovernedActionOutcome<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(Option<Value>) -> Fut,
+    Fut: Future<Output = std::result::Result<ActionReport<T>, ActionError>>,
+{
+    run(
+        boundary,
+        evidence_store,
+        recorder,
+        params,
+        Some(&break_glass),
+        action,
+    )
+    .await
+}
+
+/// Everything break-glass needs is checked before anything is evaluated or run.
+async fn check_break_glass(
+    store: &EvidenceStoreClient,
+    params: &GovernedActionParams,
+    options: &BreakGlassOptions,
+) -> Result<()> {
+    let outbox = store
+        .record_outbox()
+        .ok_or(GenesisMeshError::RecordOutboxRequired)?;
+    if params.resource_id.is_none() {
+        return Err(GenesisMeshError::Configuration(
+            "break-glass needs resource_id and resource_action".into(),
+        ));
+    }
+    let named = |key: &str| {
+        params.evaluate[key]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    };
+    // An agreement-based evaluation rests on the agreement, which a
+    // break-glass record does not carry: the NA could not judge it after the
+    // fact.
+    if !named("attestation_id") {
+        return Err(refused(
+            "break_glass_malformed",
+            "break-glass needs an attestation-based evaluation (attestation_id)",
+        ));
+    }
+    if !named("requested_capability") {
+        return Err(refused(
+            "break_glass_malformed",
+            "break-glass needs requested_capability",
+        ));
+    }
+    check_justification(&options.justification)?;
+    // Everything the record carries besides the action's report is checked
+    // now, with room left for the report, so a record can always be kept once
+    // the action has run.
+    let context = params
+        .evaluate
+        .get("context")
+        .filter(|c| !c.is_null())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut carried = serde_json::Map::new();
+    for name in ["request_parameters", "attributes"] {
+        let value = context.get(name).cloned().unwrap_or_else(|| json!({}));
+        if !value.is_object() {
+            return Err(refused(
+                "break_glass_malformed",
+                format!("context.{name} must be a JSON object"),
+            ));
+        }
+        carried.insert(name.into(), value);
+    }
+    if let Some(secret) = check_metadata_only(&context, None) {
+        return Err(refused("break_glass_secret_material", secret));
+    }
+    carried.insert("justification".into(), json!(options.justification));
+    let size = serde_json::to_vec(&carried).map_or(usize::MAX, |bytes| bytes.len());
+    if size > MAX_METADATA_BYTES - RECORD_RESERVE {
+        return Err(refused(
+            "break_glass_malformed",
+            format!(
+                "the context and justification leave no room for the record within \
+                 {MAX_METADATA_BYTES} bytes"
+            ),
+        ));
+    }
+    outbox.list().await.map_err(GenesisMeshError::Outbox)?;
+    Ok(())
+}
+
+/// Run the action without a decision and keep its break-glass record.
+async fn break_the_glass<T, F, Fut>(
+    store: &EvidenceStoreClient,
+    recorder: &ExecutionRecorder,
+    params: &GovernedActionParams,
+    justification: &str,
+    request: Value,
+    (failure, evaluation_error): (EvaluationFailure, GenesisMeshError),
+    action: F,
+) -> Result<BreakGlassResult<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(Option<Value>) -> Fut,
+    Fut: Future<Output = std::result::Result<ActionReport<T>, ActionError>>,
+{
+    let context = &request["context"];
+    let present = |value: &Value| Some(value.clone()).filter(|v| !v.is_null());
+    let sign = |outcome: Option<String>,
+                execution_parameters: Option<Value>,
+                outcome_detail: Option<String>| {
+        recorder.sign_break_glass(BreakGlassInput {
+            attestation_id: request["attestation_id"].as_str().map(str::to_owned),
+            request_parameters: present(&context["request_parameters"]),
+            attributes: present(&context["attributes"]),
+            outcome,
+            outcome_detail: clip(outcome_detail, MAX_OUTCOME_DETAIL),
+            execution_parameters,
+            ..BreakGlassInput::new(
+                params.resource_id.clone().unwrap_or_default(),
+                params.resource_action.clone().unwrap_or_default(),
+                request["requested_capability"].as_str().unwrap_or_default(),
+                justification,
+                request.clone(),
+                failure,
+            )
+        })
+    };
+
+    let report = match action(None).await {
+        Ok(report) => report,
+        Err(source) => {
+            // The error text is not recorded: it may carry secret material.
+            let record = match sign(Some("failure".into()), None, Some("action failed".into())) {
+                Ok(record) => record,
+                Err(evidence_error) => {
+                    return Err(GenesisMeshError::ActionUnrecorded {
+                        source,
+                        evidence_error: Box::new(evidence_error),
+                        evidence: None,
+                    })
+                }
+            };
+            return Err(match store.enqueue_record(record.clone()).await {
+                Ok(delivery) => GenesisMeshError::ActionFailed {
+                    source,
+                    evidence: Some(Box::new(record)),
+                    queued: None,
+                    queued_record: delivery.queued.map(Box::new),
+                },
+                Err(evidence_error) => GenesisMeshError::ActionUnrecorded {
+                    source,
+                    evidence_error: Box::new(evidence_error),
+                    evidence: Some(Box::new(record)),
+                },
+            });
+        }
+    };
+
+    // The action ran: from here on its outcome is always recorded.
+    let ActionReport {
+        value,
+        execution_parameters,
+        outcome,
+        outcome_detail,
+    } = report;
+    let not_kept = |source: GenesisMeshError, record: Option<Value>, value: Option<T>| {
+        GenesisMeshError::EvidenceNotKept {
+            source: Box::new(source),
+            evidence: record.map(Box::new),
+            value: ActionValue::new(value),
+        }
+    };
+    let (record, dropped) = match sign(
+        outcome.clone(),
+        execution_parameters.clone(),
+        outcome_detail.clone(),
+    ) {
+        Ok(record) => (record, Vec::new()),
+        Err(GenesisMeshError::OutOfBandRecord { code, .. })
+            if code == "break_glass_secret_material" =>
+        {
+            let cleaned = without_refused_metadata(
+                execution_parameters.as_ref().unwrap_or(&json!({})),
+                outcome_detail.as_deref(),
+            );
+            match sign(
+                outcome.clone(),
+                Some(cleaned.execution_parameters),
+                Some(cleaned.outcome_detail),
+            ) {
+                Ok(record) => (record, cleaned.dropped),
+                Err(GenesisMeshError::OutOfBandRecord { code, .. })
+                    if code == "break_glass_secret_material" =>
+                {
+                    // The report together with the context is still refused
+                    // (its size): keep the outcome alone.
+                    let mut all: Vec<String> = execution_parameters
+                        .as_ref()
+                        .and_then(Value::as_object)
+                        .map(|p| p.keys().cloned().collect())
+                        .unwrap_or_default();
+                    if outcome_detail.is_some() {
+                        all.push("outcome_detail".into());
+                    }
+                    all.sort();
+                    let detail = "[secret guard dropped the report]".to_owned();
+                    match sign(outcome, Some(json!({})), Some(detail)) {
+                        Ok(record) => (record, all),
+                        Err(err) => return Err(not_kept(err, None, value)),
+                    }
+                }
+                Err(err) => return Err(not_kept(err, None, value)),
+            }
+        }
+        Err(err) => return Err(not_kept(err, None, value)),
+    };
+    let delivery = match store.enqueue_record(record.clone()).await {
+        Ok(delivery) => delivery,
+        Err(err) => return Err(not_kept(err, Some(record), value)),
+    };
+    Ok(BreakGlassResult {
+        failure,
+        evaluation_error,
+        value,
+        record,
+        submission: delivery.submission,
+        queued: delivery.queued,
+        dropped,
+    })
+}
+
+/// [`governed_action`], with break-glass when `break_glass` is given.
+async fn run<T, F, Fut>(
+    boundary: &BoundaryClient,
+    evidence_store: &EvidenceStoreClient,
+    recorder: &ExecutionRecorder,
+    params: GovernedActionParams,
+    break_glass: Option<&BreakGlassOptions>,
+    action: F,
+) -> Result<GovernedActionOutcome<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(Option<Value>) -> Fut,
+    Fut: Future<Output = std::result::Result<ActionReport<T>, ActionError>>,
+{
     if params.resource_id.is_some() != params.resource_action.is_some() {
         return Err(GenesisMeshError::Configuration(
             "resource_id and resource_action go together".into(),
@@ -351,6 +749,9 @@ where
         // evaluated or run.
         outbox.list().await.map_err(GenesisMeshError::Outbox)?;
     }
+    if let Some(options) = break_glass {
+        check_break_glass(evidence_store, &params, options).await?;
+    }
     let mut request = params.evaluate.clone();
     if !request.is_object() {
         return Err(GenesisMeshError::Configuration(
@@ -366,12 +767,31 @@ where
     }
     request["context"]["context_id"] = json!(context_id);
 
-    let evaluation = boundary.evaluate(request).await?;
+    let evaluation = match boundary.evaluate(request.clone()).await {
+        Ok(evaluation) => evaluation,
+        Err(err) => {
+            let (Some(options), Some(failure)) = (break_glass, evaluation_failure(&err)) else {
+                return Err(err);
+            };
+            let failed = (failure, err);
+            return break_the_glass(
+                evidence_store,
+                recorder,
+                &params,
+                &options.justification,
+                request,
+                failed,
+                action,
+            )
+            .await
+            .map(GovernedActionOutcome::BrokeGlass);
+        }
+    };
     let decision = evaluation["decision"].clone();
     check_decision(&decision, &params, &context_id)?;
     let summary = summarize_decision(&decision);
     if !summary.authorized {
-        return Ok(GovernedActionResult {
+        return Ok(GovernedActionOutcome::Evaluated(GovernedActionResult {
             evaluation,
             authorized: false,
             summary,
@@ -379,7 +799,7 @@ where
             evidence: None,
             submission: None,
             queued: None,
-        });
+        }));
     }
 
     let prior = match (&params.resource_id, &params.prior_resource) {
@@ -419,7 +839,7 @@ where
         })
     };
 
-    let report = match action(decision.clone()).await {
+    let report = match action(Some(decision.clone())).await {
         Ok(report) => report,
         Err(source) => {
             // The error text is not recorded: it may carry secret material.
@@ -446,6 +866,7 @@ where
                     source,
                     evidence: Some(Box::new(evidence)),
                     queued: queued.map(Box::new),
+                    queued_record: None,
                 },
                 Err(evidence_error) => GenesisMeshError::ActionUnrecorded {
                     source,
@@ -465,7 +886,7 @@ where
     if outbox.is_none() {
         let evidence = record(outcome, execution_parameters, outcome_detail)?;
         let submission = evidence_store.submit(evidence.clone()).await?;
-        return Ok(GovernedActionResult {
+        return Ok(GovernedActionOutcome::Evaluated(GovernedActionResult {
             evaluation,
             authorized: true,
             summary,
@@ -473,7 +894,7 @@ where
             evidence: Some(evidence),
             submission: Some(submission),
             queued: None,
-        });
+        }));
     }
 
     // The action ran: from here on its outcome is always recorded.
@@ -520,7 +941,7 @@ where
             value: ActionValue::new(value),
         });
     }
-    Ok(GovernedActionResult {
+    Ok(GovernedActionOutcome::Evaluated(GovernedActionResult {
         evaluation,
         authorized: true,
         summary,
@@ -528,5 +949,5 @@ where
         evidence: Some(evidence),
         submission: delivery.submission,
         queued: delivery.queued,
-    })
+    }))
 }
