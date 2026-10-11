@@ -13,7 +13,8 @@ use genesis_mesh_sdk::{
         checkpoint_canonical, entry_digest, out_of_band_canonical, out_of_band_digest,
         payload_digest,
     },
-    canonical_digest, json, observation_from_finding, public_key_from_seed, sign_canonical,
+    canonical_digest, json, observation_from_finding, public_key_from_seed,
+    record_metadata_problem, sign_canonical,
     verify::{
         parse_export_lines, verify_evidence_events, verify_out_of_band_record,
         VerifyEvidenceOptions,
@@ -88,13 +89,20 @@ fn every_vector_gives_the_reference_outcome() {
                     &[v["public_key"].as_str().unwrap().to_owned()]
                 )
             }),
+            // v1.3.1: the NA's guard on a record's own values, as it admits it.
+            "metadata_problem" => {
+                let key = [v["key"]["public_key"].as_str().unwrap().to_owned()];
+                assert!(verify_out_of_band_record(&v["record"], &key), "{}", v["id"]);
+                let kind = v["record_kind"].as_str().unwrap();
+                json!({ "problem": record_metadata_problem(kind, &v["record"]) })
+            }
             "time_bounds" | "policy_history" => continue,
             other => panic!("unknown vector kind {other}"),
         };
         assert_eq!(got, v["expected"], "{}", v["id"]);
         ran += 1;
     }
-    assert_eq!(ran, 24);
+    assert_eq!(ran, 68);
 }
 
 #[test]
@@ -624,6 +632,43 @@ fn event(seq: i64, kind: &str, payload: Value, prev: Option<&Value>, extra: Valu
         "exec_sequence_no": null, "resource_id": payload["resource_id"], "resource_action": null,
         "resource_sequence": null,
     });
+    // The envelope fields the NA derives from a Stage 2 record (`entry_index`):
+    // the verifier checks each against the record (1.3.1).
+    let derived: &[(&str, &str)] = match kind {
+        "observation" => &[
+            ("record_id", "observation_id"),
+            ("resource_action", "action"),
+            ("capability", "capability"),
+            ("executor_sovereign_id", "observer_sovereign_id"),
+        ],
+        "break_glass" => &[
+            ("record_id", "break_glass_id"),
+            ("resource_action", "resource_action"),
+            ("capability", "capability"),
+            ("executor_sovereign_id", "executor_sovereign_id"),
+            ("attestation_id", "attestation_id"),
+            ("outcome", "outcome"),
+        ],
+        "judgement" => &[
+            ("record_id", "judgement_id"),
+            ("subject_id", "subject_id"),
+            ("resource_action", "action"),
+            ("capability", "capability"),
+            ("outcome", "verdict"),
+            ("matched_evidence_id", "matched_evidence_id"),
+        ],
+        "quarantine" => &[
+            ("record_id", "quarantine_id"),
+            ("outcome", "rejection_code"),
+        ],
+        "registry" => &[("record_id", "registry_record_id"), ("outcome", "event")],
+        _ => &[],
+    };
+    for (field, source) in derived {
+        if let Some(value) = payload.get(*source).filter(|v| !v.is_null()) {
+            entry[*field] = value.clone();
+        }
+    }
     for (k, v) in extra.as_object().unwrap() {
         entry[k] = v.clone();
     }
@@ -669,6 +714,34 @@ fn reasons(events: &[Value], options: &VerifyEvidenceOptions) -> Vec<String> {
         .into_iter()
         .map(|f| f.reason)
         .collect()
+}
+
+#[test]
+fn a_field_the_reference_writes_as_null_is_refused_by_the_signature_when_left_out() {
+    // 1.3.1: as the reference reads it, a record without `outcome_detail` or
+    // `prev_evidence_digest` (written as null) is well formed and fails its
+    // signature, not `payload_invalid`.
+    let decision = json!({"decision_id": "d", "context_id": "c", "agreement_id": "a"});
+    let record = executor()
+        .record(genesis_mesh_sdk::RecordExecution {
+            decision,
+            executed_capability: "secret.rotate".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let keys = vec![json!({
+        "key_id": "executor-1", "public_key": public_key_from_seed(&seed(12)).unwrap(),
+        "executor_sovereign_id": "controller",
+    })];
+    let options = VerifyEvidenceOptions::new(vec![na_key()], keys);
+    let first = event(1, "execution", record.clone(), None, json!({}));
+    assert!(reasons(std::slice::from_ref(&first), &options).is_empty());
+    for field in ["outcome_detail", "prev_evidence_digest"] {
+        let mut without = record.clone();
+        without.as_object_mut().unwrap().remove(field);
+        let run = vec![event(1, "execution", without, None, json!({}))];
+        assert_eq!(reasons(&run, &options), ["invalid_signature"], "{field}");
+    }
 }
 
 #[test]

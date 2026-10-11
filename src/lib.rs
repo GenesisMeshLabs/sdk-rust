@@ -48,6 +48,8 @@ pub use governance::{
     GovernedActionResult, GovernedVerification, RefusedMetadata,
 };
 pub use health::HealthClient;
+#[doc(hidden)]
+pub use out_of_band::record_metadata_problem;
 pub use out_of_band::{
     observation_from_finding, observation_id, BreakGlassInput, EvaluationFailure,
     FindingObservationOptions, ObservationInput, ObservationRecorder,

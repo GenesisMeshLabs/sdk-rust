@@ -397,7 +397,14 @@ under the NA keys; each resource's observation positions
 that names it as stored (`judgement_subject_mismatch`,
 `judgement_subject_missing`), and execution evidence matched once
 (`match_reused`). The result counts them in `observations`, `break_glass`,
-`judgements` and `quarantined`. `canonical::out_of_band_canonical`,
+`judgements` and `quarantined`. Since 1.3.1 it verifies an export as the
+reference does: a record's id appears once per kind (`duplicate_record`); a
+Stage 2 entry's envelope names what its record says (`envelope_mismatch`); a
+judgement's matched record is in an export from entry 1
+(`judgement_match_missing`); a retention checkpoint removed as many entries as
+positions (`retention_count_mismatch`); and an export that starts after entry 1
+(a later page) takes the first record it holds of each resource as that
+chain's start, so it no longer reports `resource_chain_break` there. `canonical::out_of_band_canonical`,
 `canonical::out_of_band_digest` and `verify::verify_out_of_band_record` give
 one record's signed form and check its signature.
 
