@@ -639,7 +639,9 @@ impl<E: Entry> JsonFiles<E> {
             }
         }
         // 1.3.1: a file that cannot be read is moved aside, so it does not
-        // stop every action; the read that finds it fails, once.
+        // stop every action; the read that finds it fails, once. Named in
+        // queue order: the directory lists in no fixed order.
+        unreadable.sort();
         for file in &unreadable {
             fs::rename(
                 self.directory.join(file),
