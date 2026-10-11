@@ -1,7 +1,8 @@
 //! Controller-side composition for governed resource lifecycles (e.g.
 //! secrets): evaluate, act only on a verified ALLOW, and record the outcome on
 //! the resource chain. With break-glass (v1.3.0), act when the NA cannot be
-//! reached, and record that.
+//! reached, and record that. Cancel a denied change by rotating forward,
+//! then disabling (1.4.0).
 
 use std::future::Future;
 
@@ -23,6 +24,9 @@ use crate::{
         refused, BreakGlassInput, EvaluationFailure,
     },
     outbox::{OutboxEntry, RecordOutboxEntry},
+    remediation::{
+        remediation_input_problem, RemediationInput, RemediationSteps, RemediationSubject,
+    },
     verify::{verify_boundary_decision, VerifyDecisionOptions},
 };
 
@@ -1004,4 +1008,228 @@ where
         submission: delivery.submission,
         queued: delivery.queued,
     }))
+}
+
+// ── Remediation by a forward rotation (1.4.0) ────────────────────────────────
+
+/// What [`rotate_forward_then_disable`] remediates and how the rotation is
+/// governed (1.4.0).
+#[derive(Debug, Clone)]
+pub struct RotateForwardParams {
+    /// The rotation's governed action: its evaluation (a decision for the
+    /// rotation, under the policy that applies to it), the resource, which
+    /// must be the subject's, and the decision's verification.
+    /// `resource_action` is `rotate` (the default) or `update`.
+    pub governed: GovernedActionParams,
+    /// The judged change, from the remediation state
+    /// ([`RemediationSubject::from_state`]).
+    pub subject: RemediationSubject,
+    /// The denied version, disabled once the new version is current.
+    pub disabled_version_id: String,
+    /// A short note for the remediation record, no secret values.
+    pub detail: Option<String>,
+}
+
+/// The version a forward rotation issued, as the rotation action reports it.
+#[derive(Debug, Clone)]
+pub struct RotatedVersion<T> {
+    /// The new version, recorded as `execution_parameters.version_id`.
+    pub version_id: String,
+    /// Returned to the caller; never recorded.
+    pub value: Option<T>,
+    /// Other identifiers for the execution evidence (never values).
+    pub execution_parameters: serde_json::Map<String, Value>,
+}
+
+impl<T> RotatedVersion<T> {
+    /// The new version, without other parameters.
+    pub fn new(version_id: impl Into<String>) -> Self {
+        Self {
+            version_id: version_id.into(),
+            value: None,
+            execution_parameters: serde_json::Map::new(),
+        }
+    }
+}
+
+/// What [`rotate_forward_then_disable`] did (1.4.0).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RotateForwardResult<T> {
+    /// The forward rotation's governed action. When it was not authorized,
+    /// nothing else happened.
+    pub rotation: GovernedActionResult<T>,
+    /// The signed remediation record linking the rotation, when the denied
+    /// version was disabled.
+    pub record: Option<Value>,
+    /// The NA's answer to the record, when it admitted it.
+    pub submission: Option<Value>,
+    /// The record outbox entry holding the record otherwise: pending (for
+    /// example until the rotation's evidence is admitted) or a dead letter.
+    pub queued: Option<RecordOutboxEntry>,
+}
+
+/// Cancel a denied change to a versioned resource without breaking its
+/// readers (1.4.0): rotate forward to a new version under a governed
+/// decision, then disable the denied version, then record a remediation
+/// linked to the rotation's execution evidence.
+///
+/// 1. `rotate` runs as a [`governed_action`] (a verified ALLOW only),
+///    rotating the resource to a new version and making it current; the new
+///    version is recorded in the evidence as `execution_parameters.version_id`.
+///    A DENY returns the result with no record: nothing else ran.
+/// 2. `disable` disables (or deletes) `disabled_version_id`.
+/// 3. The remediation record (`rotate_forward_then_disable`, outcome
+///    `cancelled`) names the rotation's `evidence_id`, the new version and
+///    the disabled one; it is signed by `recorder` and kept in the record
+///    outbox, then submitted. The NA admits it once it holds the rotation's
+///    evidence; until then it stays pending (`remediation_rotation_missing`
+///    is retried).
+///
+/// Before anything is evaluated or run, it needs a record outbox
+/// ([`GenesisMeshError::RecordOutboxRequired`]), a `resource_id` equal to
+/// the subject's and a `rotate` or `update` action
+/// ([`GenesisMeshError::Configuration`]), and a remediation the NA would
+/// admit ([`GenesisMeshError::OutOfBandRecord`], `remediation_malformed` or
+/// `remediation_secret_material`). Errors of the rotation are those of
+/// [`governed_action`]. Once the rotation ran, a disable that fails, a new
+/// version equal to the denied one, or a record that cannot be kept returns
+/// [`GenesisMeshError::RemediationIncomplete`] with the rotation's evidence.
+pub async fn rotate_forward_then_disable<T, R, RFut, D, DFut>(
+    boundary: &BoundaryClient,
+    evidence_store: &EvidenceStoreClient,
+    recorder: &ExecutionRecorder,
+    params: RotateForwardParams,
+    rotate: R,
+    disable: D,
+) -> Result<RotateForwardResult<T>>
+where
+    T: Send + 'static,
+    R: FnOnce(Value) -> RFut,
+    RFut: Future<Output = std::result::Result<RotatedVersion<T>, ActionError>>,
+    D: FnOnce(String) -> DFut,
+    DFut: Future<Output = std::result::Result<(), ActionError>>,
+{
+    let outbox = evidence_store
+        .record_outbox()
+        .ok_or(GenesisMeshError::RecordOutboxRequired)?;
+    let RotateForwardParams {
+        mut governed,
+        subject,
+        disabled_version_id,
+        detail,
+    } = params;
+    if governed.resource_id.as_deref() != Some(subject.resource_id.as_str()) {
+        return Err(GenesisMeshError::Configuration(
+            "the forward rotation's resource_id must be the remediated resource".into(),
+        ));
+    }
+    let action = governed
+        .resource_action
+        .get_or_insert_with(|| "rotate".into());
+    if !matches!(action.as_str(), "rotate" | "update") {
+        return Err(GenesisMeshError::Configuration(
+            "a forward rotation's resource_action is rotate or update".into(),
+        ));
+    }
+    let input = |rotation_evidence_id: String, version_id: String| RemediationInput {
+        detail: detail.clone(),
+        ..RemediationInput::new(
+            subject.clone(),
+            RemediationSteps::RotateForwardThenDisable {
+                rotation_evidence_id,
+                version_id,
+                disabled_version_id: disabled_version_id.clone(),
+            },
+        )
+    };
+    // Checked with placeholders for what the rotation will give: another
+    // version than the denied one.
+    let placeholder = if disabled_version_id == "v" { "w" } else { "v" };
+    remediation_input_problem(
+        recorder.executor_sovereign_id(),
+        &input("rotation".into(), placeholder.into()),
+    )?;
+    outbox.list().await.map_err(GenesisMeshError::Outbox)?;
+
+    let rotation = governed_action(
+        boundary,
+        evidence_store,
+        recorder,
+        governed,
+        |decision| async move {
+            let rotated = rotate(decision).await?;
+            let mut parameters = rotated.execution_parameters;
+            parameters.insert("version_id".into(), json!(rotated.version_id));
+            Ok(ActionReport {
+                value: Some((rotated.value, rotated.version_id)),
+                execution_parameters: Some(Value::Object(parameters)),
+                ..ActionReport::default()
+            })
+        },
+    )
+    .await?;
+    let GovernedActionResult {
+        evaluation,
+        authorized,
+        summary,
+        value,
+        evidence,
+        submission,
+        queued,
+    } = rotation;
+    let (value, version_id) = match value {
+        Some((value, version_id)) => (value, Some(version_id)),
+        None => (None, None),
+    };
+    let rotation = GovernedActionResult {
+        evaluation,
+        authorized,
+        summary,
+        value,
+        evidence,
+        submission,
+        queued,
+    };
+    let (Some(evidence), Some(version_id)) = (rotation.evidence.clone(), version_id) else {
+        return Ok(RotateForwardResult {
+            rotation,
+            record: None,
+            submission: None,
+            queued: None,
+        });
+    };
+    let incomplete =
+        |source: ActionError, record: Option<Value>| GenesisMeshError::RemediationIncomplete {
+            source,
+            rotation: Box::new(evidence.clone()),
+            record: record.map(Box::new),
+        };
+    if version_id == disabled_version_id {
+        return Err(incomplete(
+            "the forward rotation issued the version it was to replace; nothing was disabled"
+                .into(),
+            None,
+        ));
+    }
+    if let Err(source) = disable(disabled_version_id.clone()).await {
+        return Err(incomplete(source, None));
+    }
+    let evidence_id = evidence["evidence_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let record = recorder
+        .sign_remediation(input(evidence_id, version_id))
+        .map_err(|err| incomplete(Box::new(err), None))?;
+    let delivery = evidence_store
+        .enqueue_record(record.clone())
+        .await
+        .map_err(|err| incomplete(Box::new(err), Some(record.clone())))?;
+    Ok(RotateForwardResult {
+        rotation,
+        record: Some(record),
+        submission: delivery.submission,
+        queued: delivery.queued,
+    })
 }

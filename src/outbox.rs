@@ -13,8 +13,8 @@
 //!
 //! The record outbox (v1.3.0,
 //! [`ClientOptions::with_record_outbox`](crate::ClientOptions::with_record_outbox))
-//! keeps signed observations and break-glass records the same way, in a
-//! directory of its own;
+//! keeps signed observations and break-glass records (1.4.0: and remediation
+//! records) the same way, in a directory of its own;
 //! [`EvidenceStoreClient::flush_records`](crate::EvidenceStoreClient::flush_records)
 //! submits them.
 
@@ -120,16 +120,19 @@ pub enum RecordKind {
     Observation,
     /// A `BreakGlassRecord`, submitted to `/evidence/break-glass`.
     BreakGlass,
+    /// A `RemediationRecord`, submitted to `/evidence/remediations` (1.4.0).
+    Remediation,
 }
 
 /// One signed observation or break-glass record in the record outbox
-/// (v1.3.0). The TypeScript SDK reads and writes the same JSON.
+/// (v1.3.0), or remediation record (1.4.0). The TypeScript SDK reads and
+/// writes the same JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RecordOutboxEntry {
-    /// The record's `observation_id` or `break_glass_id`.
+    /// The record's `observation_id`, `break_glass_id` or `remediation_id`.
     pub id: String,
-    /// Observation or break-glass.
+    /// Observation, break-glass or remediation.
     pub kind: RecordKind,
     /// The signed record, exactly as it will be submitted.
     pub record: Value,
@@ -147,10 +150,13 @@ pub struct RecordOutboxEntry {
 
 impl RecordOutboxEntry {
     /// A new pending entry for a signed observation (a record with an
-    /// `observation_id`) or break-glass record.
+    /// `observation_id`), remediation record (a `remediation_id`, 1.4.0) or
+    /// break-glass record.
     pub fn new(record: Value) -> Self {
         let (kind, key) = if record.get("observation_id").is_some() {
             (RecordKind::Observation, "observation_id")
+        } else if record.get("remediation_id").is_some() {
+            (RecordKind::Remediation, "remediation_id")
         } else {
             (RecordKind::BreakGlass, "break_glass_id")
         };
@@ -352,9 +358,16 @@ pub fn classify_submission_error(err: &GenesisMeshError) -> (SubmissionFailure, 
 }
 
 /// [`classify_submission_error`] for an observation or break-glass record
-/// (v1.3.0): refused for good only by [`RECORD_PERMANENT_REFUSALS`].
+/// (v1.3.0): refused for good only by [`RECORD_PERMANENT_REFUSALS`]; for a
+/// remediation record (1.4.0), by
+/// [`REMEDIATION_PERMANENT_REFUSALS`](crate::REMEDIATION_PERMANENT_REFUSALS).
 pub fn classify_record_submission_error(err: &GenesisMeshError) -> (SubmissionFailure, bool) {
-    classify(err, &RECORD_PERMANENT_REFUSALS)
+    let refusals: Vec<&str> = RECORD_PERMANENT_REFUSALS
+        .iter()
+        .chain(crate::remediation::REMEDIATION_PERMANENT_REFUSALS.iter())
+        .copied()
+        .collect();
+    classify(err, &refusals)
 }
 
 fn classify(err: &GenesisMeshError, refusals: &[&str]) -> (SubmissionFailure, bool) {

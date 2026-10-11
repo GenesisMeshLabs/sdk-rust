@@ -38,7 +38,10 @@ pub use data_usage::DataUsageClient;
 pub use disclosure::DisclosureClient;
 pub use errors::{ActionValue, GenesisMeshError, Result};
 pub use evidence::EvidenceClient;
-pub use evidence_store::{EvidenceStoreClient, FlushOptions, ResourceHead, MAX_PAGE};
+pub use evidence_store::{
+    EvidenceStoreClient, FlushOptions, RemediationQuery, ResourceHead, ReviewDecision, MAX_PAGE,
+    MAX_REMEDIATION_PAGE,
+};
 pub use execution::{
     check_metadata_only, ExecutionRecorder, PriorResource, RecordExecution, MAX_METADATA_BYTES,
 };
@@ -47,6 +50,9 @@ pub use governance::{
     without_refused_metadata, ActionError, ActionReport, BreakGlassOptions, BreakGlassResult,
     DecisionSummary, GateFailure, GovernedActionOutcome, GovernedActionParams,
     GovernedActionResult, GovernedVerification, RefusedMetadata,
+};
+pub use governance::{
+    rotate_forward_then_disable, RotateForwardParams, RotateForwardResult, RotatedVersion,
 };
 pub use health::HealthClient;
 #[doc(hidden)]
