@@ -19,6 +19,7 @@ mod health;
 mod out_of_band;
 mod outbox;
 mod policy;
+pub mod remediation;
 pub mod strict;
 mod strict_json;
 pub mod verify;
@@ -62,5 +63,8 @@ pub use outbox::{
     PREDECESSOR_DEAD_LETTERED, RECORD_PERMANENT_REFUSALS,
 };
 pub use policy::PolicyClient;
+pub use remediation::{
+    RemediationInput, RemediationSteps, RemediationSubject, REMEDIATION_PERMANENT_REFUSALS,
+};
 pub use serde_json::{json, Value};
 pub use strict_json::{check_strict_json, parse_strict_json};

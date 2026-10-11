@@ -16,6 +16,7 @@ use crate::{
         action_problem, check_nesting, length_problem, sign_break_glass, time_problem,
         BreakGlassInput,
     },
+    remediation::{sign_remediation, RemediationInput},
 };
 
 /// Limit on `execution_parameters` plus `outcome_detail`, as enforced by the
@@ -268,6 +269,30 @@ impl ExecutionRecorder {
     /// (`invalid_json`, 1.3.1).
     pub fn sign_break_glass(&self, input: BreakGlassInput) -> Result<Value> {
         sign_break_glass(
+            &self.executor_sovereign_id,
+            &self.key_id,
+            &self.signing_key,
+            input,
+        )
+    }
+
+    /// Build and sign a remediation record with this executor's key (v1.4.0):
+    /// what the controller did about a judged change, as the NA's remediation
+    /// state names it. Submit it with
+    /// [`EvidenceStoreClient::submit_remediation`](crate::EvidenceStoreClient::submit_remediation)
+    /// or keep it in the record outbox
+    /// ([`EvidenceStoreClient::enqueue_record`](crate::EvidenceStoreClient::enqueue_record)).
+    /// Refused before signing ([`GenesisMeshError::OutOfBandRecord`]) as the
+    /// NA would refuse it (the 1.3.1 guards): `remediation_malformed` for a
+    /// subject or change kind the reference does not know, a field of the
+    /// wrong length, a time outside the years 1 to 9999, or a forward
+    /// rotation that disables the version it issued;
+    /// `remediation_secret_material` for secret material in its versions or
+    /// detail, or those over [`MAX_METADATA_BYTES`] as the NA counts them.
+    /// Values nested too deep for every reader are refused as
+    /// [`GenesisMeshError::StrictJson`] (`invalid_json`).
+    pub fn sign_remediation(&self, input: RemediationInput) -> Result<Value> {
+        sign_remediation(
             &self.executor_sovereign_id,
             &self.key_id,
             &self.signing_key,
