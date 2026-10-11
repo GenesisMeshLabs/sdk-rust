@@ -70,6 +70,47 @@ pub(crate) fn metadata_problem(values: &[(&str, &Value)]) -> Option<String> {
     })
 }
 
+/// Why the NA would refuse a signed observation or break-glass record as
+/// secret material, or `None` (1.3.1): [`metadata_problem`] over the values
+/// it guards, as it admits the record. For an observation (`record_kind`
+/// `observation`) its `metadata` (absent: `{}`), `actor`, `source_event_id`
+/// and `version_id` (absent or `null` ones left out); for a break-glass record
+/// its `execution_parameters`, `request_parameters` and `attributes` (absent:
+/// `{}`), `outcome_detail` (absent or `null`: `""`) and `justification`. The
+/// conformance suite `out_of_band` (`metadata_problem` vectors) checks it.
+#[doc(hidden)]
+pub fn record_metadata_problem(record_kind: &str, record: &Value) -> Option<String> {
+    let field = |name: &str| record.get(name).filter(|v| !v.is_null()).cloned();
+    let object = |name: &str| field(name).unwrap_or_else(|| json!({}));
+    let values: Vec<(&str, Value)> = if record_kind == "observation" {
+        [
+            ("metadata", Some(object("metadata"))),
+            ("actor", field("actor")),
+            ("source_event_id", field("source_event_id")),
+            ("version_id", field("version_id")),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value?)))
+        .collect()
+    } else {
+        vec![
+            ("execution_parameters", object("execution_parameters")),
+            ("request_parameters", object("request_parameters")),
+            ("attributes", object("attributes")),
+            (
+                "outcome_detail",
+                field("outcome_detail").unwrap_or_else(|| json!("")),
+            ),
+            (
+                "justification",
+                field("justification").unwrap_or(Value::Null),
+            ),
+        ]
+    };
+    let named: Vec<(&str, &Value)> = values.iter().map(|(name, value)| (*name, value)).collect();
+    metadata_problem(&named)
+}
+
 /// Why a text field would be refused as malformed, or `None`: `min` to `max`
 /// characters, counted as the reference counts them (1.3.1).
 pub(crate) fn length_problem(name: &str, value: &str, min: usize, max: usize) -> Option<String> {
@@ -339,18 +380,13 @@ impl ObservationRecorder {
         }
         // The NA guards the source's own strings too: an actor is a pseudonym,
         // never a credential.
-        let actor = input.actor.clone().map(Value::from);
-        let source_event_id = json!(input.source_event_id);
-        let version_id = input.version_id.clone().map(Value::from);
-        let mut guarded = vec![("metadata", &metadata)];
-        if let Some(actor) = &actor {
-            guarded.push(("actor", actor));
-        }
-        guarded.push(("source_event_id", &source_event_id));
-        if let Some(version_id) = &version_id {
-            guarded.push(("version_id", version_id));
-        }
-        if let Some(secret) = metadata_problem(&guarded) {
+        let guarded = json!({
+            "metadata": &metadata,
+            "actor": &input.actor,
+            "source_event_id": &input.source_event_id,
+            "version_id": &input.version_id,
+        });
+        if let Some(secret) = record_metadata_problem("observation", &guarded) {
             return Err(refused("observation_secret_material", secret));
         }
         let mut record = Map::new();
@@ -614,13 +650,14 @@ pub(crate) fn sign_break_glass(
     let request_parameters = object_or_empty(input.request_parameters, "request_parameters")?;
     let attributes = object_or_empty(input.attributes, "attributes")?;
     let execution_parameters = object_or_empty(input.execution_parameters, "execution_parameters")?;
-    if let Some(secret) = metadata_problem(&break_glass_metadata(
-        &execution_parameters,
-        &request_parameters,
-        &attributes,
-        &json!(input.outcome_detail.as_deref().unwrap_or_default()),
-        &json!(input.justification),
-    )) {
+    let guarded = json!({
+        "execution_parameters": &execution_parameters,
+        "request_parameters": &request_parameters,
+        "attributes": &attributes,
+        "outcome_detail": &input.outcome_detail,
+        "justification": &input.justification,
+    });
+    if let Some(secret) = record_metadata_problem("break_glass", &guarded) {
         return Err(refused("break_glass_secret_material", secret));
     }
     let mut record = Map::new();

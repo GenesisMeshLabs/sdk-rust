@@ -99,7 +99,10 @@ fn shape(fields: Vec<(&'static str, Check)>, exact: bool) -> Check {
 fn signature() -> Check {
     nullable(shape(vec![("key_id", string()), ("sig", string())], false))
 }
-/// Absent, `null` (read as absent) or valid.
+/// Absent, `null` (read as absent) or valid. Since 1.3.1 also for a field
+/// the reference always writes, `null` when it has no value: a record without
+/// it is then refused by its signature or its form, as the reference refuses
+/// it, not as `payload_invalid`.
 fn absent(check: Check) -> Check {
     optional(nullable(check))
 }
@@ -187,7 +190,7 @@ fn policy_binding() -> Check {
             ("context_digest", string()),
             ("registry_gate_types", array(string())),
             ("resolution_status", one_of(&["resolved", "failed"])),
-            ("resolution_failure", nullable(string())),
+            ("resolution_failure", absent(string())),
         ],
         false,
     )
@@ -239,9 +242,9 @@ validator!(
                 optional(nullable(shape(
                     vec![
                         ("attestation_id", string()),
-                        ("subject_id", nullable(string())),
-                        ("issuer_sovereign_id", nullable(string())),
-                        ("attestation_digest", nullable(string())),
+                        ("subject_id", absent(string())),
+                        ("issuer_sovereign_id", absent(string())),
+                        ("attestation_digest", absent(string())),
                         ("revocation_seq_checked", nonnegative()),
                     ],
                     false
@@ -287,8 +290,8 @@ validator!(
             ("execution_parameters", object()),
             ("executed_at", timestamp()),
             ("outcome", string()),
-            ("outcome_detail", nullable(string())),
-            ("prev_evidence_digest", nullable(string())),
+            ("outcome_detail", absent(string())),
+            ("prev_evidence_digest", absent(string())),
             (
                 "resource_id",
                 optional(nullable(Box::new(|v| v
@@ -342,7 +345,7 @@ validator!(
                                 false
                             ))
                         ),
-                        ("short_circuited_at", nullable(string())),
+                        ("short_circuited_at", absent(string())),
                         ("final_authorized", boolean()),
                     ],
                     false
@@ -363,7 +366,7 @@ validator!(
             ("removed_through_sequence", nonnegative()),
             ("last_removed_entry_digest", string()),
             ("removed_count", nonnegative()),
-            ("previous_checkpoint_id", nullable(string())),
+            ("previous_checkpoint_id", absent(string())),
             ("issued_by", string()),
             ("signature", optional(signature())),
             (
@@ -1248,6 +1251,109 @@ fn out_of_band_signed(
     })
 }
 
+/// Whether an export payload of a known kind is well formed.
+fn valid_payload(kind: &str, payload: &Value) -> bool {
+    match kind {
+        "decision" => valid_decision(payload.get("decision")),
+        "justification" => valid_justification(Some(payload)),
+        "execution" => valid_execution(Some(payload)),
+        "retention_checkpoint" => valid_checkpoint(Some(payload)),
+        "observation" => valid_observation(Some(payload)),
+        "break_glass" => valid_break_glass(Some(payload)),
+        "judgement" => valid_judgement(Some(payload)),
+        "quarantine" => valid_quarantine(Some(payload)),
+        "registry" => valid_registry(Some(payload)),
+        _ => false,
+    }
+}
+
+/// A record's id, which appears once per kind in a store (v1.3.1).
+fn record_id_of(kind: &str, payload: &Value) -> String {
+    let id = match kind {
+        "decision" => &payload["decision"]["decision_id"],
+        "justification" => &payload["proof_id"],
+        "execution" => &payload["evidence_id"],
+        "retention_checkpoint" => &payload["checkpoint_id"],
+        "observation" => &payload["observation_id"],
+        "break_glass" => &payload["break_glass_id"],
+        "judgement" => &payload["judgement_id"],
+        "quarantine" => &payload["quarantine_id"],
+        "registry" => &payload["registry_record_id"],
+        _ => &Value::Null,
+    };
+    id.as_str().unwrap_or_default().to_owned()
+}
+
+/// v1.3.1: the envelope fields a Stage 2 entry derives from its record, and
+/// the record field each must equal (an absent field is null). The NA
+/// searches and matches on them.
+const ENVELOPE_FIELDS: [(&str, &[(&str, &str)]); 5] = [
+    (
+        "observation",
+        &[
+            ("record_id", "observation_id"),
+            ("resource_id", "resource_id"),
+            ("resource_action", "action"),
+            ("capability", "capability"),
+            ("executor_sovereign_id", "observer_sovereign_id"),
+        ],
+    ),
+    (
+        "break_glass",
+        &[
+            ("record_id", "break_glass_id"),
+            ("resource_id", "resource_id"),
+            ("resource_action", "resource_action"),
+            ("capability", "capability"),
+            ("executor_sovereign_id", "executor_sovereign_id"),
+            ("attestation_id", "attestation_id"),
+            ("outcome", "outcome"),
+        ],
+    ),
+    (
+        "judgement",
+        &[
+            ("record_id", "judgement_id"),
+            ("subject_id", "subject_id"),
+            ("resource_id", "resource_id"),
+            ("resource_action", "action"),
+            ("capability", "capability"),
+            ("outcome", "verdict"),
+            ("matched_evidence_id", "matched_evidence_id"),
+        ],
+    ),
+    (
+        "quarantine",
+        &[
+            ("record_id", "quarantine_id"),
+            ("resource_id", "resource_id"),
+            ("outcome", "rejection_code"),
+        ],
+    ),
+    (
+        "registry",
+        &[("record_id", "registry_record_id"), ("outcome", "event")],
+    ),
+];
+
+/// The envelope fields of an entry that differ from what its record says.
+fn envelope_mismatches(kind: &str, entry: &Value, payload: &Value) -> Vec<&'static str> {
+    let null = Value::Null;
+    ENVELOPE_FIELDS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, fields)| {
+            fields
+                .iter()
+                .filter(|(field, source)| {
+                    entry.get(*field).unwrap_or(&null) != payload.get(*source).unwrap_or(&null)
+                })
+                .map(|(field, _)| *field)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn fail(result: &mut EvidenceVerification, seq: Option<i64>, reason: &str, detail: &str) {
     result.verified = false;
     result.failures.push(VerificationFailure {
@@ -1263,6 +1369,22 @@ fn fail(result: &mut EvidenceVerification, seq: Option<i64>, reason: &str, detai
 /// judgements, quarantine and registry entries), each resource's observation
 /// positions, one judgement per record that names it as stored, and
 /// execution evidence matched once.
+///
+/// v1.3.1, as the reference verifies an export:
+///
+/// * a run that starts at entry 1, or right after the checkpoint, holds each
+///   chain from its start; one that starts anywhere else takes the first
+///   record it holds of a resource as that chain's start;
+/// * a record's id appears once per kind (`duplicate_record`);
+/// * a Stage 2 entry's envelope names what its record says, every field the
+///   NA derives from it (`envelope_mismatch`, once per entry);
+/// * a judgement's subject is keyed by its kind and id; its matched record is
+///   in a run from entry 1 (`judgement_match_missing`);
+/// * a retention checkpoint removed as many entries as positions, counted
+///   from the checkpoint before it when the run holds that one
+///   (`retention_count_mismatch`);
+/// * a record with fields outside its signature is checked for its form as
+///   the signer signed it.
 pub fn verify_evidence_events<'a>(
     events: impl IntoIterator<Item = &'a Value>,
     options: &VerifyEvidenceOptions,
@@ -1301,10 +1423,16 @@ pub fn verify_evidence_events<'a>(
         .flatten()
         .filter_map(|(resource, position)| Some((resource.clone(), position.as_i64()?)))
         .collect();
-    let mut subjects: HashMap<String, (String, i64)> = HashMap::new();
-    let mut judged: HashSet<String> = HashSet::new();
+    // v1.3.1: judgement subjects and judged records by kind and id.
+    let mut subjects: HashMap<(String, String), (String, i64)> = HashMap::new();
+    let mut judged: HashSet<(String, String)> = HashSet::new();
     let mut matched: HashSet<String> = HashSet::new();
     let mut not_decisions: HashSet<String> = HashSet::new();
+    // v1.3.1: the record ids seen per kind, the records a judgement can
+    // match, and each retention checkpoint's last removed position.
+    let mut record_ids: HashSet<(String, String)> = HashSet::new();
+    let mut matchable: HashSet<String> = HashSet::new();
+    let mut checkpoints: HashMap<String, i64> = HashMap::new();
     let mut first_sequence: Option<i64> = None;
     let mut from_start = false;
     let mut prev: Option<Value> = None;
@@ -1414,11 +1542,10 @@ pub fn verify_evidence_events<'a>(
             }
         }
         let payload = &checked.payload;
-        // v1.3.0: a record whose signature covers it as received, in a form
-        // the reference does not write, is refused by name, as the reference
-        // refuses it (checked when the whole record was signed, not after
-        // unsigned fields were set aside).
-        let whole = checked.unsigned.is_empty();
+        // A record whose signature covers it as received, in a form the
+        // reference does not write, is refused by name, as the reference
+        // refuses it (v1.3.0); since 1.3.1 also one whose fields outside its
+        // signature were set aside, checked as the signer signed it.
         let signature = |result: &mut EvidenceVerification,
                          signed: bool,
                          model: &str,
@@ -1426,17 +1553,37 @@ pub fn verify_evidence_events<'a>(
                          detail: &str| {
             if !signed {
                 fail(result, s, "invalid_signature", detail);
-            } else if whole && !non_canonical_fields(model, record).is_empty() {
+            } else if !non_canonical_fields(model, record).is_empty() {
                 fail(result, s, "non_canonical_form", detail);
             }
         };
+        if !valid_payload(kind, payload) {
+            fail(&mut result, s, "payload_invalid", "");
+            continue;
+        }
+        // v1.3.1: a record appears once per kind; a copied entry is a replay.
+        let record_id = record_id_of(kind, payload);
+        if !record_ids.insert((kind.to_owned(), record_id.clone())) {
+            fail(
+                &mut result,
+                s,
+                "duplicate_record",
+                &format!("{kind} {record_id}"),
+            );
+        }
+        // v1.3.1: the envelope names what the record says.
+        let wrong = envelope_mismatches(kind, entry, payload);
+        if !wrong.is_empty() {
+            fail(
+                &mut result,
+                s,
+                "envelope_mismatch",
+                &format!("{kind}: {}", wrong.join(", ")),
+            );
+        }
         match kind {
             "decision" => {
                 let decision = &payload["decision"];
-                if !valid_decision(payload.get("decision")) {
-                    fail(&mut result, s, "payload_invalid", "");
-                    continue;
-                }
                 signature(
                     &mut result,
                     verify_decision_signature(decision, &options.na_public_keys),
@@ -1456,10 +1603,6 @@ pub fn verify_evidence_events<'a>(
                 }
             }
             "justification" => {
-                if !valid_justification(Some(payload)) {
-                    fail(&mut result, s, "payload_invalid", "");
-                    continue;
-                }
                 signature(
                     &mut result,
                     verify_justification_signature(payload, &options.na_public_keys),
@@ -1469,10 +1612,6 @@ pub fn verify_evidence_events<'a>(
                 );
             }
             "execution" => {
-                if !valid_execution(Some(payload)) {
-                    fail(&mut result, s, "payload_invalid", "");
-                    continue;
-                }
                 let ev = payload;
                 let key = ev
                     .get("signature")
@@ -1526,13 +1665,18 @@ pub fn verify_evidence_events<'a>(
                     fail(&mut result, s, "evidence_chain_break", "");
                 }
                 last_exec.insert(decision_id, ev.clone());
+                matchable.insert(str_field(ev, "evidence_id").unwrap_or_default().to_owned());
                 if let Some(resource_id) = str_field(ev, "resource_id") {
                     let head = resource_heads.get(resource_id);
                     let expected = head.map_or(1, |h| h.resource_sequence + 1);
                     let resource_sequence = ev.get("resource_sequence").and_then(Value::as_u64);
-                    if resource_sequence != Some(expected)
-                        || str_field(ev, "prev_resource_digest")
-                            != head.map(|h| h.record_digest.as_str())
+                    // v1.3.1: a run that starts after entry 1 and not right
+                    // after the checkpoint takes the first record it holds of
+                    // a resource as that chain's start.
+                    if (head.is_some() || from_start)
+                        && (resource_sequence != Some(expected)
+                            || str_field(ev, "prev_resource_digest")
+                                != head.map(|h| h.record_digest.as_str()))
                     {
                         fail(&mut result, s, "resource_chain_break", resource_id);
                     }
@@ -1546,10 +1690,6 @@ pub fn verify_evidence_events<'a>(
                 }
             }
             "retention_checkpoint" => {
-                if !valid_checkpoint(Some(payload)) {
-                    fail(&mut result, s, "payload_invalid", "");
-                    continue;
-                }
                 signature(
                     &mut result,
                     verify_retention_checkpoint(payload, &options.na_public_keys),
@@ -1557,37 +1697,45 @@ pub fn verify_evidence_events<'a>(
                     payload,
                     "retention_checkpoint",
                 );
+                // v1.3.1: a checkpoint removed as many entries as positions,
+                // counted from the checkpoint before it when the run holds
+                // that one, or from entry 1 when there is none.
+                let through = payload["removed_through_sequence"]
+                    .as_i64()
+                    .unwrap_or_default();
+                let start = match str_field(payload, "previous_checkpoint_id") {
+                    None => Some(0),
+                    Some(previous) => checkpoints.get(previous).copied(),
+                };
+                if let Some(start) = start {
+                    if payload["removed_count"].as_i64() != Some(through - start) {
+                        fail(
+                            &mut result,
+                            s,
+                            "retention_count_mismatch",
+                            &format!(
+                                "removed {} of {} entries after #{start} through #{through}",
+                                payload["removed_count"],
+                                through - start
+                            ),
+                        );
+                    }
+                }
+                checkpoints.insert(record_id, through);
             }
             "observation" | "break_glass" => {
                 let observation = kind == "observation";
-                let valid = if observation {
-                    valid_observation(Some(payload))
-                } else {
-                    valid_break_glass(Some(payload))
-                };
-                if !valid {
-                    fail(&mut result, s, "payload_invalid", "");
-                    continue;
-                }
                 let signed = out_of_band_signed(kind, payload, options, &executor_keys);
                 signature(&mut result, signed, model_of(kind), payload, kind);
-                let id_field = if observation {
-                    "observation_id"
-                } else {
-                    "break_glass_id"
-                };
-                let record_id = str_field(payload, id_field).unwrap_or_default().to_owned();
                 let resource = str_field(payload, "resource_id")
                     .unwrap_or_default()
                     .to_owned();
-                if str_field(entry, "record_id") != Some(record_id.as_str())
-                    || str_field(entry, "resource_id") != Some(resource.as_str())
-                {
-                    fail(&mut result, s, "envelope_mismatch", kind);
-                }
                 let digest = str_field(entry, "payload_digest").unwrap_or_default();
-                subjects.insert(record_id.clone(), (digest.to_owned(), seq));
-                not_decisions.insert(record_id);
+                subjects.insert(
+                    (kind.to_owned(), record_id.clone()),
+                    (digest.to_owned(), seq),
+                );
+                not_decisions.insert(record_id.clone());
                 if observation {
                     result.observations += 1;
                     let position = entry["observation_sequence"].as_i64();
@@ -1599,29 +1747,27 @@ pub fn verify_evidence_events<'a>(
                     observation_heads.insert(resource, next);
                 } else {
                     result.break_glass += 1;
+                    matchable.insert(record_id);
                 }
             }
             "judgement" => {
-                if !valid_judgement(Some(payload)) {
-                    fail(&mut result, s, "payload_invalid", "");
-                    continue;
-                }
                 let signed = out_of_band_signed(kind, payload, options, &executor_keys);
                 signature(&mut result, signed, model_of(kind), payload, kind);
                 result.judgements += 1;
-                let judgement_id = str_field(payload, "judgement_id").unwrap_or_default();
+                not_decisions.insert(record_id);
                 let subject_id = str_field(payload, "subject_id").unwrap_or_default();
-                not_decisions.insert(judgement_id.to_owned());
-                if str_field(entry, "subject_id") != Some(subject_id)
-                    || str_field(entry, "record_id") != Some(judgement_id)
-                {
-                    fail(&mut result, s, "envelope_mismatch", "judgement");
-                }
-                if !judged.insert(subject_id.to_owned()) {
+                // v1.3.1: keyed by the subject's kind and id.
+                let subject = (
+                    str_field(payload, "subject_kind")
+                        .unwrap_or_default()
+                        .to_owned(),
+                    subject_id.to_owned(),
+                );
+                if !judged.insert(subject.clone()) {
                     fail(&mut result, s, "duplicate_judgement", subject_id);
                 }
                 let subject_sequence = payload["subject_store_sequence"].as_i64();
-                match subjects.get(subject_id) {
+                match subjects.get(&subject) {
                     Some((digest, sequence)) => {
                         if Some(digest.as_str()) != str_field(payload, "subject_digest")
                             || Some(*sequence) != subject_sequence
@@ -1641,13 +1787,17 @@ pub fn verify_evidence_events<'a>(
                     if !matched.insert(evidence_id.to_owned()) {
                         fail(&mut result, s, "match_reused", evidence_id);
                     }
+                    // v1.3.1: the NA matches a record it already holds, so a
+                    // run from entry 1 holds it.
+                    if options.contiguous
+                        && first_sequence == Some(1)
+                        && !matchable.contains(evidence_id)
+                    {
+                        fail(&mut result, s, "judgement_match_missing", evidence_id);
+                    }
                 }
             }
             "quarantine" => {
-                if !valid_quarantine(Some(payload)) {
-                    fail(&mut result, s, "payload_invalid", "");
-                    continue;
-                }
                 let signed = out_of_band_signed(kind, payload, options, &executor_keys);
                 signature(&mut result, signed, model_of(kind), payload, kind);
                 result.quarantined += 1;
@@ -1658,10 +1808,6 @@ pub fn verify_evidence_events<'a>(
                 }
             }
             "registry" => {
-                if !valid_registry(Some(payload)) {
-                    fail(&mut result, s, "payload_invalid", "");
-                    continue;
-                }
                 let signed = out_of_band_signed(kind, payload, options, &executor_keys);
                 signature(&mut result, signed, model_of(kind), payload, kind);
             }
