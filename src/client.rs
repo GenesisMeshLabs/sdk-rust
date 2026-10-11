@@ -1,7 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
+use chrono::{DateTime, Utc};
 use ed25519_dalek::SigningKey;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, RETRY_AFTER};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -335,18 +336,52 @@ impl HttpTransport {
         self.parse(response).await
     }
 
-    async fn post<T>(&self, path: &str, body: Value, extra_headers: HeaderMap) -> Result<T>
+    /// [`public_post`](Self::public_post), with how long the NA asked the
+    /// caller to wait (`Retry-After`) when it refused the request (1.3.1).
+    pub(crate) async fn public_post_waiting<T>(
+        &self,
+        path: &str,
+        body: impl Serialize,
+    ) -> (Result<T>, Option<Duration>)
     where
         T: DeserializeOwned,
     {
-        let response = self
+        let sent = match serde_json::to_value(body) {
+            Ok(body) => self.send_post(path, body, HeaderMap::new()).await,
+            Err(err) => Err(err.into()),
+        };
+        let response = match sent {
+            Ok(response) => response,
+            Err(err) => return (Err(err), None),
+        };
+        let wait = retry_after(response.headers(), Utc::now());
+        match self.parse(response).await {
+            Ok(value) => (Ok(value), None),
+            Err(err) => (Err(err), wait),
+        }
+    }
+
+    async fn send_post(
+        &self,
+        path: &str,
+        body: Value,
+        extra_headers: HeaderMap,
+    ) -> Result<reqwest::Response> {
+        Ok(self
             .http
             .post(self.url(path)?)
             .header(CONTENT_TYPE, "application/json")
             .headers(extra_headers)
             .json(&body)
             .send()
-            .await?;
+            .await?)
+    }
+
+    async fn post<T>(&self, path: &str, body: Value, extra_headers: HeaderMap) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let response = self.send_post(path, body, extra_headers).await?;
         self.parse(response).await
     }
 
@@ -385,6 +420,18 @@ impl HttpTransport {
         }
         Ok(format!("{}{}", self.base_url, path))
     }
+}
+
+/// How long a response asks the caller to wait before trying again
+/// (`Retry-After`, 1.3.1): delay seconds or an HTTP date; `None` when it says
+/// nothing usable.
+pub(crate) fn retry_after(headers: &HeaderMap, now: DateTime<Utc>) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
+    }
+    let at = DateTime::parse_from_rfc2822(value).ok()?;
+    Some((at.with_timezone(&Utc) - now).to_std().unwrap_or_default())
 }
 
 /// A response whose body could not be read (v1.3.0): the NA answered, so this
@@ -489,5 +536,33 @@ impl GenesisMeshClient {
             health: HealthClient::new(Arc::clone(&transport)),
             policy: PolicyClient::new(transport),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_retry_after_as_seconds_or_a_date() {
+        let now = DateTime::parse_from_rfc3339("2026-10-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let wait = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+            retry_after(&headers, now)
+        };
+        assert_eq!(wait("60"), Some(Duration::from_secs(60)));
+        assert_eq!(wait(" 0 "), Some(Duration::ZERO));
+        assert_eq!(
+            wait("Sat, 10 Oct 2026 12:02:00 GMT"),
+            Some(Duration::from_secs(120))
+        );
+        // A date already past asks for no wait.
+        assert_eq!(wait("Sat, 10 Oct 2026 11:00:00 GMT"), Some(Duration::ZERO));
+        assert_eq!(wait("soon"), None);
+        assert_eq!(wait("-5"), None);
+        assert_eq!(retry_after(&HeaderMap::new(), now), None);
     }
 }

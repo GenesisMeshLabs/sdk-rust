@@ -1,9 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
         Arc, Mutex, PoisonError,
     },
+    time::Duration,
 };
 
 use chrono::Utc;
@@ -16,7 +17,7 @@ use crate::{
     errors::{GenesisMeshError, Result},
     execution::ensure_metadata_only,
     outbox::{
-        classify_record_submission_error, classify_submission_error, retry_delay, timestamp,
+        classify_record_submission_error, classify_submission_error, next_attempt, next_attempt_at,
         Delivery, EvidenceOutbox, FlushReport, OutboxEntry, OutboxState, RecordDelivery,
         RecordFlushReport, RecordKind, RecordOutbox, RecordOutboxEntry, SubmissionFailure,
         PREDECESSOR_DEAD_LETTERED,
@@ -33,6 +34,11 @@ const MAX_INLINE_DRAIN: usize = 100;
 
 /// Most observations one batch request carries (v1.3.0).
 const OBSERVATION_BATCH: usize = 100;
+
+/// Refusals of a record whose predecessor the NA does not hold: retried while
+/// that predecessor may still be admitted, final once it is a dead letter
+/// (1.3.1).
+const CHAIN_GAPS: [&str; 2] = ["evidence_chain_gap", "resource_chain_gap"];
 
 /// The head of a resource chain: what the next record must link to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,11 +70,15 @@ fn outbox_error(err: std::io::Error) -> GenesisMeshError {
     GenesisMeshError::Outbox(err)
 }
 
-fn predecessor_refused() -> SubmissionFailure {
+/// The NA's chain-gap refusal of a record behind a dead letter, as kept.
+fn predecessor_refused(failure: SubmissionFailure) -> SubmissionFailure {
     SubmissionFailure {
-        status: 0,
+        status: failure.status,
         code: PREDECESSOR_DEAD_LETTERED.into(),
-        message: "a record this one chains from was refused".into(),
+        message: format!(
+            "a record this one chains from was refused; the NA answered {}: {}",
+            failure.code, failure.message
+        ),
     }
 }
 
@@ -123,6 +133,12 @@ pub struct EvidenceStoreClient {
     record_outbox: Option<Arc<dyn RecordOutbox>>,
     flushing_records: Arc<AtomicBool>,
     records_in_flight: Arc<InFlight>,
+    /// Most observations a batch carries: halved each time the NA throttles
+    /// one (`429`, 1.3.1).
+    observation_batch: Arc<AtomicUsize>,
+    /// No record is due before this time (Unix milliseconds): the NA asked
+    /// the client to wait (`Retry-After`, 1.3.1).
+    records_paused_until: Arc<AtomicI64>,
 }
 
 impl EvidenceStoreClient {
@@ -139,6 +155,8 @@ impl EvidenceStoreClient {
             record_outbox,
             flushing_records: Arc::new(AtomicBool::new(false)),
             records_in_flight: Arc::default(),
+            observation_batch: Arc::new(AtomicUsize::new(OBSERVATION_BATCH)),
+            records_paused_until: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -158,7 +176,10 @@ impl EvidenceStoreClient {
     /// older ones wait for [`flush_pending`](Self::flush_pending)). A failed
     /// submission is not an error: a transient one leaves the record pending,
     /// and a refusal no retry can overcome keeps it as a dead letter with the
-    /// NA's code, as does a predecessor's refusal. Fails only when the outbox
+    /// NA's code. A record whose predecessor was refused is submitted too
+    /// (1.3.1), so the NA can quarantine it when it refuses it for good; one
+    /// refused only for the gap its predecessor left is a dead letter
+    /// (`evidence_predecessor_dead_lettered`). Fails only when the outbox
     /// cannot store the record. Passing a record already in the outbox
     /// submits it again.
     pub async fn enqueue(&self, evidence: Value) -> Result<Delivery> {
@@ -184,11 +205,7 @@ impl EvidenceStoreClient {
         if entry.state == OutboxState::DeadLetter {
             return Ok(Delivery::queued(entry));
         }
-        let (dead, pending) = chain_of(&entries, &entry)?;
-        if dead {
-            let refused = dead_letter(outbox, &mut entries, entry, predecessor_refused()).await?;
-            return Ok(Delivery::queued(refused));
-        }
+        let pending = pending_before(&entries, &entry)?;
         if pending.is_empty() {
             let _holding = self.in_flight.hold(&entry.id);
             return self.attempt(outbox, &mut entries, entry).await;
@@ -214,13 +231,18 @@ impl EvidenceStoreClient {
     }
 
     /// Submit the outbox's pending records in the order they were added
-    /// (v1.2.0). A record waits while one it chains from is pending, and is
-    /// dead-lettered (`evidence_predecessor_dead_lettered`) when that one was
-    /// refused. Records in backoff are skipped unless `ignore_backoff`, as is
-    /// a record an `enqueue` call is submitting (reported pending, v1.3.0); a
-    /// transient error ends the run, leaving the rest for the next one. Run
-    /// it at startup and on a timer, one run at a time per client: a call
-    /// while another runs returns [`GenesisMeshError::FlushInProgress`].
+    /// (v1.2.0). A record waits while one it chains from is pending. A record
+    /// whose predecessor was refused is submitted too (1.3.1), and is
+    /// dead-lettered (`evidence_predecessor_dead_lettered`) when the NA
+    /// refuses it for the gap that predecessor left; before 1.3.1 a record
+    /// behind a dead letter of an earlier run was retried for good. Records
+    /// in backoff are skipped unless `ignore_backoff`, as is a record an
+    /// `enqueue` call is submitting (reported pending, v1.3.0); a transient
+    /// error ends the run, leaving the rest for the next one, and its next
+    /// attempt waits at least as long as the NA's `Retry-After` asks (1.3.1,
+    /// at most 15 minutes). Run it at startup and on a timer, one run at a
+    /// time per client: a call while another runs returns
+    /// [`GenesisMeshError::FlushInProgress`].
     pub async fn flush_pending(&self, options: FlushOptions) -> Result<FlushReport> {
         let outbox = self.require_outbox()?;
         if self.flushing.swap(true, Ordering::AcqRel) {
@@ -253,7 +275,8 @@ impl EvidenceStoreClient {
         entries: &mut [OutboxEntry],
         entry: OutboxEntry,
     ) -> Result<Delivery> {
-        match self.submit(entry.evidence.clone()).await {
+        let (submitted, wait) = self.submit_waiting(entry.evidence.clone()).await;
+        match submitted {
             Ok(ack) => {
                 // The NA holds the record even if this fails: the next flush
                 // resubmits it, gets a duplicate and removes it.
@@ -263,17 +286,29 @@ impl EvidenceStoreClient {
             Err(err) => {
                 let (failure, transient) = classify_submission_error(&err);
                 let attempts = entry.attempts + 1;
+                // A gap behind a record not admitted yet closes once it is;
+                // behind a dead letter it never does (1.3.1).
+                let dead = dead_digests(entries)?;
+                if CHAIN_GAPS.contains(&failure.code.as_str())
+                    && predecessors(&entry.evidence)
+                        .iter()
+                        .any(|d| dead.contains(d))
+                {
+                    let refused = OutboxEntry { attempts, ..entry };
+                    let failure = predecessor_refused(failure);
+                    return Ok(Delivery::queued(
+                        dead_letter(outbox, entries, refused, failure).await,
+                    ));
+                }
                 if !transient {
                     let refused = OutboxEntry { attempts, ..entry };
                     return Ok(Delivery::queued(
-                        dead_letter(outbox, entries, refused, failure).await?,
+                        dead_letter(outbox, entries, refused, failure).await,
                     ));
                 }
-                let retry = chrono::Duration::from_std(retry_delay(attempts))
-                    .unwrap_or(chrono::Duration::MAX);
                 let failed = OutboxEntry {
                     attempts,
-                    next_attempt_at: Some(timestamp(Utc::now() + retry)),
+                    next_attempt_at: Some(next_attempt_at(attempts, wait)),
                     last_error: Some(failure),
                     ..entry
                 };
@@ -328,20 +363,8 @@ impl EvidenceStoreClient {
             match &delivery.queued {
                 None => report.admitted.push(entry.clone()),
                 Some(refused) if refused.state == OutboxState::DeadLetter => {
+                    // The records chaining from it are submitted in turn (1.3.1).
                     report.dead_lettered.push(refused.clone());
-                    // attempt() also dead-lettered the records chaining from it.
-                    for later in &entries[index..] {
-                        let follows = later.state == OutboxState::DeadLetter
-                            && later
-                                .last_error
-                                .as_ref()
-                                .is_some_and(|e| e.code == PREDECESSOR_DEAD_LETTERED)
-                            && !report.dead_lettered.iter().any(|d| d.id == later.id);
-                        if follows {
-                            outcomes.insert(later.id.clone(), Delivery::queued(later.clone()));
-                            report.dead_lettered.push(later.clone());
-                        }
-                    }
                 }
                 Some(failed) => {
                     waiting.insert(digest);
@@ -358,12 +381,20 @@ impl EvidenceStoreClient {
     /// executor signature, not operator headers. An identical resubmission
     /// returns `status: "duplicate"`, so it is safe to retry.
     pub async fn submit(&self, evidence: Value) -> Result<Value> {
-        ensure_metadata_only(
+        self.submit_waiting(evidence).await.0
+    }
+
+    /// [`submit`](Self::submit), with how long the NA asked to wait when it
+    /// refused the record (`Retry-After`, 1.3.1).
+    async fn submit_waiting(&self, evidence: Value) -> (Result<Value>, Option<Duration>) {
+        if let Err(err) = ensure_metadata_only(
             evidence.get("execution_parameters").unwrap_or(&json!({})),
             evidence.get("outcome_detail").and_then(Value::as_str),
-        )?;
+        ) {
+            return (Err(err), None);
+        }
         self.http
-            .public_post("/evidence/execution", json!({ "evidence": evidence }))
+            .public_post_waiting("/evidence/execution", json!({ "evidence": evidence }))
             .await
     }
 
@@ -580,22 +611,48 @@ impl EvidenceStoreClient {
             .await
     }
 
+    /// Submit one record of the record outbox, with how long the NA asked to
+    /// wait when it refused it (`Retry-After`, 1.3.1).
+    async fn submit_record_waiting(
+        &self,
+        entry: &RecordOutboxEntry,
+    ) -> (Result<Value>, Option<Duration>) {
+        let (path, body) = match entry.kind {
+            RecordKind::Observation => (
+                "/evidence/observations",
+                json!({ "observation": entry.record }),
+            ),
+            RecordKind::BreakGlass => ("/evidence/break-glass", json!({ "record": entry.record })),
+        };
+        self.http.public_post_waiting(path, body).await
+    }
+
     /// Submit up to 100 signed observations in one request (v1.3.0); the NA
     /// admits them in order of their change times. One result per
     /// observation, with its `index` in the request: `recorded`, `duplicate`,
     /// `quarantined`, or `refused` with an `error` (`code`, `message`).
     pub async fn submit_observations(&self, observations: &[Value]) -> Result<Vec<Value>> {
-        let mut body: Value = self
+        self.submit_observations_waiting(observations).await.0
+    }
+
+    /// [`submit_observations`](Self::submit_observations), with how long the
+    /// NA asked to wait when it refused the batch (`Retry-After`, 1.3.1).
+    async fn submit_observations_waiting(
+        &self,
+        observations: &[Value],
+    ) -> (Result<Vec<Value>>, Option<Duration>) {
+        let (answer, wait) = self
             .http
-            .public_post(
+            .public_post_waiting::<Value>(
                 "/evidence/observations/batch",
                 json!({ "observations": observations }),
             )
-            .await?;
-        Ok(match body["results"].take() {
+            .await;
+        let results = answer.map(|mut body| match body["results"].take() {
             Value::Array(results) => results,
             _ => Vec::new(),
-        })
+        });
+        (results, wait)
     }
 
     /// Submit one signed break-glass record (v1.3.0), authenticated by the
@@ -648,30 +705,43 @@ impl EvidenceStoreClient {
         Ok(self.attempt_record(outbox, entry).await)
     }
 
-    /// Submit the record outbox's pending records in the order they were
-    /// added (v1.3.0), consecutive observations up to 100 per request and
-    /// break-glass records one at a time. Records in backoff are skipped
-    /// unless `ignore_backoff`, as are records an `enqueue_record` call is
-    /// submitting (reported pending); a transient error ends the run. A record the
-    /// NA keeps as a quarantine entry is admitted and also listed in
-    /// `quarantined`. One run at a time per client: a call while another
-    /// runs returns [`GenesisMeshError::FlushInProgress`].
+    /// Submit the record outbox's pending records (v1.3.0): break-glass
+    /// records first, one at a time (1.3.1), then observations, consecutive
+    /// ones up to 100 per request, each in the order they were added.
+    /// Break-glass records share the NA's submission rate with observations,
+    /// and an observation of the same change then finds its break-glass
+    /// record. A batch the NA refuses as a whole
+    /// (one record it cannot read, `invalid_json`) or that is larger than it
+    /// takes (`413`) is split in halves until the record it refuses is tried
+    /// alone (1.3.1). A batch it throttles (`429`) halves the batches this
+    /// client sends after it. After a transient refusal with a `Retry-After`,
+    /// no record is due until then (1.3.1, at most 15 minutes). Records in
+    /// backoff are skipped unless `ignore_backoff`, as are records an
+    /// `enqueue_record` call is submitting (reported pending); a transient
+    /// error ends the run. A record the NA keeps as a quarantine entry is
+    /// admitted and also listed in `quarantined`. One run at a time per
+    /// client: a call while another runs returns
+    /// [`GenesisMeshError::FlushInProgress`].
     pub async fn flush_records(&self, options: FlushOptions) -> Result<RecordFlushReport> {
         let outbox = self.require_record_outbox()?;
         if self.flushing_records.swap(true, Ordering::AcqRel) {
             return Err(GenesisMeshError::FlushInProgress);
         }
         let _flushing = Flushing(&self.flushing_records);
-        let entries: Vec<RecordOutboxEntry> = outbox
+        let (mut entries, observations): (Vec<RecordOutboxEntry>, Vec<RecordOutboxEntry>) = outbox
             .list()
             .await
             .map_err(outbox_error)?
             .into_iter()
             .filter(|e| e.state == OutboxState::Pending)
-            .collect();
+            .partition(|e| e.kind == RecordKind::BreakGlass);
+        entries.extend(observations);
         // A record `enqueue_record` is submitting is left to it, as pending.
         let due = |e: &RecordOutboxEntry| {
-            !self.records_in_flight.contains(&e.id) && (options.ignore_backoff || e.due(Utc::now()))
+            let now = Utc::now();
+            let paused = self.records_paused_until.load(Ordering::Acquire) > now.timestamp_millis();
+            !self.records_in_flight.contains(&e.id)
+                && (options.ignore_backoff || (!paused && e.due(now)))
         };
         let mut report = RecordFlushReport::default();
         let mut stopped = false;
@@ -690,40 +760,72 @@ impl EvidenceStoreClient {
                 continue;
             }
             let start = index;
+            let most = self.observation_batch.load(Ordering::Acquire).max(1);
             while index < entries.len()
-                && index - start < OBSERVATION_BATCH
+                && index - start < most
                 && entries[index].kind == RecordKind::Observation
                 && due(&entries[index])
             {
                 index += 1;
             }
-            let batch = &entries[start..index];
-            let records: Vec<Value> = batch.iter().map(|e| e.record.clone()).collect();
-            let results = match self.submit_observations(&records).await {
+            stopped = self
+                .submit_batch(outbox, &entries[start..index], &mut report)
+                .await;
+        }
+        Ok(report)
+    }
+
+    /// Submit a batch of observations and settle each; true when a transient
+    /// failure ends the run. A batch refused as a whole, or larger than the
+    /// NA takes, is split in halves until the record it refuses is tried
+    /// alone; a throttled one (`429`) halves the batches that follow (1.3.1).
+    async fn submit_batch(
+        &self,
+        outbox: &dyn RecordOutbox,
+        batch: &[RecordOutboxEntry],
+        report: &mut RecordFlushReport,
+    ) -> bool {
+        let mut parts = vec![batch];
+        let mut stopped = false;
+        while let Some(part) = parts.pop() {
+            if stopped {
+                report.pending.extend(part.iter().cloned());
+                continue;
+            }
+            let records: Vec<Value> = part.iter().map(|e| e.record.clone()).collect();
+            let (answer, wait) = self.submit_observations_waiting(&records).await;
+            let results = match answer {
                 Ok(results) => results,
                 Err(err) if !too_large(&err) && classify_record_submission_error(&err).1 => {
-                    for e in batch {
-                        let failed = record_failed(outbox, e.clone(), &err).await;
-                        settle(&mut report, e, RecordDelivery::queued(failed));
+                    self.pause_records(&err, wait);
+                    if matches!(
+                        err,
+                        GenesisMeshError::RateLimit { .. }
+                            | GenesisMeshError::Http { status: 429, .. }
+                    ) {
+                        self.observation_batch
+                            .fetch_min((part.len() / 2).max(1), Ordering::AcqRel);
+                    }
+                    for e in part {
+                        let failed = record_failed(outbox, e.clone(), &err, wait).await;
+                        settle(report, e, RecordDelivery::queued(failed));
                     }
                     stopped = true;
                     continue;
                 }
+                Err(_) if part.len() == 1 => {
+                    let delivery = self.attempt_record(outbox, part[0].clone()).await;
+                    stopped = !settle(report, &part[0], delivery);
+                    continue;
+                }
                 Err(_) => {
-                    // The batch itself was refused, or is larger than the NA
-                    // takes (413): each observation is tried alone.
-                    for e in batch {
-                        if stopped {
-                            report.pending.push(e.clone());
-                        } else {
-                            let delivery = self.attempt_record(outbox, e.clone()).await;
-                            stopped = !settle(&mut report, e, delivery);
-                        }
-                    }
+                    let (first, second) = part.split_at(part.len().div_ceil(2));
+                    parts.push(second);
+                    parts.push(first);
                     continue;
                 }
             };
-            for (position, e) in batch.iter().enumerate() {
+            for (position, e) in part.iter().enumerate() {
                 match results
                     .iter()
                     .find(|r| r["index"].as_u64() == Some(position as u64))
@@ -731,19 +833,19 @@ impl EvidenceStoreClient {
                     None => report.pending.push(e.clone()),
                     Some(answer) if answer["status"] == "refused" => {
                         let refusal = batch_refusal(&answer["error"]);
-                        let failed = record_failed(outbox, e.clone(), &refusal).await;
-                        settle(&mut report, e, RecordDelivery::queued(failed));
+                        let failed = record_failed(outbox, e.clone(), &refusal, None).await;
+                        settle(report, e, RecordDelivery::queued(failed));
                     }
                     Some(answer) => {
                         // The NA holds the record even if this fails: the next
                         // flush resubmits it, gets a duplicate and removes it.
                         let _ = outbox.remove(&e.id).await;
-                        settle(&mut report, e, RecordDelivery::admitted(answer.clone()));
+                        settle(report, e, RecordDelivery::admitted(answer.clone()));
                     }
                 }
             }
         }
-        Ok(report)
+        stopped
     }
 
     async fn attempt_record(
@@ -751,18 +853,27 @@ impl EvidenceStoreClient {
         outbox: &dyn RecordOutbox,
         entry: RecordOutboxEntry,
     ) -> RecordDelivery {
-        let submitted = match entry.kind {
-            RecordKind::Observation => self.submit_observation(entry.record.clone()).await,
-            RecordKind::BreakGlass => self.submit_break_glass(entry.record.clone()).await,
-        };
-        match submitted {
-            Ok(ack) => {
+        match self.submit_record_waiting(&entry).await {
+            (Ok(ack), _) => {
                 // The NA holds the record even if this fails: the next flush
                 // resubmits it, gets a duplicate and removes it.
                 let _ = outbox.remove(&entry.id).await;
                 RecordDelivery::admitted(ack)
             }
-            Err(err) => RecordDelivery::queued(record_failed(outbox, entry, &err).await),
+            (Err(err), wait) => {
+                self.pause_records(&err, wait);
+                RecordDelivery::queued(record_failed(outbox, entry, &err, wait).await)
+            }
+        }
+    }
+
+    /// After a transient refusal that says when to try again (`Retry-After`),
+    /// no record is due before then (1.3.1): every record shares the NA's
+    /// submission rate.
+    fn pause_records(&self, err: &GenesisMeshError, wait: Option<Duration>) {
+        if wait.is_some() && classify_record_submission_error(err).1 {
+            let until = next_attempt(0, wait).timestamp_millis();
+            self.records_paused_until.fetch_max(until, Ordering::AcqRel);
         }
     }
 
@@ -899,15 +1010,14 @@ async fn record_failed(
     outbox: &dyn RecordOutbox,
     entry: RecordOutboxEntry,
     err: &GenesisMeshError,
+    wait: Option<Duration>,
 ) -> RecordOutboxEntry {
     let (failure, transient) = classify_record_submission_error(err);
     let attempts = entry.attempts + 1;
     let next = if transient {
-        let retry =
-            chrono::Duration::from_std(retry_delay(attempts)).unwrap_or(chrono::Duration::MAX);
         RecordOutboxEntry {
             attempts,
-            next_attempt_at: Some(timestamp(Utc::now() + retry)),
+            next_attempt_at: Some(next_attempt_at(attempts, wait)),
             last_error: Some(failure),
             ..entry
         }
@@ -994,14 +1104,12 @@ fn dead_digests(entries: &[OutboxEntry]) -> Result<HashSet<String>> {
     Ok(dead)
 }
 
-/// Whether `entry` chains from a dead letter, and the ids of the pending
-/// records it chains from.
-fn chain_of(entries: &[OutboxEntry], entry: &OutboxEntry) -> Result<(bool, Vec<String>)> {
+/// The ids of the pending records `entry` chains from.
+fn pending_before(entries: &[OutboxEntry], entry: &OutboxEntry) -> Result<Vec<String>> {
     let mut by_digest = HashMap::new();
     for e in entries {
         by_digest.insert(execution_digest(&e.evidence)?, e);
     }
-    let dead = dead_digests(entries)?;
     let mut pending = Vec::new();
     let mut seen = HashSet::new();
     let mut stack = predecessors(&entry.evidence);
@@ -1017,20 +1125,18 @@ fn chain_of(entries: &[OutboxEntry], entry: &OutboxEntry) -> Result<(bool, Vec<S
         }
         stack.extend(predecessors(&before.evidence));
     }
-    let chains_from_dead = predecessors(&entry.evidence)
-        .iter()
-        .any(|d| dead.contains(d));
-    Ok((chains_from_dead, pending))
+    Ok(pending)
 }
 
-/// Dead-letter `entry` and every pending record after it that chains from
-/// it.
+/// Dead-letter `entry`. The records that chain from it stay pending (1.3.1):
+/// each is submitted in turn, so the NA quarantines one it refuses for good,
+/// and one it refuses only for the gap is dead-lettered then.
 async fn dead_letter(
     outbox: &dyn EvidenceOutbox,
     entries: &mut [OutboxEntry],
     entry: OutboxEntry,
     failure: SubmissionFailure,
-) -> Result<OutboxEntry> {
+) -> OutboxEntry {
     let refused = OutboxEntry {
         state: OutboxState::DeadLetter,
         next_attempt_at: None,
@@ -1038,24 +1144,8 @@ async fn dead_letter(
         ..entry
     };
     keep(outbox, &refused).await;
-    let Some(position) = entries.iter().position(|e| e.id == refused.id) else {
-        return Ok(refused);
-    };
-    entries[position] = refused.clone();
-    let mut dead = HashSet::from([execution_digest(&refused.evidence)?]);
-    for later in entries[position + 1..].iter_mut() {
-        if later.state != OutboxState::Pending
-            || !predecessors(&later.evidence)
-                .iter()
-                .any(|d| dead.contains(d))
-        {
-            continue;
-        }
-        dead.insert(execution_digest(&later.evidence)?);
-        later.state = OutboxState::DeadLetter;
-        later.next_attempt_at = None;
-        later.last_error = Some(predecessor_refused());
-        keep(outbox, later).await;
+    if let Some(slot) = entries.iter_mut().find(|e| e.id == refused.id) {
+        *slot = refused.clone();
     }
-    Ok(refused)
+    refused
 }

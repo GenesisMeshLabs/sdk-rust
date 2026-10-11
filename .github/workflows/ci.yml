@@ -127,7 +127,9 @@ jobs:
             if [ -n "${GITHUB_HEAD_REF:-}" ] && git ls-remote --exit-code --heads https://github.com/GenesisMeshLabs/genesismesh.git "refs/heads/$GITHUB_HEAD_REF" > /dev/null; then
               core_ref="$GITHUB_HEAD_REF"
             fi
-            core="$(curl -fsSL --retry 3 -H "Authorization: Bearer ${{ github.token }}" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/GenesisMeshLabs/genesismesh/contents/VERSION?ref=$core_ref" | tr -d '[:space:]')"
+            # A branch name is a query value: encoded, so '#', '&' or '+' in it cannot change the request.
+            ref_query="$(jq -rn --arg ref "$core_ref" '$ref | @uri')"
+            core="$(curl -fsSL --retry 3 -H "Authorization: Bearer ${{ github.token }}" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/GenesisMeshLabs/genesismesh/contents/VERSION?ref=$ref_query" | tr -d '[:space:]')"
             if [ "$(printf '%s\n%s\n' "$version" "$core" | sort -V | tail -n 1)" != "$core" ]; then
               echo "::error::Version $version is ahead of the Genesis Mesh core ($core). The core leads every coordinated version; see genesismesh docs/development/versioning.md."
               exit 1
@@ -137,8 +139,9 @@ jobs:
                 echo "::error::Tag $GITHUB_REF_NAME does not match version $version."
                 exit 1
               fi
-              if [ "$version" != "$core" ] && ! git ls-remote --exit-code --tags https://github.com/GenesisMeshLabs/genesismesh.git "refs/tags/v$version" > /dev/null; then
-                echo "::error::Release $version is not a Genesis Mesh core version (core is $core). Release the core first."
+              # The core release is tagged first, even when the core's main already names the version.
+              if ! git ls-remote --exit-code --tags https://github.com/GenesisMeshLabs/genesismesh.git "refs/tags/v$version" > /dev/null; then
+                echo "::error::The Genesis Mesh core has no tag v$version (core main is $core). Release the core first."
                 exit 1
               fi
             fi
@@ -146,7 +149,8 @@ jobs:
 
   github-release:
     if: github.ref_type == 'tag'
-    needs: [test, release-checks, release-train]
+    # sdk-e2e runs the crate against the core release of the same tag.
+    needs: [test, sdk-e2e, release-checks, release-train]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

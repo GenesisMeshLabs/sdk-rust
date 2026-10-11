@@ -155,7 +155,12 @@ async fn rotate(gm: &GenesisMeshClient, attestation: Value, policy: Value, na_ke
 A denial returns `authorized: false` without running the action. A failed action
 is recorded as a `failure` record without its error text (`ActionFailed`).
 Metadata that looks like secret material, or exceeds 16 KiB, is refused before
-signing (`SecretMaterial`). `verify::verify_evidence_events` checks an export
+signing (`SecretMaterial`), as is a resource action other than `create`,
+`rotate`, `revoke`, `update` or `delete` (`Configuration`). Since 1.3.1 a record
+no reader would take, nested more than 64 deep as it is submitted or kept in an
+outbox, is refused before signing as `StrictJson` (`invalid_json`); after an
+action has run, its outcome is then recorded without the parameters nested too
+deep (`MetadataRefused`). `verify::verify_evidence_events` checks an export
 offline with the same reason codes as the Python reference, and
 `verify::verify_boundary_decision` checks one decision.
 
@@ -166,7 +171,12 @@ writes each record there before submitting it and removes it once the NA admits
 it. `FileOutbox` keeps one JSON file per record in a directory, written to a
 temporary file, synced and renamed into place, in the format the TypeScript SDK
 uses. It reads the directory once and keeps it in memory, so one process uses a
-directory at a time, and recovers what a crash left on that first read. A
+directory at a time, and recovers what a crash left on that first read. Nothing
+enforces that: two processes sharing a directory submit each other's records
+and overwrite each other's changes, so give each process a directory of its
+own. An entry file that cannot be read is moved aside as `<name>.unreadable`
+(1.3.1): the read that finds it fails once (`Outbox`, code
+`outbox_file_unreadable`) and the record it held is not submitted. A
 directory it creates is `0700` and its files `0600` on Unix; on Windows, or for
 a directory that already exists, restrict access to it yourself. Implement the
 `EvidenceOutbox` trait (its methods return boxed futures) to keep records in a
@@ -178,15 +188,19 @@ NA's acknowledgement when it admitted the record; otherwise `result.queued` is
 the outbox entry: `OutboxState::Pending` after a failure a later attempt can
 overcome (network, timeout, `5xx`, `429`, an executor key not registered yet, a
 chain gap, a disabled store, a proxy's error page), or `OutboxState::DeadLetter`
-after a refusal no retry can overcome (`PERMANENT_REFUSALS`), or when a record it
-chains from was refused (`evidence_predecessor_dead_lettered`), with the code in
-`last_error`. Dead letters are kept, never dropped. Without an outbox,
-`governed_action` behaves as in 1.1.
+after a refusal no retry can overcome (`PERMANENT_REFUSALS`; since 1.3.1 also
+`invalid_json`, the NA's strict reader refusing the request), with the code in
+`last_error`. A record that chains from a dead letter is still submitted
+(1.3.1), so the NA can quarantine it when it refuses it for good on its own
+account; refused for the gap the dead letter left, it is a dead letter with
+`evidence_predecessor_dead_lettered`. Dead letters are kept, never dropped.
+Without an outbox, `governed_action` behaves as in 1.1.
 
 `gm.evidence_store.flush_pending(FlushOptions::default())` submits pending
 records in the order they were added; run it at startup and on a timer, one run
 at a time (`FlushInProgress` otherwise). A record waits behind a pending
-predecessor. Retries back off from 5 s to 15 minutes;
+predecessor. Retries back off from 5 s to 15 minutes, and wait at least as
+long as the NA's `Retry-After` asks (1.3.1, at most 15 minutes);
 `FlushOptions { ignore_backoff: true }` retries at once. A transient error ends
 the run. A resource with pending records chains from the newest of them, not
 from the NA's head, and the next action on it submits them first (up to 100),
@@ -241,9 +255,15 @@ async fn start(url: &str) -> Result<GenesisMeshClient, Box<dyn std::error::Error
 
 `enqueue_record` keeps a record and submits it; a transient failure leaves it
 pending, and a refusal no retry can overcome (`RECORD_PERMANENT_REFUSALS`)
-keeps it as a dead letter. `flush_records` submits pending records in order,
-observations up to 100 per request (one at a time when the NA refuses a batch,
-or finds it too large). A record the NA admits outside its time
+keeps it as a dead letter. `flush_records` submits pending break-glass
+records first (1.3.1), then observations, each in the order they were added,
+observations up to 100 per request. A batch the NA refuses as a whole (one
+record its strict reader cannot read, `invalid_json`) or finds too large is
+split in halves until the record it refuses is tried alone (1.3.1). A batch it
+throttles (`429`) halves the batches the client sends after it, and no
+record is due again until the NA's `Retry-After` has passed, so a submission
+rate (`NA_RATE_LIMIT_OBSERVATIONS_PER_MINUTE`) below 100 a minute still drains
+the backlog. A record the NA admits outside its time
 bounds is kept by the NA as a quarantine entry and is listed in the run's
 `quarantined`. Implement the `RecordOutbox` trait to keep records elsewhere;
 `MemoryRecordOutbox` is for tests only.
@@ -282,9 +302,14 @@ async fn observe(gm: &GenesisMeshClient, observer_public_key: &str, observer_see
 ```
 
 `actor` is recorded as the source reported it and is not authenticated: use a
-pseudonymous identifier, never a credential. `metadata` passes the secret
-guard (`observation_secret_material`): names, versions and times, never
-values. Name the version (`version_id`) when the source reports one: the NA
+pseudonymous identifier, never a credential. `metadata`, and the `actor`,
+source event and version strings, pass the secret guard as the NA applies it
+(`observation_secret_material`): names, versions and times, never values, at
+most 16 KiB together as the NA counts them (since 1.3.1: text outside ASCII
+escaped, as `é`). A record the NA would find malformed is not signed
+either (`observation_malformed`): an action other than `create`, `rotate`,
+`revoke`, `update` or `delete`, a field of the wrong length, or a time outside
+the years 1 to 9999. Name the version (`version_id`) when the source reports one: the NA
 matches the observation to execution evidence for the same resource, action
 and capability that reports the same `execution_parameters.version_id`, and
 the change is then governed by that evidence's decision, unless the
@@ -294,7 +319,9 @@ finding knows only that a resource
 changed between two scans: `observation_from_finding` turns one (the JSON the
 other SDKs' reconciliation returns) into an observation input with that
 window, which the NA judges at both ends, and returns `None` for a resource in
-sync.
+sync. An observation's id defaults to one derived from its observer, source and
+source event (`observation_id`, 1.3.1), so the same finding signed again is
+the same record, which the NA answers as a `duplicate`.
 
 ### Break-glass
 
@@ -335,8 +362,9 @@ decided, even denied), or any other error. It needs a record outbox
 naming its `requested_capability`. Before anything is evaluated or run it
 checks the justification (1 to 1024 characters), that the context's
 `request_parameters` and `attributes` are objects that, with the
-justification, leave room for the record, and the context and justification
-against the secret guard (`OutOfBandRecord` with `break_glass_malformed` or
+justification, leave room for the record (counted as the NA counts it, since
+1.3.1), and the context and justification against the secret guard
+(`OutOfBandRecord` with `break_glass_malformed` or
 `break_glass_secret_material`). A failed action is recorded as a `failure`
 record (`ActionFailed`, whose `queued_record` holds its entry while the NA is
 away). Once the action ran a record is always kept: an outcome detail is cut

@@ -49,8 +49,8 @@ pub use governance::{
 };
 pub use health::HealthClient;
 pub use out_of_band::{
-    observation_from_finding, BreakGlassInput, EvaluationFailure, FindingObservationOptions,
-    ObservationInput, ObservationRecorder,
+    observation_from_finding, observation_id, BreakGlassInput, EvaluationFailure,
+    FindingObservationOptions, ObservationInput, ObservationRecorder,
 };
 pub use outbox::{
     classify_record_submission_error, classify_submission_error, retry_delay, Delivery,

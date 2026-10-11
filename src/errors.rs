@@ -138,9 +138,10 @@ pub enum GenesisMeshError {
     },
 
     /// With an outbox (v1.2.0): the governed action ran, but the secret guard
-    /// refused metadata it reported. The outcome was recorded without the
-    /// refused fields (`dropped`) as `evidence`; `submission` or `queued` say
-    /// what became of it. Do not rerun the action.
+    /// refused metadata it reported (or, 1.3.1, metadata nested too deep for
+    /// every reader). The outcome was recorded without the refused fields
+    /// (`dropped`) as `evidence`; `submission` or `queued` say what became of
+    /// it. Do not rerun the action.
     /// [`GenesisMeshError::take_action_value`] takes the action's value.
     #[error("the action ran; its metadata was refused and recorded without {}: {reason}", dropped.join(", "))]
     #[non_exhaustive]
@@ -180,7 +181,9 @@ pub enum GenesisMeshError {
     },
 
     /// The evidence outbox failed to store, update, remove or list entries
-    /// (v1.2.0).
+    /// (v1.2.0). Code `outbox_error`, or `outbox_file_unreadable` (1.3.1) when
+    /// a file outbox found entry files it could not read and moved them
+    /// aside.
     #[error("evidence outbox error: {0}")]
     Outbox(#[source] std::io::Error),
 
@@ -258,6 +261,13 @@ impl GenesisMeshError {
             Self::ActionUnrecorded { .. } => "governed_action_unrecorded",
             Self::MetadataRefused { .. } => "governed_action_metadata_refused",
             Self::EvidenceNotKept { .. } => "governed_action_evidence_unkept",
+            Self::Outbox(err)
+                if err
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<crate::outbox::UnreadableFiles>()) =>
+            {
+                "outbox_file_unreadable"
+            }
             Self::Outbox(_) => "outbox_error",
             Self::OutboxRequired => "outbox_required",
             Self::FlushInProgress => "outbox_flush_in_progress",

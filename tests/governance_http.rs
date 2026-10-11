@@ -965,13 +965,16 @@ async fn a_second_action_chains_from_the_pending_head_and_submits_it_first() {
 }
 
 #[tokio::test]
-async fn a_record_behind_a_refused_one_is_dead_lettered_without_submission() {
+async fn a_record_behind_a_refused_one_is_dead_lettered_when_the_na_finds_the_gap() {
     let v = vectors();
     let (url, task) = scripted(vec![
         ok(signed_evaluation(&v, true, "ctx-o6")),
         unavailable(),
         ok(signed_evaluation(&v, true, "ctx-o7")),
         refusal(409, "evidence_conflict"),
+        // 1.3.1: the record behind it is submitted, so the NA can quarantine
+        // one it refuses for good; refused for the gap, it is a dead letter.
+        refusal(422, "resource_chain_gap"),
         ok(signed_evaluation(&v, true, "ctx-o8")),
         ok(json!({"resource_id": v["resource_id"], "resource_sequence": 9, "record_digest": "na-head"})),
         ok(json!({"status": "recorded"})),
@@ -982,17 +985,83 @@ async fn a_record_behind_a_refused_one_is_dead_lettered_without_submission() {
     let second = rotate_to(&c, &v, "ctx-o7", None, "v2").await.unwrap();
     assert_eq!(state(&second.queued), Some(OutboxState::DeadLetter));
     assert_eq!(code(&second.queued), PREDECESSOR_DEAD_LETTERED);
+    let failure = second.queued.unwrap().last_error.unwrap();
+    assert_eq!(failure.status, 422);
+    assert!(
+        failure.message.contains("resource_chain_gap"),
+        "{failure:?}"
+    );
     // A third action no longer chains from the dead records.
     let third = rotate_to(&c, &v, "ctx-o8", None, "v3").await.unwrap();
     assert_eq!(third.evidence.unwrap()["prev_resource_digest"], "na-head");
-    assert_eq!(task.await.unwrap().len(), 7);
+    let r = task.await.unwrap();
+    assert_eq!(r.len(), 8);
+    assert_eq!(r[4].body["evidence"], second.evidence.unwrap());
 }
 
 #[tokio::test]
-async fn enqueue_dead_letters_at_once_behind_a_dead_letter_and_waits_on_the_decision_chain() {
+async fn a_flush_settles_a_record_behind_an_earlier_dead_letter() {
+    // A record whose predecessor a run before this one dead-lettered: before
+    // 1.3.1 it was retried for good, as the NA's gap never closes.
+    let v = vectors();
+    let decision = signed_evaluation(&v, true, "ctx-g")["decision"].clone();
+    let sign = |prior: Option<Value>| {
+        recorder()
+            .record(RecordExecution {
+                decision: decision.clone(),
+                executed_capability: "sp-secret.rotate".into(),
+                resource_id: Some("kv:v/g".into()),
+                resource_action: Some("rotate".into()),
+                prior_resource: prior.map(PriorResource::Record),
+                ..RecordExecution::default()
+            })
+            .unwrap()
+    };
+    let a = sign(None);
+    let b = sign(Some(a.clone()));
+    for (answer, expected, kept) in [
+        (
+            refusal(422, "resource_chain_gap"),
+            OutboxState::DeadLetter,
+            PREDECESSOR_DEAD_LETTERED,
+        ),
+        // Refused on its own account: the NA's code, and the NA quarantines it.
+        (
+            refusal(422, "evidence_decision_denied"),
+            OutboxState::DeadLetter,
+            "evidence_decision_denied",
+        ),
+        (unavailable(), OutboxState::Pending, "service_unavailable"),
+    ] {
+        let outbox = Arc::new(MemoryOutbox::default());
+        let mut dead = OutboxEntry::new(a.clone());
+        dead.state = OutboxState::DeadLetter;
+        outbox.add(&dead).await.unwrap();
+        outbox.add(&OutboxEntry::new(b.clone())).await.unwrap();
+        let (url, task) = scripted(vec![answer]).await;
+        let c = client_with(&url, outbox.clone());
+        let report = c
+            .evidence_store
+            .flush_pending(FlushOptions::default())
+            .await
+            .unwrap();
+        let settled = outbox.list().await.unwrap()[1].clone();
+        assert_eq!(settled.state, expected, "{kept}");
+        assert_eq!(settled.last_error.unwrap().code, kept);
+        assert_eq!(
+            report.dead_lettered.len(),
+            usize::from(expected == OutboxState::DeadLetter)
+        );
+        assert_eq!(task.await.unwrap()[0].body["evidence"], b);
+    }
+}
+
+#[tokio::test]
+async fn enqueue_dead_letters_a_record_behind_a_dead_letter_on_its_gap() {
     let v = vectors();
     let (url, task) = scripted(vec![
         refusal(409, "evidence_conflict"),
+        refusal(422, "resource_chain_gap"),
         unavailable(),
         unavailable(),
     ])
@@ -1032,7 +1101,7 @@ async fn enqueue_dead_letters_at_once_behind_a_dead_letter_and_waits_on_the_deci
         .unwrap();
     let waiting = next.queued.unwrap();
     assert_eq!((waiting.state, waiting.attempts), (OutboxState::Pending, 0));
-    assert_eq!(task.await.unwrap().len(), 3);
+    assert_eq!(task.await.unwrap().len(), 4);
 }
 
 #[tokio::test]
@@ -1179,6 +1248,54 @@ async fn a_guard_refusal_after_the_action_records_the_outcome_and_returns_the_va
     let r = task.await.unwrap();
     assert_eq!(r[1].body["evidence"], *evidence);
     assert!(!r[1].body.to_string().contains("s3cr3t"));
+}
+
+#[tokio::test]
+async fn a_report_nested_too_deep_is_recorded_without_it() {
+    let v = vectors();
+    let (url, task) = scripted(vec![
+        ok(signed_evaluation(&v, true, "ctx-o13")),
+        ok(json!({"status": "recorded"})),
+    ])
+    .await;
+    let c = with_outbox(&url);
+    let mut p = params(&v, "ctx-o13");
+    p.prior_resource = Some(None);
+    // No reader takes JSON nested more than 64 deep (1.3.1).
+    let deep = (1..70).fold(json!({}), |inner, _| json!({ "a": inner }));
+    let err = governed_action(
+        &c.boundary,
+        &c.evidence_store,
+        &recorder(),
+        p,
+        |_| async move {
+            Ok::<_, ActionError>(ActionReport {
+                value: Some(7_u32),
+                execution_parameters: Some(json!({"deep": deep, "secret_version": "v2"})),
+                ..ActionReport::default()
+            })
+        },
+    )
+    .await
+    .unwrap_err();
+    let GenesisMeshError::MetadataRefused {
+        reason,
+        dropped,
+        evidence,
+        submission,
+        ..
+    } = err
+    else {
+        panic!("unexpected error {err}");
+    };
+    assert!(reason.contains("nested more than 64 deep"), "{reason}");
+    assert_eq!(dropped, ["deep"]);
+    assert_eq!(
+        evidence["execution_parameters"],
+        json!({"secret_version": "v2"})
+    );
+    assert_eq!(submission.unwrap()["status"], "recorded");
+    assert_eq!(task.await.unwrap()[1].body["evidence"], *evidence);
 }
 
 #[tokio::test]
