@@ -52,7 +52,8 @@ pub use governance::{
     GovernedActionResult, GovernedVerification, RefusedMetadata,
 };
 pub use governance::{
-    rotate_forward_then_disable, RotateForwardParams, RotateForwardResult, RotatedVersion,
+    rotate_forward_then_disable, urgent_action, EmergencyOptions, RotateForwardParams,
+    RotateForwardResult, RotatedVersion, UrgentActionResult, UrgentPath,
 };
 pub use health::HealthClient;
 #[doc(hidden)]

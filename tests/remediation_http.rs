@@ -11,12 +11,12 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, SigningKey};
 use genesis_mesh_sdk::{
     admin_signing_payload, governed_action, governed_action_with_break_glass, json,
-    rotate_forward_then_disable, ActionError, ActionReport, AdminRequest, BreakGlassOptions,
-    ClientOptions, EvaluationFailure, ExecutionRecorder, FlushOptions, GenesisMeshClient,
-    GenesisMeshError, GovernedActionOutcome, GovernedActionParams, GovernedVerification,
-    MemoryRecordOutbox, OutboxState, RecordKind, RecordOutbox, RemediationInput, RemediationQuery,
-    RemediationSteps, RemediationSubject, ReviewDecision, RotateForwardParams, RotatedVersion,
-    Value,
+    rotate_forward_then_disable, urgent_action, ActionError, ActionReport, AdminRequest,
+    BreakGlassOptions, ClientOptions, EmergencyOptions, EvaluationFailure, ExecutionRecorder,
+    FlushOptions, GenesisMeshClient, GenesisMeshError, GovernedActionOutcome, GovernedActionParams,
+    GovernedVerification, MemoryRecordOutbox, OutboxState, RecordKind, RecordOutbox,
+    RemediationInput, RemediationQuery, RemediationSteps, RemediationSubject, ReviewDecision,
+    RotateForwardParams, RotatedVersion, UrgentPath, Value,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -609,7 +609,7 @@ async fn a_denied_rotation_disables_nothing() {
 }
 
 #[tokio::test]
-async fn a_failed_disable_leaves_the_rotation_recorded_and_the_remediation_incomplete() {
+async fn a_failed_disable_leaves_the_rotation_recorded_and_the_remediation_not_recorded() {
     let v = vectors();
     let (url, task) = scripted(vec![
         ok(signed_evaluation(&v, true, "ctx-3")),
@@ -627,8 +627,8 @@ async fn a_failed_disable_leaves_the_rotation_recorded_and_the_remediation_incom
     )
     .await
     .unwrap_err();
-    assert_eq!(err.code(), "remediation_incomplete");
-    let GenesisMeshError::RemediationIncomplete {
+    assert_eq!(err.code(), "remediation_not_recorded");
+    let GenesisMeshError::RemediationNotRecorded {
         rotation, record, ..
     } = err
     else {
@@ -660,9 +660,10 @@ async fn a_rotation_that_cannot_be_remediated_is_refused_before_it_runs() {
         .code()
         .to_owned()
     };
+    // Without a record outbox the record is submitted directly: the NA is asked.
     assert_eq!(
         run(forward(&v, "c"), client("http://127.0.0.1:9")).await,
-        "record_outbox_required"
+        "network"
     );
     let other_resource = RotateForwardParams {
         subject: subject("kv:vault/other"),
@@ -831,4 +832,299 @@ async fn an_urgent_change_with_the_na_answering_503_or_429_breaks_the_glass() {
         assert_eq!(r[1].route(), "/evidence/break-glass");
         assert_eq!(r[1].body["record"]["capability"], EMERGENCY);
     }
+}
+
+#[tokio::test]
+async fn without_a_record_outbox_the_remediation_is_submitted_directly() {
+    let v = vectors();
+    let (url, task) = scripted(vec![
+        ok(signed_evaluation(&v, true, "ctx-4")),
+        ok(json!({"status": "recorded"})),
+        refusal(422, "remediation_rotation_missing"),
+    ])
+    .await;
+    let c = client(&url);
+    let err = rotate_forward_then_disable(
+        &c.boundary,
+        &c.evidence_store,
+        &executor(),
+        forward(&v, "ctx-4"),
+        |_| rotated("v9"),
+        |_| async { Ok::<_, ActionError>(()) },
+    )
+    .await
+    .unwrap_err();
+    // The NA does not hold the rotation yet: the signed record comes back to
+    // be submitted again.
+    let GenesisMeshError::RemediationNotRecorded { source, record, .. } = err else {
+        panic!("not a remediation left unrecorded");
+    };
+    assert!(source.to_string().contains("remediation_rotation_missing"));
+    assert_eq!(record.unwrap()["version_id"], "v9");
+    assert_eq!(task.await.unwrap()[2].route(), "/evidence/remediations");
+}
+
+fn emergency_options(v: &Value) -> EmergencyOptions {
+    EmergencyOptions {
+        capability: EMERGENCY.into(),
+        justification: "key leaked in a public repository".into(),
+        justification_parameter: None,
+        expected_policies: vec![v["policy"].clone()],
+    }
+}
+
+fn ordinary(v: &Value) -> GovernedActionParams {
+    let mut params = governed(v, "", "sp-secret.rotate", json!({"app_id": "billing"}));
+    params.evaluate["context"]
+        .as_object_mut()
+        .unwrap()
+        .remove("context_id");
+    params.resource_action = Some("rotate".into());
+    params
+}
+
+/// How the scripted NA answers one request, from its body.
+type Answer = Box<dyn Fn(&Value) -> (u16, String) + Send>;
+
+/// Serve the evaluations, answering each with the decision for its context.
+async fn evaluations(answers: Vec<Answer>) -> (String, JoinHandle<Vec<Value>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        for answer in answers {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("client made fewer requests than scripted")
+                .unwrap();
+            let mut bytes = Vec::new();
+            let (head, offset) = loop {
+                let mut chunk = [0; 8192];
+                let count = stream.read(&mut chunk).await.unwrap();
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|p| p == b"\r\n\r\n") {
+                    break (String::from_utf8(bytes[..end].to_vec()).unwrap(), end + 4);
+                }
+            };
+            let length: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|n| n.trim().parse().unwrap())
+                })
+                .unwrap_or(0);
+            while bytes.len() < offset + length {
+                let mut chunk = [0; 8192];
+                let count = stream.read(&mut chunk).await.unwrap();
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            let body: Value = if length == 0 {
+                Value::Null
+            } else {
+                serde_json::from_slice(&bytes[offset..offset + length]).unwrap()
+            };
+            let (status, reply) = answer(&body);
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            seen.push(body);
+        }
+        seen
+    });
+    (url, task)
+}
+
+fn answer_with(v: &Value, allowed: bool) -> Answer {
+    let v = v.clone();
+    Box::new(move |body: &Value| {
+        let context = body["context"]["context_id"].as_str().unwrap().to_owned();
+        ok(signed_evaluation(&v, allowed, &context))
+    })
+}
+
+fn answer(reply: (u16, String)) -> Answer {
+    Box::new(move |_| reply.clone())
+}
+
+async fn rotate_now(
+    decision: Option<Value>,
+) -> std::result::Result<ActionReport<bool>, ActionError> {
+    Ok(ActionReport {
+        value: Some(decision.is_some()),
+        execution_parameters: Some(json!({"version_id": "v9"})),
+        ..ActionReport::default()
+    })
+}
+
+#[tokio::test]
+async fn an_urgent_change_runs_under_the_ordinary_capability_when_it_is_allowed() {
+    let v = vectors();
+    let (url, task) = evaluations(vec![
+        answer_with(&v, true),
+        answer(ok(json!({"status": "recorded"}))),
+    ])
+    .await;
+    let (c, _) = with_records(&url);
+    let urgent = urgent_action(
+        &c.boundary,
+        &c.evidence_store,
+        &executor(),
+        ordinary(&v),
+        emergency_options(&v),
+        rotate_now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(urgent.path, UrgentPath::Ordinary);
+    assert!(urgent.ordinary_denial.is_none());
+    let GovernedActionOutcome::Evaluated(result) = urgent.outcome else {
+        panic!("not evaluated");
+    };
+    assert_eq!(
+        result.evidence.unwrap()["executed_capability"],
+        "sp-secret.rotate"
+    );
+    let seen = task.await.unwrap();
+    assert_eq!(seen[0]["requested_capability"], "sp-secret.rotate");
+    assert!(seen[0]["context"]["request_parameters"]
+        .get("justification")
+        .is_none());
+}
+
+#[tokio::test]
+async fn an_urgent_change_under_a_deny_requests_the_emergency_capability() {
+    let v = vectors();
+    let (url, task) = evaluations(vec![
+        answer_with(&v, false),
+        answer_with(&v, true),
+        answer(ok(json!({"status": "recorded"}))),
+    ])
+    .await;
+    let (c, _) = with_records(&url);
+    let urgent = urgent_action(
+        &c.boundary,
+        &c.evidence_store,
+        &executor(),
+        ordinary(&v),
+        emergency_options(&v),
+        rotate_now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(urgent.path, UrgentPath::Emergency);
+    assert!(!urgent.ordinary_denial.unwrap().authorized);
+    let GovernedActionOutcome::Evaluated(result) = urgent.outcome else {
+        panic!("not evaluated");
+    };
+    assert!(result.authorized);
+    assert_eq!(result.value, Some(true));
+    assert_eq!(result.evidence.unwrap()["executed_capability"], EMERGENCY);
+    let seen = task.await.unwrap();
+    assert_eq!(seen[1]["requested_capability"], EMERGENCY);
+    assert_eq!(
+        seen[1]["context"]["request_parameters"],
+        json!({"app_id": "billing", "justification": "key leaked in a public repository"})
+    );
+    assert_ne!(
+        seen[0]["context"]["context_id"],
+        seen[1]["context"]["context_id"]
+    );
+}
+
+#[tokio::test]
+async fn an_urgent_change_the_na_does_not_answer_breaks_the_glass_naming_the_emergency_capability()
+{
+    let v = vectors();
+    for (status, code, failure) in [
+        (503, "service_unavailable", EvaluationFailure::ServerError),
+        (429, "rate_limited", EvaluationFailure::RateLimited),
+    ] {
+        let (url, task) = evaluations(vec![
+            answer(refusal(status, code)),
+            answer(refusal(status, code)),
+            answer((201, json!({"status": "recorded"}).to_string())),
+        ])
+        .await;
+        let (c, _) = with_records(&url);
+        let urgent = urgent_action(
+            &c.boundary,
+            &c.evidence_store,
+            &executor(),
+            ordinary(&v),
+            emergency_options(&v),
+            rotate_now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(urgent.path, UrgentPath::BreakGlass);
+        let GovernedActionOutcome::BrokeGlass(glass) = urgent.outcome else {
+            panic!("the glass was not broken");
+        };
+        assert_eq!(glass.failure, failure);
+        assert_eq!(glass.value, Some(false));
+        assert_eq!(glass.record["capability"], EMERGENCY);
+        assert_eq!(
+            glass.record["request_parameters"]["justification"],
+            "key leaked in a public repository"
+        );
+        let seen = task.await.unwrap();
+        assert_eq!(seen[1]["requested_capability"], EMERGENCY);
+        assert_eq!(seen[2]["record"]["capability"], EMERGENCY);
+    }
+    // The NA comes back between the two evaluations: the emergency capability is decided.
+    let (url, _task) = evaluations(vec![
+        answer(refusal(503, "service_unavailable")),
+        answer_with(&v, true),
+        answer(ok(json!({"status": "recorded"}))),
+    ])
+    .await;
+    let (c, _) = with_records(&url);
+    let urgent = urgent_action(
+        &c.boundary,
+        &c.evidence_store,
+        &executor(),
+        ordinary(&v),
+        emergency_options(&v),
+        rotate_now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(urgent.path, UrgentPath::Emergency);
+    assert!(urgent.ordinary_denial.is_none());
+}
+
+#[tokio::test]
+async fn an_urgent_change_checks_what_break_glass_needs_before_anything_is_evaluated() {
+    let v = vectors();
+    let c = client("http://127.0.0.1:9");
+    let err = urgent_action(
+        &c.boundary,
+        &c.evidence_store,
+        &executor(),
+        ordinary(&v),
+        emergency_options(&v),
+        rotate_now,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), "record_outbox_required");
+    let (c, _) = with_records("http://127.0.0.1:9");
+    let unjustified = EmergencyOptions {
+        justification: String::new(),
+        ..emergency_options(&v)
+    };
+    let err = urgent_action(
+        &c.boundary,
+        &c.evidence_store,
+        &executor(),
+        ordinary(&v),
+        unjustified,
+        rotate_now,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), "break_glass_malformed");
 }

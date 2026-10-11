@@ -212,24 +212,23 @@ pub enum GenesisMeshError {
 
     /// No record outbox is configured
     /// ([`ClientOptions::with_record_outbox`](crate::ClientOptions::with_record_outbox));
-    /// the record outbox methods and break-glass need one (v1.3.0), and
-    /// [`rotate_forward_then_disable`](crate::rotate_forward_then_disable)
-    /// (1.4.0).
+    /// the record outbox methods and break-glass need one (v1.3.0).
     #[error("no record outbox is configured (ClientOptions::with_record_outbox)")]
     RecordOutboxRequired,
 
     /// [`rotate_forward_then_disable`](crate::rotate_forward_then_disable)
     /// rotated the resource forward (its execution evidence is `rotation`),
-    /// but the denied version was not disabled, or the remediation record
-    /// could not be kept (`record`, when it was signed) (1.4.0). Code
-    /// `remediation_incomplete`. Do not rotate again: disable the denied
-    /// version and sign the remediation with
+    /// but the remediation was not recorded (1.4.0): the denied version was
+    /// not disabled, or the remediation record could not be signed,
+    /// submitted or kept (`record`, when it was signed). Code
+    /// `remediation_not_recorded`, as in the TypeScript SDK. Do not rotate
+    /// again: disable the denied version and sign the remediation with
     /// [`RemediationSteps::RotateForwardThenDisable`](crate::RemediationSteps::RotateForwardThenDisable)
-    /// naming `rotation`'s `evidence_id`, or keep `record` once the record
-    /// outbox works.
-    #[error("the forward rotation ran; the remediation is incomplete: {source}")]
+    /// naming `rotation`'s `evidence_id`, or submit `record` once the cause
+    /// is fixed (the NA answers the same record again as a duplicate).
+    #[error("the forward rotation ran; the remediation was not recorded: {source}")]
     #[non_exhaustive]
-    RemediationIncomplete {
+    RemediationNotRecorded {
         /// Why.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -295,7 +294,7 @@ impl GenesisMeshError {
             Self::OutboxRequired => "outbox_required",
             Self::FlushInProgress => "outbox_flush_in_progress",
             Self::RecordOutboxRequired => "record_outbox_required",
-            Self::RemediationIncomplete { .. } => "remediation_incomplete",
+            Self::RemediationNotRecorded { .. } => "remediation_not_recorded",
             Self::Configuration(_) => "configuration",
             Self::Network(_) => "network",
             Self::ResponseBodyUnreadable { .. } => "response_body_unreadable",

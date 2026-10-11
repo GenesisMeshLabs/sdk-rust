@@ -782,6 +782,47 @@ where
     F: FnOnce(Option<Value>) -> Fut,
     Fut: Future<Output = std::result::Result<ActionReport<T>, ActionError>>,
 {
+    match attempt(
+        boundary,
+        evidence_store,
+        recorder,
+        params,
+        break_glass,
+        false,
+        action,
+    )
+    .await?
+    {
+        Attempt::Done(outcome) => Ok(outcome),
+        Attempt::Denied(result, _) => Ok(GovernedActionOutcome::Evaluated(result)),
+        Attempt::Unanswered(err, _) => Err(err),
+    }
+}
+
+/// What one governed attempt did. With `hand_back` (1.4.0, for
+/// [`urgent_action`]), a DENY or an evaluation that got no answer returns the
+/// action, which did not run.
+enum Attempt<T, F> {
+    Done(GovernedActionOutcome<T>),
+    Denied(GovernedActionResult<T>, F),
+    Unanswered(GenesisMeshError, F),
+}
+
+/// [`run`], handing the action back when it did not run and `hand_back`.
+async fn attempt<T, F, Fut>(
+    boundary: &BoundaryClient,
+    evidence_store: &EvidenceStoreClient,
+    recorder: &ExecutionRecorder,
+    params: GovernedActionParams,
+    break_glass: Option<&BreakGlassOptions>,
+    hand_back: bool,
+    action: F,
+) -> Result<Attempt<T, F>>
+where
+    T: Send + 'static,
+    F: FnOnce(Option<Value>) -> Fut,
+    Fut: Future<Output = std::result::Result<ActionReport<T>, ActionError>>,
+{
     if params.resource_id.is_some() != params.resource_action.is_some() {
         return Err(GenesisMeshError::Configuration(
             "resource_id and resource_action go together".into(),
@@ -826,6 +867,9 @@ where
     let evaluation = match boundary.evaluate(request.clone()).await {
         Ok(evaluation) => evaluation,
         Err(err) => {
+            if hand_back && evaluation_failure(&err).is_some() {
+                return Ok(Attempt::Unanswered(err, action));
+            }
             let (Some(options), Some(failure)) = (break_glass, evaluation_failure(&err)) else {
                 return Err(err);
             };
@@ -840,14 +884,14 @@ where
                 action,
             )
             .await
-            .map(GovernedActionOutcome::BrokeGlass);
+            .map(|result| Attempt::Done(GovernedActionOutcome::BrokeGlass(result)));
         }
     };
     let decision = evaluation["decision"].clone();
     check_decision(&decision, &params, &context_id)?;
     let summary = summarize_decision(&decision);
     if !summary.authorized {
-        return Ok(GovernedActionOutcome::Evaluated(GovernedActionResult {
+        let denied = GovernedActionResult {
             evaluation,
             authorized: false,
             summary,
@@ -855,7 +899,12 @@ where
             evidence: None,
             submission: None,
             queued: None,
-        }));
+        };
+        return Ok(if hand_back {
+            Attempt::Denied(denied, action)
+        } else {
+            Attempt::Done(GovernedActionOutcome::Evaluated(denied))
+        });
     }
 
     let prior = match (&params.resource_id, &params.prior_resource) {
@@ -942,15 +991,17 @@ where
     if outbox.is_none() {
         let evidence = record(outcome, execution_parameters, outcome_detail)?;
         let submission = evidence_store.submit(evidence.clone()).await?;
-        return Ok(GovernedActionOutcome::Evaluated(GovernedActionResult {
-            evaluation,
-            authorized: true,
-            summary,
-            value,
-            evidence: Some(evidence),
-            submission: Some(submission),
-            queued: None,
-        }));
+        return Ok(Attempt::Done(GovernedActionOutcome::Evaluated(
+            GovernedActionResult {
+                evaluation,
+                authorized: true,
+                summary,
+                value,
+                evidence: Some(evidence),
+                submission: Some(submission),
+                queued: None,
+            },
+        )));
     }
 
     // The action ran: from here on its outcome is always recorded.
@@ -999,15 +1050,17 @@ where
             value: ActionValue::new(value),
         });
     }
-    Ok(GovernedActionOutcome::Evaluated(GovernedActionResult {
-        evaluation,
-        authorized: true,
-        summary,
-        value,
-        evidence: Some(evidence),
-        submission: delivery.submission,
-        queued: delivery.queued,
-    }))
+    Ok(Attempt::Done(GovernedActionOutcome::Evaluated(
+        GovernedActionResult {
+            evaluation,
+            authorized: true,
+            summary,
+            value,
+            evidence: Some(evidence),
+            submission: delivery.submission,
+            queued: delivery.queued,
+        },
+    )))
 }
 
 // ── Remediation by a forward rotation (1.4.0) ────────────────────────────────
@@ -1064,8 +1117,9 @@ pub struct RotateForwardResult<T> {
     pub record: Option<Value>,
     /// The NA's answer to the record, when it admitted it.
     pub submission: Option<Value>,
-    /// The record outbox entry holding the record otherwise: pending (for
-    /// example until the rotation's evidence is admitted) or a dead letter.
+    /// With a record outbox, the entry holding the record otherwise: pending
+    /// (for example until the rotation's evidence is admitted) or a dead
+    /// letter.
     pub queued: Option<RecordOutboxEntry>,
 }
 
@@ -1081,20 +1135,22 @@ pub struct RotateForwardResult<T> {
 /// 2. `disable` disables (or deletes) `disabled_version_id`.
 /// 3. The remediation record (`rotate_forward_then_disable`, outcome
 ///    `cancelled`) names the rotation's `evidence_id`, the new version and
-///    the disabled one; it is signed by `recorder` and kept in the record
-///    outbox, then submitted. The NA admits it once it holds the rotation's
-///    evidence; until then it stays pending (`remediation_rotation_missing`
-///    is retried).
+///    the disabled one; it is signed by `recorder`, kept in the record outbox
+///    when there is one (submitted directly otherwise), and submitted. The
+///    NA admits it once it holds the rotation's evidence: with a record
+///    outbox it stays pending until then (`remediation_rotation_missing` is
+///    retried); flush the evidence outbox first.
 ///
-/// Before anything is evaluated or run, it needs a record outbox
-/// ([`GenesisMeshError::RecordOutboxRequired`]), a `resource_id` equal to
+/// Before anything is evaluated or run, it needs a `resource_id` equal to
 /// the subject's and a `rotate` or `update` action
-/// ([`GenesisMeshError::Configuration`]), and a remediation the NA would
-/// admit ([`GenesisMeshError::OutOfBandRecord`], `remediation_malformed` or
-/// `remediation_secret_material`). Errors of the rotation are those of
-/// [`governed_action`]. Once the rotation ran, a disable that fails, a new
-/// version equal to the denied one, or a record that cannot be kept returns
-/// [`GenesisMeshError::RemediationIncomplete`] with the rotation's evidence.
+/// ([`GenesisMeshError::Configuration`]), a remediation the NA would admit
+/// ([`GenesisMeshError::OutOfBandRecord`], `remediation_malformed` or
+/// `remediation_secret_material`), and a record outbox that can be read.
+/// Errors of the rotation are those of [`governed_action`]. Once the rotation
+/// ran, a new version equal to the denied one (nothing is disabled), a
+/// disable that fails, or a record that cannot be signed, submitted or kept
+/// returns [`GenesisMeshError::RemediationNotRecorded`] with the rotation's
+/// evidence, and the record when it was signed.
 pub async fn rotate_forward_then_disable<T, R, RFut, D, DFut>(
     boundary: &BoundaryClient,
     evidence_store: &EvidenceStoreClient,
@@ -1110,9 +1166,6 @@ where
     D: FnOnce(String) -> DFut,
     DFut: Future<Output = std::result::Result<(), ActionError>>,
 {
-    let outbox = evidence_store
-        .record_outbox()
-        .ok_or(GenesisMeshError::RecordOutboxRequired)?;
     let RotateForwardParams {
         mut governed,
         subject,
@@ -1150,7 +1203,10 @@ where
         recorder.executor_sovereign_id(),
         &input("rotation".into(), placeholder.into()),
     )?;
-    outbox.list().await.map_err(GenesisMeshError::Outbox)?;
+    if let Some(outbox) = evidence_store.record_outbox() {
+        // A record outbox that cannot be read fails here, before anything runs.
+        outbox.list().await.map_err(GenesisMeshError::Outbox)?;
+    }
 
     let rotation = governed_action(
         boundary,
@@ -1200,7 +1256,7 @@ where
         });
     };
     let incomplete =
-        |source: ActionError, record: Option<Value>| GenesisMeshError::RemediationIncomplete {
+        |source: ActionError, record: Option<Value>| GenesisMeshError::RemediationNotRecorded {
             source,
             rotation: Box::new(evidence.clone()),
             record: record.map(Box::new),
@@ -1222,14 +1278,179 @@ where
     let record = recorder
         .sign_remediation(input(evidence_id, version_id))
         .map_err(|err| incomplete(Box::new(err), None))?;
-    let delivery = evidence_store
-        .enqueue_record(record.clone())
-        .await
-        .map_err(|err| incomplete(Box::new(err), Some(record.clone())))?;
+    let (submission, queued) = if evidence_store.record_outbox().is_some() {
+        let delivery = evidence_store
+            .enqueue_record(record.clone())
+            .await
+            .map_err(|err| incomplete(Box::new(err), Some(record.clone())))?;
+        (delivery.submission, delivery.queued)
+    } else {
+        let submission = evidence_store
+            .submit_remediation(record.clone())
+            .await
+            .map_err(|err| incomplete(Box::new(err), Some(record.clone())))?;
+        (Some(submission), None)
+    };
     Ok(RotateForwardResult {
         rotation,
         record: Some(record),
-        submission: delivery.submission,
-        queued: delivery.queued,
+        submission,
+        queued,
+    })
+}
+
+// ── Urgent changes (1.4.0) ───────────────────────────────────────────────────
+
+/// The emergency capability an urgent change falls back to (1.4.0): a
+/// capability of its own, selected by a policy with an `emergency` section.
+#[derive(Debug, Clone)]
+pub struct EmergencyOptions {
+    /// The emergency capability.
+    pub capability: String,
+    /// Why the change cannot wait: 1 to 1024 characters, no secret values.
+    /// Sent as the emergency policy's justification parameter, and recorded
+    /// as a break-glass record's justification.
+    pub justification: String,
+    /// The emergency policy's `justification_parameter`; `None` for
+    /// `justification`.
+    pub justification_parameter: Option<String>,
+    /// The policies the emergency capability's decision must bind
+    /// (`verify.expected_policies` for it).
+    pub expected_policies: Vec<Value>,
+}
+
+/// How an urgent change went (1.4.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UrgentPath {
+    /// The ordinary capability was allowed: the change ran under it.
+    Ordinary,
+    /// The ordinary capability was denied, or its evaluation got no answer,
+    /// and the emergency capability was decided (the outcome says whether it
+    /// was allowed).
+    Emergency,
+    /// The NA did not answer for the emergency capability either: the change
+    /// ran under break-glass naming it.
+    BreakGlass,
+}
+
+/// What [`urgent_action`] did (1.4.0).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct UrgentActionResult<T> {
+    /// Which path the change took.
+    pub path: UrgentPath,
+    /// The governed action's outcome on that path.
+    pub outcome: GovernedActionOutcome<T>,
+    /// The ordinary capability's DENY, when the emergency capability was
+    /// requested after it.
+    pub ordinary_denial: Option<GovernedActionResult<T>>,
+}
+
+/// An urgent change (1.4.0): never blocked, always governed and judged.
+///
+/// * The ordinary capability (`params`) is evaluated first, as
+///   [`governed_action`] does; an ALLOW runs the action under it
+///   ([`UrgentPath::Ordinary`]).
+/// * On a DENY, or when that evaluation gets no answer (a network error, a
+///   timeout, `5xx` or `429`; see [`evaluation_failure`]), the emergency
+///   capability is requested with the justification in its justification
+///   parameter; the NA decides it under the emergency policy before the
+///   change and reviews it after ([`UrgentPath::Emergency`]; the outcome's
+///   `authorized` is false when that is a DENY too).
+/// * When the NA does not answer for the emergency capability either, the
+///   action runs under break-glass naming the emergency capability, with the
+///   justification parameter in its request parameters; the NA judges it
+///   under the emergency policy once it is back ([`UrgentPath::BreakGlass`]).
+///
+/// The action gets the decision it runs under, or `None` under break-glass.
+/// Everything break-glass needs is checked before anything is evaluated, as
+/// [`governed_action_with_break_glass`] checks it: a record outbox, an
+/// attestation-based evaluation and `resource_id`. The emergency
+/// capability's decision is verified against `emergency.expected_policies`.
+pub async fn urgent_action<T, F, Fut>(
+    boundary: &BoundaryClient,
+    evidence_store: &EvidenceStoreClient,
+    recorder: &ExecutionRecorder,
+    params: GovernedActionParams,
+    emergency: EmergencyOptions,
+    action: F,
+) -> Result<UrgentActionResult<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(Option<Value>) -> Fut,
+    Fut: Future<Output = std::result::Result<ActionReport<T>, ActionError>>,
+{
+    let parameter = emergency
+        .justification_parameter
+        .as_deref()
+        .unwrap_or("justification");
+    let mut urgent = params.clone();
+    if !urgent.evaluate.is_object() {
+        return Err(GenesisMeshError::Configuration(
+            "evaluate must be a JSON object".into(),
+        ));
+    }
+    urgent.evaluate["requested_capability"] = json!(emergency.capability);
+    let context = &mut urgent.evaluate["context"];
+    if !context.is_object() {
+        *context = json!({});
+    }
+    // Each attempt is a request of its own.
+    if let Some(context) = context.as_object_mut() {
+        context.remove("context_id");
+    }
+    let parameters = &mut context["request_parameters"];
+    if parameters.is_null() {
+        *parameters = json!({});
+    }
+    if !parameters.is_object() {
+        return Err(GenesisMeshError::Configuration(
+            "context.request_parameters must be a JSON object".into(),
+        ));
+    }
+    parameters[parameter] = json!(emergency.justification);
+    urgent.verify.expected_policies = emergency.expected_policies;
+    let break_glass = BreakGlassOptions::new(emergency.justification);
+    check_break_glass(evidence_store, recorder, &urgent, &break_glass).await?;
+
+    let (ordinary_denial, action) = match attempt(
+        boundary,
+        evidence_store,
+        recorder,
+        params,
+        None,
+        true,
+        action,
+    )
+    .await?
+    {
+        Attempt::Done(outcome) => {
+            return Ok(UrgentActionResult {
+                path: UrgentPath::Ordinary,
+                outcome,
+                ordinary_denial: None,
+            })
+        }
+        Attempt::Denied(denied, action) => (Some(denied), action),
+        Attempt::Unanswered(_, action) => (None, action),
+    };
+    let outcome = run(
+        boundary,
+        evidence_store,
+        recorder,
+        urgent,
+        Some(&break_glass),
+        action,
+    )
+    .await?;
+    let path = match outcome {
+        GovernedActionOutcome::Evaluated(_) => UrgentPath::Emergency,
+        GovernedActionOutcome::BrokeGlass(_) => UrgentPath::BreakGlass,
+    };
+    Ok(UrgentActionResult {
+        path,
+        outcome,
+        ordinary_denial,
     })
 }

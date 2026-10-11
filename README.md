@@ -483,11 +483,14 @@ async fn cancel(gm: &GenesisMeshClient, recorder: &ExecutionRecorder, state: &Va
 }
 ```
 
-It needs a record outbox. A DENY of the rotation stops it with nothing
+The record is kept in the record outbox when there is one (pending until the
+NA holds the rotation's evidence: flush the evidence outbox first), and
+submitted directly otherwise. A DENY of the rotation stops it with nothing
 disabled. Once the rotation ran, a disable that fails, or a record that cannot
-be kept, returns `RemediationIncomplete` with the rotation's evidence: do not
-rotate again. `remediation::check_remediation` names the refusal the NA would
-answer for a signed record and a registered key.
+be signed, submitted or kept, returns `RemediationNotRecorded`
+(`remediation_not_recorded`) with the rotation's evidence and the record when
+it was signed: do not rotate again. `remediation::check_remediation` names the
+refusal the NA would answer for a signed record and a registered key.
 
 ### Reviews
 
@@ -504,15 +507,24 @@ the request body is exactly what the record proves.
 
 ### Urgent changes
 
-None is blocked, and each is judged and reviewed:
+`urgent_action` takes an urgent change through the path that applies; none is
+blocked, and each is judged and reviewed (`UrgentActionResult::path`):
 
-- **The NA answers with an ordinary DENY**: call `governed_action` again with
-  the emergency capability (a capability of its own, with its own policy) and
-  its justification parameter in the request parameters. The NA decides it
-  under the emergency policy and opens a review of the decision.
-- **The NA is down, or answers `5xx` or `429`**:
-  `governed_action_with_break_glass` with the emergency capability; the NA
-  judges the break-glass record under the emergency policy when it arrives.
+- **`Ordinary`**: the ordinary capability is allowed; the change runs under it.
+- **`Emergency`**: on an ordinary DENY, or when that evaluation gets no
+  answer, the emergency capability (`EmergencyOptions`: a capability of its
+  own, selected by a policy with an `emergency` section) is requested with the
+  justification in its justification parameter. The NA decides it under the
+  emergency policy before the change, and opens a review of the decision.
+- **`BreakGlass`**: the NA does not answer for it either (a network error, a
+  timeout, `5xx` or `429`): the change runs under break-glass naming the
+  emergency capability, and the NA judges it under the emergency policy when
+  the record arrives.
+
+It checks what break-glass needs before anything is evaluated (a record
+outbox, an attestation-based evaluation, `resource_id`, the justification).
+The same paths can be taken by hand with `governed_action` and
+`governed_action_with_break_glass`.
 
 ### Policies and offline verification
 
