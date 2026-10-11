@@ -1,5 +1,150 @@
 # Changelog
 
+## 1.3.1 - 2026-10-11
+
+### Changed
+
+- `enqueue` and `flush_pending` no longer dead-letter the records behind a
+  refused record without submitting them. Each is submitted in turn and
+  settled by the NA's answer.
+- **An outbox file that cannot be read no longer stops every action.**
+  `FileOutbox` and `FileRecordOutbox` failed every read, and so every governed
+  action, while one entry file was not readable. They now move the file aside
+  as `<name>.unreadable` and fail the read that found it, once
+  (`GenesisMeshError::Outbox`, code `outbox_file_unreadable`), as the
+  TypeScript SDK does. The record it held is not submitted, so inspect the
+  file. A file of the other outbox's format is still refused, and left where
+  it is.
+- `flush_records` submits break-glass records first, then observations, each
+  in the order they were added, as the TypeScript SDK does. They share the
+  NA's submission rate, and an observation of the same change then finds its
+  break-glass record.
+
+### Fixed
+
+- **`verify_evidence_events` verifies an export as the reference does**
+  (the conformance suite `out_of_band`, now 80 vectors).
+  - An export that starts after entry 1 (a later page, an export since a
+    position) takes the first record it holds of each resource as that
+    chain's start. It reported `resource_chain_break` for a correct store.
+  - A record copied later in the store is refused as `duplicate_record`. Ids
+    are compared within one kind.
+  - Every envelope field the NA derives from a record of a change made
+    outside the controlled path must name what the record says:
+    `envelope_mismatch`, at most once per entry. Only the record and resource
+    ids were checked.
+  - A judgement's subject is looked up by its kind and id, and so is a
+    `duplicate_judgement`. A record of another kind with the same id is not
+    its subject.
+  - A judgement whose matched record is not in an export from entry 1 is
+    refused as `judgement_match_missing`.
+  - A retention checkpoint must have removed as many entries as positions,
+    counted from the checkpoint before it when the export holds that one:
+    `retention_count_mismatch`.
+  - A record with fields outside its signature is checked for its form as
+    its signer signed it (`non_canonical_form`). Its form was not checked
+    before.
+- **A record without a field the reference writes as `null`** (an execution
+  record's `outcome_detail` or `prev_evidence_digest`, a justification's
+  `trace.short_circuited_at`, a checkpoint's `previous_checkpoint_id`, the
+  nullable fields of a decision's bindings) is refused for its signature
+  (`invalid_signature`) or its form, as the reference refuses it. It was
+  `payload_invalid`.
+- **Floats are written as Python writes them, ties included.** For a float
+  exactly halfway between two shortest forms (`13509655414498.0625`),
+  `canonical_json` wrote the larger one (`...498.063`) where the reference
+  writes the one ending in an even digit (`...498.062`). Such a value in
+  signed metadata gave a different canonical form, so an honest record failed
+  verification here, and a record this crate signed failed it everywhere
+  else. The digits are now exactly Python's `repr`.
+- **Observations and break-glass records are guarded exactly as the NA
+  guards them.** The secret guard now applies the reference's
+  `metadata_problem`. It covers an observation's `actor`, `source_event_id` and
+  `version_id` with its `metadata`, and a break-glass record's justification
+  with its parameters, attributes and outcome detail. It counts their size as
+  the NA does: text outside ASCII escaped (`é` is six bytes, an emoji twelve)
+  and floats in Python's form. Before, such a record was signed after its
+  action ran, then refused for good (`*_secret_material`) and dead-lettered.
+  Now it is refused before signing. `governed_action_with_break_glass` keeps
+  room for the report measured the same way before the action runs. A report
+  that leaves no room with the justification is left out of the record
+  (`dropped`), which is still kept.
+- A string ending in a newline is checked as the reference checks it: a token
+  or key followed by `\n` is refused as secret material, as the NA refuses it.
+- **An observation of one source event always has the same id.**
+  `ObservationRecorder::record` used a random `observation_id`, so recording
+  one finding again (`observation_from_finding` after a restart, a second run
+  over one scan) signed a different record for the same source event. The NA
+  refused it for good as `observation_conflict` and it was dead-lettered. The
+  default id is now `observation_id(observer, source, source_event_id)`: the
+  SHA-256, in hex, of the observer sovereign, source and source event id
+  joined by NUL characters, as in the TypeScript SDK. The same record signed
+  again is a `duplicate`. An id you give is kept.
+- **A record behind a dead letter no longer waits forever.** When a record's
+  predecessor had been dead-lettered by an earlier run (or its dead-lettering
+  was not stored), `flush_pending` submitted the record. The NA answered
+  `resource_chain_gap`, which was retried on every run, and the record held
+  back its resource. A record that chains from a dead letter is still
+  submitted, as in the TypeScript SDK, so the NA can quarantine it when it
+  refuses it for good on its own account. When the NA refuses it for the gap
+  (`evidence_chain_gap`, `resource_chain_gap`), it becomes a dead letter with
+  `evidence_predecessor_dead_lettered` and the NA's answer in its message.
+- **A record outbox no longer deletes an execution outbox's crash
+  leftovers.** Opened on a directory of the other outbox's files,
+  `FileRecordOutbox` (or `FileOutbox`) removed that outbox's temporary files
+  before refusing the directory. A crash during an add leaves such a file, so
+  a signed record that its own outbox would have recovered was lost. A
+  directory with a temporary file of the other format is now refused before
+  anything in it changes.
+- The outbox documentation says plainly that nothing stops two processes from
+  sharing one outbox directory. Two processes that share one submit each
+  other's records and overwrite each other's changes, so give each process a
+  directory of its own.
+- **One record the NA cannot read no longer blocks an outbox.** The NA's
+  strict JSON reader refuses a whole request with `400 invalid_json`. The
+  outboxes retried that answer, and `flush_records` sent the same batch of up
+  to 100 observations every time, so one such record held back every
+  observation behind it. `invalid_json` is now a refusal no retry can
+  overcome (`PERMANENT_REFUSALS`, `RECORD_PERMANENT_REFUSALS`). A batch the NA
+  refuses as a whole is split in halves until the record it refuses is tried
+  alone; that record becomes a dead letter and the rest are admitted. A
+  response this crate cannot read is not the NA's refusal and is still
+  retried.
+- **A rate-limited record backlog drains.** `flush_records` sent batches of
+  100 observations, and the NA counts each observation in a batch against
+  `NA_RATE_LIMIT_OBSERVATIONS_PER_MINUTE`. With a limit below 100 every batch
+  was refused with `429` and sent again unchanged, so the backlog never
+  drained. A batch answered `429` now halves the batches the client sends
+  after it.
+- **Outboxes wait as long as the NA asks.** After a refusal with a
+  `Retry-After` header (seconds or an HTTP date), the next attempt of the
+  record waits at least that long, at most 15 minutes. This holds for
+  `flush_pending`, `flush_records`, `enqueue` and `enqueue_record`. Since every
+  record shares the NA's submission rate, `flush_records` also submits no
+  record of the outbox until then (unless `ignore_backoff`).
+- **A record the NA would refuse as malformed is not signed.**
+  `ObservationRecorder::record` and `ExecutionRecorder::sign_break_glass`
+  refuse the following before signing (`observation_malformed`,
+  `break_glass_malformed`): an action other than `create`, `rotate`,
+  `revoke`, `update` or `delete`; a field longer or shorter than the reference
+  takes (`resource_id`, `capability`, `source`, `actor`, ...); and a time
+  outside the years 1 to 9999. `ExecutionRecorder::record` and
+  `governed_action` refuse an unknown `resource_action` or a `resource_id` over
+  256 characters (`Configuration`) before anything is evaluated or run.
+  Before, these records were signed and then refused for good after the
+  action had run.
+- **A record no reader would take is not signed.** A record nested more than
+  64 deep where it is submitted or kept in an outbox file is refused as
+  `StrictJson` (`invalid_json`). Such a record was signed, then refused by the
+  NA's strict reader on every attempt. After an action has run, its outcome
+  is recorded without the parameters nested too deep: `MetadataRefused`, or
+  `dropped` under break-glass.
+
+### Upgrading
+
+- `PERMANENT_REFUSALS` is now a `[&str; 14]` and `RECORD_PERMANENT_REFUSALS` a
+  `[&str; 15]`. Code that names their array types changes with them.
+
 ## 1.3.0 - 2026-10-10
 
 ### Added
