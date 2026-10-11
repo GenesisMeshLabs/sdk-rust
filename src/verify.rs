@@ -879,7 +879,7 @@ fn out_of_band_verifies(model: &str, record: &Value, keys: &[String]) -> bool {
 /// received, and it is in the form the reference writes with no signed field
 /// this crate does not know, as [`verify_evidence_events`] checks a stored
 /// one. A review's embedded approvals are checked apart
-/// ([`review_approval_problem`](crate::remediation::review_approval_problem)).
+/// ([`review_approval_problem`]).
 pub fn verify_out_of_band_record(record: &Value, public_keys: &[String]) -> bool {
     OUT_OF_BAND_IDS
         .iter()
@@ -1594,7 +1594,7 @@ fn fail(result: &mut EvidenceVerification, seq: Option<i64>, reason: &str, detai
 ///   signed by an executor key of its sovereign;
 /// * a review's embedded admin requests verify offline
 ///   (`review_approval_invalid`, see
-///   [`review_approval_problem`](crate::remediation::review_approval_problem)),
+///   [`review_approval_problem`]),
 ///   with the public key and holder the holder registry records for each
 ///   operator key at the time, when the run holds a record for that key
 ///   (`review_approval_key_mismatch`); its decider is a second holder

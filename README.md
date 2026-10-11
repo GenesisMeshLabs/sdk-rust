@@ -91,7 +91,7 @@ can also be verified locally (see [Governed actions](#governed-actions)).
 | `disclosure` | `commit`, `nullifier` | `prove`, `verify` |
 | `evidence` | `build` | `verify` |
 | `policy` | `validate`, `publish`, `list`, `active`, `history`, `activate`, `deactivate` | `verify` |
-| `evidence_store` | `search`, `search_all`, `status`, `verify`, `resource_history`, `vendor_history`, `resource_head`, `export_text`, `export`, `export_all`, `list_executor_keys`, `register_executor_key`, `retire_executor_key`, `apply_retention`, `latest_checkpoint`, `judge_observation`, `judge_break_glass`, `resource_changes`, `operator_holders`, `propose_holder`, `approve_holder` | `submit` (executor-signed), `submit_observation`, `submit_observations` (observer-signed), `submit_break_glass` (executor-signed) |
+| `evidence_store` | `search`, `search_all`, `status`, `verify`, `resource_history`, `vendor_history`, `resource_head`, `export_text`, `export`, `export_all`, `list_executor_keys`, `register_executor_key`, `retire_executor_key`, `apply_retention`, `latest_checkpoint`, `judge_observation`, `judge_break_glass`, `resource_changes`, `operator_holders`, `propose_holder`, `approve_holder`, `remediations`, `remediations_all`, `remediation`, `mark_notified`, `request_review`, `review`, `decide_review` | `submit` (executor-signed), `submit_observation`, `submit_observations` (observer-signed), `submit_break_glass`, `submit_remediation` (executor-signed) |
 | `health` | | `liveness`, `readiness`, `health` |
 
 `evidence.build(decision)` wraps its argument as `{"decision": decision}`.
@@ -407,6 +407,135 @@ positions (`retention_count_mismatch`); and an export that starts after entry 1
 chain's start, so it no longer reports `resource_chain_break` there. `canonical::out_of_band_canonical`,
 `canonical::out_of_band_digest` and `verify::verify_out_of_band_record` give
 one record's signed form and check its signature.
+
+## Remediation and reviews
+
+From Genesis Mesh 1.4.0 a change judged DENY after the fact leads somewhere:
+the NA states what is to be done and by when, the controller does it and
+records it, and the change's author is told. A second person can review a
+judgement, or a decision made under a policy that requires it, and uphold,
+deny or waive the change. The NA never changes a resource itself, and a
+credential is never rolled back. The NA must run with
+`EVIDENCE_REMEDIATION=on` (with `EVIDENCE_OUT_OF_BAND=on`); until then these
+routes answer `404 remediation_disabled`. The operator's side is described in
+*Remediation and Reviews* and *Emergency Changes and Break-Glass* in the NA
+runbooks. The routes are beta until 1.5.0; the records' signed forms are
+stable.
+
+### The due queue and notices
+
+`remediations` reads one page of the due queue (`state`, `limit` 1 to 500,
+`after` the previous page's `next_after`; without a state, the open ones),
+and `remediations_all` follows the pages. Each item is a remediation state:
+the judged change (`subject_kind`, `subject_id`, `change_kind`, `change_id`,
+`resource_id`), the plan (`mode` `cancel` or `alert_only`, `steps`,
+`fallback`, `grace_seconds`, `guidance_source`), and its times
+(`remediation_due_at`, `overdue_since`, `waived_until`, `lifetime_ends_at`).
+`remediation(subject_id)` reads one with its reviews and stored records. Tell
+the actor before `remediation_due_at`, then record the notice with
+`mark_notified(subject_id, Some("email"))`. The actor is what the source
+reported, not proof of who acted.
+
+### Carrying out a remediation
+
+`ExecutionRecorder::sign_remediation` signs a `RemediationRecord` with the
+executor key; `RemediationSubject::from_state` takes the subject from a due
+queue item, and `RemediationSteps` says what was done: `Disable` or `Delete`
+(a resource nothing reads yet), `RotateForwardThenDisable`, or `Alerted`
+(`alert_only`: nothing changed). Before signing it refuses what the NA would
+refuse, with its code (`OutOfBandRecord`): `remediation_malformed`, or
+`remediation_secret_material` for secret material in its versions or detail.
+Submit it with `submit_remediation`, or keep it in the record outbox with
+`enqueue_record`: a remediation whose subject or forward rotation the NA does
+not hold yet is retried, and a refusal no retry can overcome
+(`REMEDIATION_PERMANENT_REFUSALS`) keeps it as a dead letter. `flush_records`
+submits remediation records last, one at a time.
+
+`rotate_forward_then_disable` cancels a denied change to a versioned resource
+without breaking its readers: it rotates forward to a new version under a
+governed decision (the version recorded as `execution_parameters.version_id`),
+disables the denied version, and keeps a remediation record linked to the
+rotation's evidence:
+
+```no_run
+use genesis_mesh_sdk::{
+    rotate_forward_then_disable, ActionError, ExecutionRecorder, GenesisMeshClient,
+    GovernedActionParams, RemediationSubject, RotateForwardParams, RotatedVersion, Value,
+};
+
+async fn cancel(gm: &GenesisMeshClient, recorder: &ExecutionRecorder, state: &Value,
+                governed: GovernedActionParams) -> Result<(), Box<dyn std::error::Error>> {
+    let params = RotateForwardParams {
+        governed, // the rotation's evaluation, resource and verification
+        subject: RemediationSubject::from_state(state).ok_or("no change named")?,
+        disabled_version_id: "v8".into(),
+        detail: None,
+    };
+    let done = rotate_forward_then_disable(
+        &gm.boundary, &gm.evidence_store, recorder, params,
+        |_decision| async { Ok::<_, ActionError>(RotatedVersion::<()>::new("v9")) },
+        |_denied_version| async { Ok::<_, ActionError>(()) },
+    ).await?;
+    if let Some(record) = done.record {
+        eprintln!("remediated: {}", record["remediation_id"]);
+    }
+    Ok(())
+}
+```
+
+It needs a record outbox. A DENY of the rotation stops it with nothing
+disabled. Once the rotation ran, a disable that fails, or a record that cannot
+be kept, returns `RemediationIncomplete` with the rotation's evidence: do not
+rotate again. `remediation::check_remediation` names the refusal the NA would
+answer for a signed record and a registered key.
+
+### Reviews
+
+`request_review(subject_kind, subject_id, justification)` asks for a review
+(the operator key's holder must be named in the store). A privileged key of
+another holder decides it with `decide_review(review_id, &decision)`:
+`ReviewDecision::Uphold`, `Deny` (remediation becomes due) or `WaiveUntil`
+(the change stands until a time the NA bounds), each with an optional note.
+The NA refuses a decider who holds the requester's key or holder
+(`review_same_holder_as_requester`) or the actor's
+(`review_same_holder_as_actor`). `review(review_id)` reads it, with its signed
+record once decided. Both requests are embedded in the review as signed, so
+the request body is exactly what the record proves.
+
+### Urgent changes
+
+None is blocked, and each is judged and reviewed:
+
+- **The NA answers with an ordinary DENY**: call `governed_action` again with
+  the emergency capability (a capability of its own, with its own policy) and
+  its justification parameter in the request parameters. The NA decides it
+  under the emergency policy and opens a review of the decision.
+- **The NA is down, or answers `5xx` or `429`**:
+  `governed_action_with_break_glass` with the emergency capability; the NA
+  judges the break-glass record under the emergency policy when it arrives.
+
+### Policies and offline verification
+
+A boundary policy may carry `remediation` guidance (per gate, or `"*"`),
+`review_required: true` and an `emergency` section; absent or `null`, they are
+left out of its signed form, so a policy without them keeps its 1.3 digest.
+`remediation::policy_section_issues` names the issues the NA would find in
+them. `verify::verify_evidence_events` verifies the two new entry kinds:
+remediation records under executor keys, once per subject
+(`duplicate_remediation`), of their judgement's resource
+(`remediation_subject_mismatch`) and after their forward rotation
+(`remediation_rotation_missing`, `remediation_rotation_mismatch`); reviews
+under the NA keys, with their embedded approvals verified offline
+(`review_approval_invalid`, `remediation::review_approval_problem`) against
+the holder registry (`review_approval_key_mismatch`), decided by a second
+holder (`review_same_holder`), naming their subject's digest
+(`review_subject_mismatch`), and no waiver after a remediation
+(`review_waiver_after_remediation`); `remediation_subject_missing` and
+`review_subject_missing` in an export from entry 1. The result counts them in
+`remediations` and `reviews`. The reference's pure rules are in
+`remediation` (`remediation_plan`, `next_state`, `due_after_denial`,
+`due_after_waiver`, `steps_problem`, `review_holder_problem`), checked by the
+shared conformance suite `remediation`.
 
 ## Transport and errors
 
