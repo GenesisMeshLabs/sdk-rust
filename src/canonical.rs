@@ -67,14 +67,28 @@ pub fn attestation_digest(attestation: &Value) -> Result<String> {
     canonical_digest(&without(attestation, &["signatures"], &[]))
 }
 
+/// Policy sections added in 1.4.0 (remediation guidance, the review
+/// requirement and the emergency section), left out of the signed form when
+/// absent, so a policy without them keeps its 1.3 bytes and digest (checked
+/// against the field registry). A `null` reads as absent.
+pub const POLICY_OMITTED_WHEN_ABSENT: [&str; 3] = ["remediation", "review_required", "emergency"];
+
 /// `BoundaryPolicy.to_canonical_json()`.
 pub fn policy_canonical(policy: &Value) -> Result<String> {
-    canonical_json(&without(policy, &["signature"], &[]))
+    canonical_json(&without(
+        policy,
+        &["signature"],
+        &POLICY_OMITTED_WHEN_ABSENT,
+    ))
 }
 
 /// `BoundaryPolicy.digest()`.
 pub fn policy_digest(policy: &Value) -> Result<String> {
-    canonical_digest(&without(policy, &["signature"], &[]))
+    canonical_digest(&without(
+        policy,
+        &["signature"],
+        &POLICY_OMITTED_WHEN_ABSENT,
+    ))
 }
 
 /// Digest of the ordered applied-policy list carried in a policy binding.
@@ -147,8 +161,10 @@ fn out_of_band_fields(record: &Value) -> Value {
 
 /// The signed form of a record of a change made outside the controlled path
 /// (v1.3.0): an observation, break-glass, judgement, quarantine or registry
-/// record. Every field but `signature`; an absent optional field is left
-/// out, never `null`. Frozen from 1.3.0 on (`_SignedRecord.to_canonical_json()`).
+/// record; since 1.4.0 also a remediation or review record. Every field but
+/// `signature`; an absent optional field is left out, never `null`. Frozen
+/// from 1.3.0 on (`_SignedRecord.to_canonical_json()`), the 1.4.0 records
+/// from 1.4.0 on.
 pub fn out_of_band_canonical(record: &Value) -> Result<String> {
     canonical_json(&out_of_band_fields(record))
 }

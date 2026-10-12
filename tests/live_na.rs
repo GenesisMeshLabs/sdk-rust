@@ -5,6 +5,8 @@
 //! `GM_E2E_NA_PUBLIC_KEY` name an existing NA. The changes outside the
 //! controlled path (1.3.0) are exercised when the NA records them: the
 //! loopback NA says so, and `GM_E2E_OUT_OF_BAND=1` says so of an existing one.
+//! Remediation and reviews (1.4.0) are exercised when the loopback NA records
+//! them, with a second operator key of another holder deciding reviews.
 
 use std::{
     io::{BufRead, BufReader},
@@ -17,6 +19,8 @@ use chrono::{Duration, Utc};
 use genesis_mesh_sdk::{
     canonical::execution_digest,
     governed_action, governed_action_with_break_glass, json, public_key_from_seed,
+    remediation::review_approval_problem,
+    rotate_forward_then_disable,
     verify::{
         verify_attestation_signature, verify_boundary_decision, verify_evidence_events,
         verify_justification_signature, verify_policy_signature, VerifyDecisionOptions,
@@ -25,7 +29,8 @@ use genesis_mesh_sdk::{
     ActionError, ActionReport, BreakGlassOptions, ClientOptions, EvaluationFailure, EvidenceOutbox,
     ExecutionRecorder, FlushOptions, GenesisMeshClient, GenesisMeshError, GovernedActionOutcome,
     GovernedActionParams, GovernedVerification, MemoryOutbox, MemoryRecordOutbox, ObservationInput,
-    ObservationRecorder, OutboxState, RecordExecution, RecordOutbox, Value,
+    ObservationRecorder, OutboxState, RecordExecution, RecordOutbox, RemediationSubject,
+    ReviewDecision, RotateForwardParams, RotatedVersion, Value,
 };
 use uuid::Uuid;
 
@@ -35,6 +40,9 @@ struct LiveNa {
     na_public_key: String,
     /// The NA records changes outside the controlled path (1.3.0).
     out_of_band: bool,
+    /// With remediation and reviews (1.4.0): a privileged key of another
+    /// holder, which decides reviews.
+    reviewer: Option<GenesisMeshClient>,
     child: Option<Child>,
 }
 
@@ -78,11 +86,18 @@ fn live_na() -> Option<LiveNa> {
         .with_signing_key(config["signingKeyBase64"].as_str().unwrap())
         .with_key_id(config["keyId"].as_str().unwrap());
     let client = GenesisMeshClient::new(options.clone()).unwrap();
+    let reviewer = config["remediation"].as_bool().unwrap_or(false).then(|| {
+        let options = ClientOptions::new(config["baseUrl"].as_str().unwrap())
+            .with_signing_key(config["reviewerSigningKeyBase64"].as_str().unwrap())
+            .with_key_id(config["reviewerKeyId"].as_str().unwrap());
+        GenesisMeshClient::new(options).unwrap()
+    });
     Some(LiveNa {
         client,
         options,
         na_public_key: config["naPublicKey"].as_str().unwrap().to_owned(),
         out_of_band: config["outOfBand"].as_bool().unwrap_or(false),
+        reviewer,
         child,
     })
 }
@@ -113,6 +128,319 @@ async fn governed_lifecycle_against_a_live_na() {
     observe_enforce_rollback_failures_conflicts_and_retired_keys(&na).await;
     keep_evidence_while_the_na_is_unreachable_and_admit_it_in_order(&na).await;
     record_and_judge_changes_outside_the_controlled_path(&na).await;
+    remediate_review_and_verify_offline(&na).await;
+}
+
+/// v1.4.0: a denied change cancelled by a forward rotation and a disable,
+/// recorded as two linked records; a second denied change reviewed by
+/// another holder and waived; the export verifies offline, the review's
+/// approvals with it.
+async fn remediate_review_and_verify_offline(na: &LiveNa) {
+    let Some(reviewer) = &na.reviewer else {
+        eprintln!("skipped 1.4.0: the NA does not record remediations and reviews");
+        return;
+    };
+    let gm = &na.client;
+    let keys = vec![na.na_public_key.clone()];
+    let id = Uuid::new_v4().to_string();
+    let capability = format!("sdk.rem.{id}");
+    let emergency = format!("sdk.rem.{id}.emergency");
+    let resource = format!("kv:rem-{id}/secret");
+    let attestation = gm
+        .attestation
+        .issue(json!({"subject_id": id, "roles": ["role:client"],
+                      "claims": {"capabilities": [capability, emergency]}}))
+        .await
+        .unwrap();
+    let (valid_from, valid_until) = window();
+    let policy = gm
+        .policy
+        .publish(json!({
+            "policy_id": format!("rem-{id}"), "valid_from": valid_from, "valid_until": valid_until,
+            "selector": {"capabilities": [capability]},
+            "gates": [{"gate_id": "lifetime", "gate_type": "max_value.v1", "order": 0,
+                       "config": {"path": "request_parameters.lifetime_days", "max": 90}}],
+            "remediation": {"lifetime": {"mode": "cancel", "grace_seconds": 3600}},
+        }))
+        .await
+        .unwrap();
+    gm.policy
+        .activate(
+            policy["policy_id"].as_str().unwrap(),
+            policy["version"].as_u64().unwrap(),
+        )
+        .await
+        .unwrap();
+    let observer_id = format!("observer-{id}");
+    let observer_seed = STANDARD.encode(Uuid::new_v4().as_bytes().repeat(2));
+    gm.evidence_store
+        .register_executor_key(json!({
+            "key_id": observer_id, "public_key": public_key_from_seed(&observer_seed).unwrap(),
+            "executor_sovereign_id": observer_id, "role": "observer",
+            "resource_prefix": format!("kv:rem-{id}/"),
+        }))
+        .await
+        .unwrap();
+    let (recorder, executor_key) = executor(&format!("executor-{id}"));
+    gm.evidence_store
+        .register_executor_key(
+            json!({"key_id": recorder.key_id(), "public_key": executor_key,
+                                      "executor_sovereign_id": recorder.executor_sovereign_id()}),
+        )
+        .await
+        .unwrap();
+    let observer = ObservationRecorder::new(&observer_id, &observer_id, &observer_seed).unwrap();
+    let denied_change = |event: &str, version: &str| {
+        observer
+            .record(ObservationInput {
+                resource_id: resource.clone(),
+                action: "rotate".into(),
+                capability: capability.clone(),
+                changed_at: Some(Utc::now()),
+                source: "cloud-activity-log".into(),
+                source_event_id: format!("{id}-{event}"),
+                actor: Some("principal-7f3a".into()),
+                version_id: Some(version.into()),
+                metadata: Some(json!({"lifetime_days": 400})),
+                ..ObservationInput::default()
+            })
+            .unwrap()
+    };
+
+    // 1. A denied rotation arms a cancel: rotate forward, then disable.
+    let denied = gm
+        .evidence_store
+        .submit_observation(denied_change("1", "v8"))
+        .await
+        .unwrap();
+    let judgement_id = denied["judgement"]["payload"]["judgement_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let due = gm
+        .evidence_store
+        .remediations_all(Some("remediation_due"), 100)
+        .await
+        .unwrap();
+    let state = due
+        .iter()
+        .find(|s| s["subject_id"] == judgement_id.as_str())
+        .expect("the denied change is in the due queue");
+    assert_eq!(
+        (&state["mode"], &state["steps"]),
+        (&json!("cancel"), &json!("rotate_forward_then_disable"))
+    );
+    let notified = gm
+        .evidence_store
+        .mark_notified(&judgement_id, Some("email"))
+        .await
+        .unwrap();
+    assert!(notified["notified_at"].is_string());
+    let records: Arc<dyn RecordOutbox> = Arc::new(MemoryRecordOutbox::default());
+    let controller =
+        GenesisMeshClient::new(na.options.clone().with_record_outbox(records)).unwrap();
+    let result = rotate_forward_then_disable(
+        &controller.boundary,
+        &controller.evidence_store,
+        &recorder,
+        RotateForwardParams {
+            governed: GovernedActionParams {
+                evaluate: json!({"attestation_id": attestation["attestation_id"],
+                                 "requested_capability": capability,
+                                 "context": {"request_parameters": {"lifetime_days": 30}}}),
+                resource_id: Some(resource.clone()),
+                resource_action: None,
+                prior_resource: None,
+                verify: GovernedVerification {
+                    operator_public_keys: keys.clone(),
+                    expected_policies: vec![policy.clone()],
+                    expected_attestation: Some(attestation.clone()),
+                    ..GovernedVerification::default()
+                },
+            },
+            subject: RemediationSubject::from_state(state).unwrap(),
+            state: Some(state.clone()),
+            disabled_version_id: "v8".into(),
+            detail: None,
+        },
+        |_| async { Ok::<_, ActionError>(RotatedVersion::<()>::new("v9")) },
+        |_| async { Ok::<_, ActionError>(()) },
+    )
+    .await
+    .unwrap();
+    let submission = result.submission.expect("the remediation was admitted");
+    assert_eq!(submission["status"], "recorded");
+    assert_eq!(submission["remediation"]["state"], "remediated");
+
+    // 2. Another denied change, reviewed by a second holder and waived.
+    let second = gm
+        .evidence_store
+        .submit_observation(denied_change("2", "v10"))
+        .await
+        .unwrap();
+    let second_id = second["judgement"]["payload"]["judgement_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let opened = gm
+        .evidence_store
+        .request_review("judgement", &second_id, "Planned with the vendor")
+        .await
+        .unwrap();
+    // A pending review is a flag beside the state: the remediation stays due.
+    assert_eq!(opened["state"], "remediation_due");
+    assert_eq!(opened["review_pending"], true);
+    let review_id = opened["review_id"].as_str().unwrap().to_owned();
+    let refused = gm
+        .evidence_store
+        .decide_review(&review_id, &ReviewDecision::Deny { note: None })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), "review_same_holder_as_requester");
+    let decided = reviewer
+        .evidence_store
+        .decide_review(
+            &review_id,
+            &ReviewDecision::WaiveUntil {
+                until: Utc::now() + Duration::days(1),
+                note: Some("rotated by the vendor on Friday".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(decided["state"], "waived");
+    let review = gm.evidence_store.review(&review_id).await.unwrap();
+    assert_eq!(
+        review_approval_problem(&review["record"]["payload"], &keys),
+        None
+    );
+    let held = gm.evidence_store.remediation(&second_id).await.unwrap();
+    assert_eq!(held["state"], "waived");
+
+    // 3. Urgent changes. With the NA up, an ordinary DENY; the emergency
+    // capability, with its justification, is decided under its own policy
+    // and its decision is reviewed. With the NA down, break-glass names the
+    // emergency capability and is judged under the same policy.
+    let urgent_policy = gm
+        .policy
+        .publish(json!({
+            "policy_id": format!("rem-{id}-emergency"), "valid_from": valid_from,
+            "valid_until": valid_until, "selector": {"capabilities": [emergency]},
+            "gates": [
+                {"gate_id": "justified", "gate_type": "required_parameter.v1", "order": 0,
+                 "config": {"path": "request_parameters.justification"}},
+                {"gate_id": "short-lived", "gate_type": "max_value.v1", "order": 1,
+                 "config": {"path": "request_parameters.lifetime_days", "max": 1}}],
+            "emergency": {"stands_for": capability, "justification_parameter": "justification",
+                          "max_lifetime_seconds": 86400},
+        }))
+        .await
+        .unwrap();
+    gm.policy
+        .activate(
+            urgent_policy["policy_id"].as_str().unwrap(),
+            urgent_policy["version"].as_u64().unwrap(),
+        )
+        .await
+        .unwrap();
+    let urgent = |capability: &str, lifetime: u32, expected: &Value| GovernedActionParams {
+        evaluate: json!({"attestation_id": attestation["attestation_id"],
+                         "requested_capability": capability,
+                         "context": {"request_parameters": {
+                             "lifetime_days": lifetime,
+                             "justification": "key leaked in a public repository"}}}),
+        resource_id: Some(resource.clone()),
+        resource_action: Some("rotate".into()),
+        prior_resource: None,
+        verify: GovernedVerification {
+            operator_public_keys: keys.clone(),
+            expected_policies: vec![expected.clone()],
+            expected_attestation: Some(attestation.clone()),
+            ..GovernedVerification::default()
+        },
+    };
+    let rotate_to_v11 = |_| async {
+        Ok::<_, ActionError>(ActionReport {
+            value: Some(()),
+            execution_parameters: Some(json!({"version_id": "v11"})),
+            ..ActionReport::default()
+        })
+    };
+    let ordinary = governed_action(
+        &controller.boundary,
+        &controller.evidence_store,
+        &recorder,
+        urgent(&capability, 400, &policy),
+        |_| async { panic!("ran under an ordinary DENY") },
+    )
+    .await
+    .map(|r: genesis_mesh_sdk::GovernedActionResult<()>| r.authorized)
+    .unwrap();
+    assert!(!ordinary);
+    let decided = governed_action(
+        &controller.boundary,
+        &controller.evidence_store,
+        &recorder,
+        urgent(&emergency, 1, &urgent_policy),
+        rotate_to_v11,
+    )
+    .await
+    .unwrap();
+    assert!(decided.authorized);
+    let decision_id = decided.summary.decision_id.clone();
+    let reviewed = gm.evidence_store.remediation(&decision_id).await.unwrap();
+    assert_eq!(reviewed["state"], "recorded");
+    assert_eq!(reviewed["review_pending"], true);
+    assert_eq!(reviewed["review"]["opened_for"], "review_required");
+    assert!(reviewed["lifetime_ends_at"].is_string());
+    let unreachable = GenesisMeshClient::new(ClientOptions {
+        base_url: "http://127.0.0.1:9".into(),
+        ..na.options.clone()
+    })
+    .unwrap();
+    let outcome = governed_action_with_break_glass(
+        &unreachable.boundary,
+        &controller.evidence_store,
+        &recorder,
+        urgent(&emergency, 1, &urgent_policy),
+        BreakGlassOptions::new("key leaked in a public repository; NA unreachable"),
+        |decision| async move {
+            assert!(decision.is_none());
+            Ok::<_, ActionError>(ActionReport {
+                value: Some(()),
+                execution_parameters: Some(json!({"version_id": "v12"})),
+                ..ActionReport::default()
+            })
+        },
+    )
+    .await
+    .unwrap();
+    let GovernedActionOutcome::BrokeGlass(glass) = outcome else {
+        panic!("the glass was not broken");
+    };
+    let judged = glass
+        .submission
+        .expect("the break-glass record was admitted");
+    assert_eq!(judged["judgement"]["payload"]["verdict"], "allow");
+    assert_eq!(
+        judged["judgement"]["payload"]["policy_binding"]["policies"][0]["policy_id"],
+        urgent_policy["policy_id"]
+    );
+    let judgement = judged["judgement"]["payload"]["judgement_id"]
+        .as_str()
+        .unwrap();
+    let held = gm.evidence_store.remediation(judgement).await.unwrap();
+    assert_eq!(held["state"], "judged_allowed");
+    assert_eq!(held["review_pending"], true);
+
+    // 4. The export verifies offline, remediation and review included.
+    let exported = gm.evidence_store.export_all(0, 1000).await.unwrap();
+    let executor_keys = gm.evidence_store.list_executor_keys().await.unwrap();
+    let verification =
+        verify_evidence_events(&exported, &VerifyEvidenceOptions::new(keys, executor_keys));
+    assert!(verification.failures.is_empty(), "{verification:?}");
+    assert!(verification.remediations >= 1);
+    assert!(verification.reviews >= 1);
 }
 
 /// v1.3.0: observations and a break-glass record, judged by the NA, and an
@@ -264,12 +592,24 @@ async fn record_and_judge_changes_outside_the_controlled_path(na: &LiveNa) {
         .iter()
         .map(|c| (c["kind"].as_str().unwrap(), c["state"].as_str().unwrap()))
         .collect();
+    // With remediation on (1.4.0), the denial is due for remediation, and the
+    // break-glass record, flagged for review, stays allowed with a review
+    // pending: a flag beside its state.
+    let denied_state = if na.reviewer.is_some() {
+        "remediation_due"
+    } else {
+        "judged_denied"
+    };
+    let glass_state = "judged_allowed";
+    if na.reviewer.is_some() {
+        assert_eq!(changes["changes"][2]["remediation"]["review_pending"], true);
+    }
     assert_eq!(
         states,
         [
-            ("observation", "judged_denied"),
+            ("observation", denied_state),
             ("observation", "judged_allowed"),
-            ("break_glass", "judged_allowed")
+            ("break_glass", glass_state)
         ]
     );
     assert_eq!(

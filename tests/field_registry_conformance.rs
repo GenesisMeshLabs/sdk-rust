@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use genesis_mesh_sdk::canonical::{
     CHECKPOINT_OMITTED_WHEN_ABSENT, DECISION_OMITTED_WHEN_ABSENT, ENVELOPE_OMITTED_WHEN_ABSENT,
-    RESOURCE_CHAIN_FIELDS,
+    POLICY_OMITTED_WHEN_ABSENT, RESOURCE_CHAIN_FIELDS,
 };
 use genesis_mesh_sdk::strict::{
     embedded_registry, is_known_entry_kind, registry_list, unknown_fields,
@@ -67,6 +67,14 @@ fn keeps_this_crates_canonical_rules_equal_to_the_registrys() {
         CHECKPOINT_OMITTED_WHEN_ABSENT.to_vec(),
         registry_list("RetentionCheckpoint", "omit_when_none")
     );
+    // v1.4.0: a policy's remediation, review and emergency sections.
+    assert_eq!(
+        POLICY_OMITTED_WHEN_ABSENT.to_vec(),
+        registry_list("BoundaryPolicy", "omit_when_none")
+    );
+    for kind in ["remediation", "review"] {
+        assert!(is_known_entry_kind(kind), "{kind}");
+    }
 }
 
 #[test]

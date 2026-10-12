@@ -123,7 +123,8 @@ impl Drop for Holding<'_> {
 
 /// The NA execution evidence store (v0.59): controller submission, operator
 /// search, history, export, executor keys and retention; from v1.3.0 also
-/// observations, break-glass records and their judgements.
+/// observations, break-glass records and their judgements; from 1.4.0
+/// remediation records, the due queue, notices and reviews.
 #[derive(Debug, Clone)]
 pub struct EvidenceStoreClient {
     http: Arc<HttpTransport>,
@@ -623,6 +624,9 @@ impl EvidenceStoreClient {
                 json!({ "observation": entry.record }),
             ),
             RecordKind::BreakGlass => ("/evidence/break-glass", json!({ "record": entry.record })),
+            RecordKind::Remediation => {
+                ("/evidence/remediations", json!({ "record": entry.record }))
+            }
         };
         self.http.public_post_waiting(path, body).await
     }
@@ -663,8 +667,9 @@ impl EvidenceStoreClient {
             .await
     }
 
-    /// Keep a signed observation or break-glass record in the record outbox
-    /// and submit it (v1.3.0). A failed submission is not an error: a
+    /// Keep a signed observation or break-glass record (1.4.0: or remediation
+    /// record) in the record outbox and submit it (v1.3.0). A failed
+    /// submission is not an error: a
     /// transient one leaves the record pending for
     /// [`flush_records`](Self::flush_records), and a refusal no retry can
     /// overcome ([`RECORD_PERMANENT_REFUSALS`](crate::RECORD_PERMANENT_REFUSALS))
@@ -676,7 +681,7 @@ impl EvidenceStoreClient {
         let fresh = RecordOutboxEntry::new(record);
         if fresh.id.is_empty() {
             return Err(GenesisMeshError::Configuration(
-                "a record needs an observation_id or a break_glass_id".into(),
+                "a record needs an observation_id, a break_glass_id or a remediation_id".into(),
             ));
         }
         let entries = outbox.list().await.map_err(outbox_error)?;
@@ -707,7 +712,9 @@ impl EvidenceStoreClient {
 
     /// Submit the record outbox's pending records (v1.3.0): break-glass
     /// records first, one at a time (1.3.1), then observations, consecutive
-    /// ones up to 100 per request, each in the order they were added.
+    /// ones up to 100 per request, then remediation records one at a time
+    /// (1.4.0: the changes they remediate are judged by then), each in the
+    /// order they were added.
     /// Break-glass records share the NA's submission rate with observations,
     /// and an observation of the same change then finds its break-glass
     /// record. A batch the NA refuses as a whole
@@ -728,14 +735,19 @@ impl EvidenceStoreClient {
             return Err(GenesisMeshError::FlushInProgress);
         }
         let _flushing = Flushing(&self.flushing_records);
-        let (mut entries, observations): (Vec<RecordOutboxEntry>, Vec<RecordOutboxEntry>) = outbox
+        let mut entries: Vec<RecordOutboxEntry> = outbox
             .list()
             .await
             .map_err(outbox_error)?
             .into_iter()
             .filter(|e| e.state == OutboxState::Pending)
-            .partition(|e| e.kind == RecordKind::BreakGlass);
-        entries.extend(observations);
+            .collect();
+        // Stable: each kind keeps the order its records were added in.
+        entries.sort_by_key(|e| match e.kind {
+            RecordKind::BreakGlass => 0,
+            RecordKind::Observation => 1,
+            RecordKind::Remediation => 2,
+        });
         // A record `enqueue_record` is submitting is left to it, as pending.
         let due = |e: &RecordOutboxEntry| {
             let now = Utc::now();
@@ -753,7 +765,7 @@ impl EvidenceStoreClient {
                 index += 1;
                 continue;
             }
-            if entry.kind == RecordKind::BreakGlass {
+            if entry.kind != RecordKind::Observation {
                 let delivery = self.attempt_record(outbox, entry.clone()).await;
                 stopped = !settle(&mut report, entry, delivery);
                 index += 1;
@@ -908,13 +920,55 @@ impl EvidenceStoreClient {
     /// Every change to a resource, oldest first, with how it was governed
     /// (`prior_decision` or `after_the_fact`) and its state (`recorded`,
     /// `matched`, `judged_allowed`, `judged_denied`, `indeterminate`,
-    /// `observed`, `quarantined`) (admin, v1.3.0). `truncated: true` when
-    /// the resource has more changes than one response holds.
+    /// `observed`, `quarantined`; 1.4.0: the remediation state, with a
+    /// `remediation` object) (admin, v1.3.0). Since 1.4.0 it follows the
+    /// pages ([`resource_changes_page`](Self::resource_changes_page)) and
+    /// returns every change; against an NA before 1.4.0, which serves one
+    /// response, `truncated: true` says it held more.
     pub async fn resource_changes(&self, resource_id: &str) -> Result<Value> {
+        let mut after = None;
+        let mut changes = Vec::new();
+        loop {
+            let mut page = self.resource_changes_page(resource_id, after, None).await?;
+            if let Value::Array(items) = page["changes"].take() {
+                changes.extend(items);
+            }
+            match page["next_after_sequence"].as_u64() {
+                Some(next) if after.is_none_or(|a| next > a) => after = Some(next),
+                Some(_) => {
+                    return Err(GenesisMeshError::Verification(
+                        "resource changes cursor did not advance".into(),
+                    ))
+                }
+                None => {
+                    page["changes"] = Value::Array(changes);
+                    return Ok(page);
+                }
+            }
+        }
+    }
+
+    /// One page of a resource's changes (admin, 1.4.0): `limit` 1 to 10,000
+    /// (the NA's default 1,000) after `after_sequence` (the previous page's
+    /// `next_after_sequence`); `truncated` and `next_after_sequence` when
+    /// there are more; `400 invalid_page`.
+    pub async fn resource_changes_page(
+        &self,
+        resource_id: &str,
+        after_sequence: Option<u64>,
+        limit: Option<u32>,
+    ) -> Result<Value> {
+        let mut query = Vec::new();
+        if let Some(limit) = limit {
+            query.push(("limit".to_owned(), limit.to_string()));
+        }
+        if let Some(after) = after_sequence {
+            query.push(("after_sequence".to_owned(), after.to_string()));
+        }
         self.http
             .admin_get(
                 &format!("/admin/evidence/changes/{}", resource_path(resource_id)?),
-                &[],
+                &query,
             )
             .await
     }
@@ -953,6 +1007,174 @@ impl EvidenceStoreClient {
                     segment(proposal_id)?
                 ),
                 json!({}),
+            )
+            .await
+    }
+
+    // ── Remediation, reviews and notification (1.4.0) ─────────────────────────
+
+    /// Submit one signed remediation record (1.4.0,
+    /// [`ExecutionRecorder::sign_remediation`](crate::ExecutionRecorder::sign_remediation)),
+    /// authenticated by the executor key's signature. `201` with
+    /// `status: "recorded"` and `remediation` (the state, now `remediated`);
+    /// the same record again returns `status: "duplicate"`. A refusal no
+    /// retry can overcome is in
+    /// [`REMEDIATION_PERMANENT_REFUSALS`](crate::REMEDIATION_PERMANENT_REFUSALS);
+    /// an authentic record refused for good is kept by the NA as a
+    /// quarantine entry. Keep the record in the record outbox
+    /// ([`enqueue_record`](Self::enqueue_record)) to retry the others.
+    pub async fn submit_remediation(&self, record: Value) -> Result<Value> {
+        self.http
+            .public_post("/evidence/remediations", json!({ "record": record }))
+            .await
+    }
+
+    /// One page of the due queue (admin, read tier, 1.4.0): remediation
+    /// states oldest first, `{state, count, remediations, next_after}`.
+    /// `state` is one of [`QUEUE_FILTERS`](crate::remediation::QUEUE_FILTERS):
+    /// a stored state, or `review_pending` (every change with a pending
+    /// review, whatever its state); without it, the `remediation_due`,
+    /// `overdue` and `waived` ones and those with a pending review. `limit`
+    /// 1 to 500 (default 100); `after` the previous page's `next_after`. Each
+    /// state carries `review_pending`, `actor_holder` and `change_version_id`.
+    pub async fn remediations(&self, query: &RemediationQuery) -> Result<Value> {
+        let mut pairs = Vec::new();
+        if let Some(state) = &query.state {
+            pairs.push(("state".to_owned(), state.clone()));
+        }
+        if let Some(limit) = query.limit {
+            pairs.push(("limit".to_owned(), limit.to_string()));
+        }
+        if let Some(after) = &query.after {
+            pairs.push(("after".to_owned(), after.clone()));
+        }
+        self.http
+            .admin_get("/admin/evidence/remediations", &pairs)
+            .await
+    }
+
+    /// Every remediation state of the due queue in `state` (or the open
+    /// ones), following pages of `page_size` (1 to 500) (admin, 1.4.0).
+    pub async fn remediations_all(
+        &self,
+        state: Option<&str>,
+        page_size: u32,
+    ) -> Result<Vec<Value>> {
+        if !(1..=MAX_REMEDIATION_PAGE).contains(&page_size) {
+            return Err(GenesisMeshError::Configuration(
+                "due queue page size must be between 1 and 500".into(),
+            ));
+        }
+        let mut query = RemediationQuery {
+            state: state.map(str::to_owned),
+            limit: Some(page_size),
+            after: None,
+        };
+        let mut states = Vec::new();
+        loop {
+            let mut page = self.remediations(&query).await?;
+            if let Value::Array(items) = page["remediations"].take() {
+                states.extend(items);
+            }
+            match page["next_after"].as_str() {
+                None => return Ok(states),
+                Some(next) if Some(next) != query.after.as_deref() => {
+                    query.after = Some(next.to_owned());
+                }
+                Some(_) => {
+                    return Err(GenesisMeshError::Verification(
+                        "due queue cursor did not advance".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// One judgement's or decision's remediation state, with `reviews`
+    /// (every review, pending or decided) and `records` (its stored
+    /// remediation and review entries) (admin, read tier, 1.4.0);
+    /// `404 remediation_not_found`.
+    pub async fn remediation(&self, subject_id: &str) -> Result<Value> {
+        self.http
+            .admin_get(
+                &format!("/admin/evidence/remediations/{}", segment(subject_id)?),
+                &[],
+            )
+            .await
+    }
+
+    /// Record that the controller told the actor (admin, standard tier,
+    /// 1.4.0): an audit event (`remediation_notified`, with `before_due`)
+    /// and, on the first notice, `notified_at`. `channel` is 1 to 64
+    /// characters, e.g. `email`. Returns the state.
+    pub async fn mark_notified(&self, subject_id: &str, channel: Option<&str>) -> Result<Value> {
+        let body = match channel {
+            Some(channel) => json!({ "channel": channel }),
+            None => json!({}),
+        };
+        self.http
+            .admin_post(
+                &format!(
+                    "/admin/evidence/remediations/{}/notified",
+                    segment(subject_id)?
+                ),
+                body,
+            )
+            .await
+    }
+
+    /// Ask a second holder to review a judged change or a decision (admin,
+    /// standard tier, 1.4.0): `subject_kind` `judgement` or `decision`, and a
+    /// justification of 1 to 1024 characters. `201` with `review_id` and the
+    /// state (`review_pending`). The operator's signed request is embedded in
+    /// the review the NA records, so it verifies offline; the key's holder
+    /// must be named in the store (`409 review_needs_named_holder`).
+    pub async fn request_review(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+        justification: &str,
+    ) -> Result<Value> {
+        self.http
+            .admin_post(
+                crate::remediation::REVIEW_REQUEST_PATH,
+                json!({
+                    "subject_kind": subject_kind,
+                    "subject_id": subject_id,
+                    "justification": justification,
+                }),
+            )
+            .await
+    }
+
+    /// A review, pending or decided (admin, read tier, 1.4.0): its request,
+    /// and once decided `record` (the stored `ReviewRecord` entry);
+    /// `404 review_not_found`.
+    pub async fn review(&self, review_id: &str) -> Result<Value> {
+        self.http
+            .admin_get(
+                &format!("/admin/evidence/reviews/{}", segment(review_id)?),
+                &[],
+            )
+            .await
+    }
+
+    /// Decide a review as a privileged key of a second holder (admin,
+    /// privileged tier, 1.4.0): `{review, ...state}`, `review` being the
+    /// stored `ReviewRecord` entry with this request embedded. Refused with
+    /// `409 review_same_holder_as_requester` or
+    /// `review_same_holder_as_actor` when this key's holder requested the
+    /// review or made the change, `422 review_waiver_too_long` or
+    /// `review_waiver_beyond_lifetime` for a waiver the NA does not grant.
+    pub async fn decide_review(&self, review_id: &str, decision: &ReviewDecision) -> Result<Value> {
+        self.http
+            .admin_post(
+                &format!(
+                    "{}/{}/decide",
+                    crate::remediation::REVIEW_REQUEST_PATH,
+                    segment(review_id)?
+                ),
+                decision.body(),
             )
             .await
     }
@@ -999,6 +1221,65 @@ impl EvidenceStoreClient {
             }
         }
         Ok(head)
+    }
+}
+
+/// Largest due-queue page the NA serves (1.4.0).
+pub const MAX_REMEDIATION_PAGE: u32 = 500;
+
+/// A page of the due queue (1.4.0,
+/// [`EvidenceStoreClient::remediations`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemediationQuery {
+    /// One state; `None` for the open ones.
+    pub state: Option<String>,
+    /// 1 to 500; the NA's default is 100.
+    pub limit: Option<u32>,
+    /// The previous page's `next_after`.
+    pub after: Option<String>,
+}
+
+/// A second holder's verdict on a review (1.4.0,
+/// [`EvidenceStoreClient::decide_review`]), each with an optional note of 1
+/// to 1024 characters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewDecision {
+    /// The change stands; an emergency change only until its lifetime ends.
+    Uphold {
+        /// A note recorded with the verdict.
+        note: Option<String>,
+    },
+    /// The change does not stand: remediation becomes due.
+    Deny {
+        /// A note recorded with the verdict.
+        note: Option<String>,
+    },
+    /// The change stands until `until`, then remediation becomes due. The NA
+    /// grants at most `NA_REVIEW_MAX_WAIVER_SECONDS` (at most 90 days).
+    WaiveUntil {
+        /// When the waiver ends.
+        until: chrono::DateTime<Utc>,
+        /// A note recorded with the verdict.
+        note: Option<String>,
+    },
+}
+
+impl ReviewDecision {
+    /// The request body, as the decider signs it and the review records it.
+    pub fn body(&self) -> Value {
+        let (verdict, until, note) = match self {
+            Self::Uphold { note } => ("uphold", None, note),
+            Self::Deny { note } => ("deny", None, note),
+            Self::WaiveUntil { until, note } => ("waive_until", Some(until), note),
+        };
+        let mut body = json!({ "verdict": verdict });
+        if let Some(until) = until {
+            body["waive_until"] = json!(crate::canonical::python_timestamp(*until));
+        }
+        if let Some(note) = note {
+            body["note"] = json!(note);
+        }
+        body
     }
 }
 

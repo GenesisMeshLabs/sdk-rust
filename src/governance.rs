@@ -1,7 +1,8 @@
 //! Controller-side composition for governed resource lifecycles (e.g.
 //! secrets): evaluate, act only on a verified ALLOW, and record the outcome on
 //! the resource chain. With break-glass (v1.3.0), act when the NA cannot be
-//! reached, and record that.
+//! reached, and record that. Cancel a denied change by rotating forward,
+//! then disabling (1.4.0).
 
 use std::future::Future;
 
@@ -23,6 +24,10 @@ use crate::{
         refused, BreakGlassInput, EvaluationFailure,
     },
     outbox::{OutboxEntry, RecordOutboxEntry},
+    remediation::{
+        next_state, remediation_input_problem, steps_problem, RemediationInput, RemediationSteps,
+        RemediationSubject,
+    },
     verify::{verify_boundary_decision, VerifyDecisionOptions},
 };
 
@@ -778,6 +783,47 @@ where
     F: FnOnce(Option<Value>) -> Fut,
     Fut: Future<Output = std::result::Result<ActionReport<T>, ActionError>>,
 {
+    match attempt(
+        boundary,
+        evidence_store,
+        recorder,
+        params,
+        break_glass,
+        false,
+        action,
+    )
+    .await?
+    {
+        Attempt::Done(outcome) => Ok(outcome),
+        Attempt::Denied(result, _) => Ok(GovernedActionOutcome::Evaluated(result)),
+        Attempt::Unanswered(err, _) => Err(err),
+    }
+}
+
+/// What one governed attempt did. With `hand_back` (1.4.0, for
+/// [`urgent_action`]), a DENY or an evaluation that got no answer returns the
+/// action, which did not run.
+enum Attempt<T, F> {
+    Done(GovernedActionOutcome<T>),
+    Denied(GovernedActionResult<T>, F),
+    Unanswered(GenesisMeshError, F),
+}
+
+/// [`run`], handing the action back when it did not run and `hand_back`.
+async fn attempt<T, F, Fut>(
+    boundary: &BoundaryClient,
+    evidence_store: &EvidenceStoreClient,
+    recorder: &ExecutionRecorder,
+    params: GovernedActionParams,
+    break_glass: Option<&BreakGlassOptions>,
+    hand_back: bool,
+    action: F,
+) -> Result<Attempt<T, F>>
+where
+    T: Send + 'static,
+    F: FnOnce(Option<Value>) -> Fut,
+    Fut: Future<Output = std::result::Result<ActionReport<T>, ActionError>>,
+{
     if params.resource_id.is_some() != params.resource_action.is_some() {
         return Err(GenesisMeshError::Configuration(
             "resource_id and resource_action go together".into(),
@@ -822,6 +868,9 @@ where
     let evaluation = match boundary.evaluate(request.clone()).await {
         Ok(evaluation) => evaluation,
         Err(err) => {
+            if hand_back && evaluation_failure(&err).is_some() {
+                return Ok(Attempt::Unanswered(err, action));
+            }
             let (Some(options), Some(failure)) = (break_glass, evaluation_failure(&err)) else {
                 return Err(err);
             };
@@ -836,14 +885,14 @@ where
                 action,
             )
             .await
-            .map(GovernedActionOutcome::BrokeGlass);
+            .map(|result| Attempt::Done(GovernedActionOutcome::BrokeGlass(result)));
         }
     };
     let decision = evaluation["decision"].clone();
     check_decision(&decision, &params, &context_id)?;
     let summary = summarize_decision(&decision);
     if !summary.authorized {
-        return Ok(GovernedActionOutcome::Evaluated(GovernedActionResult {
+        let denied = GovernedActionResult {
             evaluation,
             authorized: false,
             summary,
@@ -851,7 +900,12 @@ where
             evidence: None,
             submission: None,
             queued: None,
-        }));
+        };
+        return Ok(if hand_back {
+            Attempt::Denied(denied, action)
+        } else {
+            Attempt::Done(GovernedActionOutcome::Evaluated(denied))
+        });
     }
 
     let prior = match (&params.resource_id, &params.prior_resource) {
@@ -938,15 +992,17 @@ where
     if outbox.is_none() {
         let evidence = record(outcome, execution_parameters, outcome_detail)?;
         let submission = evidence_store.submit(evidence.clone()).await?;
-        return Ok(GovernedActionOutcome::Evaluated(GovernedActionResult {
-            evaluation,
-            authorized: true,
-            summary,
-            value,
-            evidence: Some(evidence),
-            submission: Some(submission),
-            queued: None,
-        }));
+        return Ok(Attempt::Done(GovernedActionOutcome::Evaluated(
+            GovernedActionResult {
+                evaluation,
+                authorized: true,
+                summary,
+                value,
+                evidence: Some(evidence),
+                submission: Some(submission),
+                queued: None,
+            },
+        )));
     }
 
     // The action ran: from here on its outcome is always recorded.
@@ -995,13 +1051,441 @@ where
             value: ActionValue::new(value),
         });
     }
-    Ok(GovernedActionOutcome::Evaluated(GovernedActionResult {
+    Ok(Attempt::Done(GovernedActionOutcome::Evaluated(
+        GovernedActionResult {
+            evaluation,
+            authorized: true,
+            summary,
+            value,
+            evidence: Some(evidence),
+            submission: delivery.submission,
+            queued: delivery.queued,
+        },
+    )))
+}
+
+// ── Remediation by a forward rotation (1.4.0) ────────────────────────────────
+
+/// What [`rotate_forward_then_disable`] remediates and how the rotation is
+/// governed (1.4.0).
+#[derive(Debug, Clone)]
+pub struct RotateForwardParams {
+    /// The rotation's governed action: its evaluation (a decision for the
+    /// rotation, under the policy that applies to it), the resource, which
+    /// must be the subject's, and the decision's verification.
+    /// `resource_action` is `rotate` (the default) or `update`.
+    pub governed: GovernedActionParams,
+    /// The judged change, from the remediation state
+    /// ([`RemediationSubject::from_state`]).
+    pub subject: RemediationSubject,
+    /// The remediation state from the due queue, when the caller has it: its
+    /// plan (`mode`, `steps`), its `state` and the version the change made
+    /// (`change_version_id`) are checked before anything runs.
+    pub state: Option<Value>,
+    /// The denied version, disabled once the new version is current.
+    pub disabled_version_id: String,
+    /// A short note for the remediation record, no secret values.
+    pub detail: Option<String>,
+}
+
+/// The version a forward rotation issued, as the rotation action reports it.
+#[derive(Debug, Clone)]
+pub struct RotatedVersion<T> {
+    /// The new version, recorded as `execution_parameters.version_id`.
+    pub version_id: String,
+    /// Returned to the caller; never recorded.
+    pub value: Option<T>,
+    /// Other identifiers for the execution evidence (never values).
+    pub execution_parameters: serde_json::Map<String, Value>,
+}
+
+impl<T> RotatedVersion<T> {
+    /// The new version, without other parameters.
+    pub fn new(version_id: impl Into<String>) -> Self {
+        Self {
+            version_id: version_id.into(),
+            value: None,
+            execution_parameters: serde_json::Map::new(),
+        }
+    }
+}
+
+/// What [`rotate_forward_then_disable`] did (1.4.0).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RotateForwardResult<T> {
+    /// The forward rotation's governed action. When it was not authorized,
+    /// nothing else happened.
+    pub rotation: GovernedActionResult<T>,
+    /// The signed remediation record linking the rotation, when the denied
+    /// version was disabled.
+    pub record: Option<Value>,
+    /// The NA's answer to the record, when it admitted it.
+    pub submission: Option<Value>,
+    /// With a record outbox, the entry holding the record otherwise: pending
+    /// (for example until the rotation's evidence is admitted) or a dead
+    /// letter.
+    pub queued: Option<RecordOutboxEntry>,
+}
+
+/// Cancel a denied change to a versioned resource without breaking its
+/// readers (1.4.0): rotate forward to a new version under a governed
+/// decision, then disable the denied version, then record a remediation
+/// linked to the rotation's execution evidence.
+///
+/// 1. `rotate` runs as a [`governed_action`] (a verified ALLOW only),
+///    rotating the resource to a new version and making it current; the new
+///    version is recorded in the evidence as `execution_parameters.version_id`.
+///    A DENY returns the result with no record: nothing else ran.
+/// 2. `disable` disables (or deletes) `disabled_version_id`.
+/// 3. The remediation record (`rotate_forward_then_disable`, outcome
+///    `cancelled`) names the rotation's `evidence_id`, the new version and
+///    the disabled one; it is signed by `recorder`, kept in the record outbox
+///    when there is one (submitted directly otherwise), and submitted. The
+///    NA admits it once it holds the rotation's evidence: with a record
+///    outbox it stays pending until then (`remediation_rotation_missing` is
+///    retried); flush the evidence outbox first.
+///
+/// Before anything is evaluated or run, it needs a `resource_id` equal to
+/// the subject's and a `rotate` or `update` action
+/// ([`GenesisMeshError::Configuration`]), a remediation the NA would admit
+/// ([`GenesisMeshError::OutOfBandRecord`], `remediation_malformed` or
+/// `remediation_secret_material`), and a record outbox that can be read.
+/// With the remediation `state`, the NA's refusals it already tells are
+/// refused too ([`GenesisMeshError::OutOfBandRecord`]): a plan other than
+/// `cancel` by `rotate_forward_then_disable` (`remediation_steps_mismatch`),
+/// a state from which no remediation is recorded, only `remediation_due` and
+/// `overdue` are (`remediation_not_due`, `remediation_already_recorded`),
+/// and another denied version than the change made
+/// (`remediation_subject_mismatch`).
+/// Errors of the rotation are those of [`governed_action`]. Once the rotation
+/// ran, a new version equal to the denied one (nothing is disabled), a
+/// disable that fails, or a record that cannot be signed, submitted or kept
+/// returns [`GenesisMeshError::RemediationNotRecorded`] with the rotation's
+/// evidence, and the record when it was signed.
+pub async fn rotate_forward_then_disable<T, R, RFut, D, DFut>(
+    boundary: &BoundaryClient,
+    evidence_store: &EvidenceStoreClient,
+    recorder: &ExecutionRecorder,
+    params: RotateForwardParams,
+    rotate: R,
+    disable: D,
+) -> Result<RotateForwardResult<T>>
+where
+    T: Send + 'static,
+    R: FnOnce(Value) -> RFut,
+    RFut: Future<Output = std::result::Result<RotatedVersion<T>, ActionError>>,
+    D: FnOnce(String) -> DFut,
+    DFut: Future<Output = std::result::Result<(), ActionError>>,
+{
+    let RotateForwardParams {
+        mut governed,
+        subject,
+        state,
+        disabled_version_id,
+        detail,
+    } = params;
+    if let Some(state) = &state {
+        let planned = json!({"outcome": "cancelled", "steps": "rotate_forward_then_disable"});
+        if let (Some(mode), Some(steps)) = (state["mode"].as_str(), state["steps"].as_str()) {
+            if let Some(problem) = steps_problem(mode, steps, &planned) {
+                return Err(refused("remediation_steps_mismatch", problem));
+            }
+        }
+        if let Some(current) = state["state"].as_str() {
+            let pending = state["review_pending"] == true;
+            if let Err(refusal) = next_state(current, "record_remediation", pending) {
+                return Err(refused(refusal.code, refusal.detail));
+            }
+        }
+        if let Some(version) = state["change_version_id"].as_str() {
+            if version != disabled_version_id {
+                return Err(refused(
+                    "remediation_subject_mismatch",
+                    format!("the change made version {version}, not {disabled_version_id}"),
+                ));
+            }
+        }
+    }
+    if governed.resource_id.as_deref() != Some(subject.resource_id.as_str()) {
+        return Err(GenesisMeshError::Configuration(
+            "the forward rotation's resource_id must be the remediated resource".into(),
+        ));
+    }
+    let action = governed
+        .resource_action
+        .get_or_insert_with(|| "rotate".into());
+    if !matches!(action.as_str(), "rotate" | "update") {
+        return Err(GenesisMeshError::Configuration(
+            "a forward rotation's resource_action is rotate or update".into(),
+        ));
+    }
+    let input = |rotation_evidence_id: String, version_id: String| RemediationInput {
+        detail: detail.clone(),
+        ..RemediationInput::new(
+            subject.clone(),
+            RemediationSteps::RotateForwardThenDisable {
+                rotation_evidence_id,
+                version_id,
+                disabled_version_id: disabled_version_id.clone(),
+            },
+        )
+    };
+    // Checked with placeholders for what the rotation will give: another
+    // version than the denied one.
+    let placeholder = if disabled_version_id == "v" { "w" } else { "v" };
+    remediation_input_problem(
+        recorder.executor_sovereign_id(),
+        &input("rotation".into(), placeholder.into()),
+    )?;
+    if let Some(outbox) = evidence_store.record_outbox() {
+        // A record outbox that cannot be read fails here, before anything runs.
+        outbox.list().await.map_err(GenesisMeshError::Outbox)?;
+    }
+
+    let rotation = governed_action(
+        boundary,
+        evidence_store,
+        recorder,
+        governed,
+        |decision| async move {
+            let rotated = rotate(decision).await?;
+            let mut parameters = rotated.execution_parameters;
+            parameters.insert("version_id".into(), json!(rotated.version_id));
+            Ok(ActionReport {
+                value: Some((rotated.value, rotated.version_id)),
+                execution_parameters: Some(Value::Object(parameters)),
+                ..ActionReport::default()
+            })
+        },
+    )
+    .await?;
+    let GovernedActionResult {
         evaluation,
-        authorized: true,
+        authorized,
         summary,
         value,
-        evidence: Some(evidence),
-        submission: delivery.submission,
-        queued: delivery.queued,
-    }))
+        evidence,
+        submission,
+        queued,
+    } = rotation;
+    let (value, version_id) = match value {
+        Some((value, version_id)) => (value, Some(version_id)),
+        None => (None, None),
+    };
+    let rotation = GovernedActionResult {
+        evaluation,
+        authorized,
+        summary,
+        value,
+        evidence,
+        submission,
+        queued,
+    };
+    let (Some(evidence), Some(version_id)) = (rotation.evidence.clone(), version_id) else {
+        return Ok(RotateForwardResult {
+            rotation,
+            record: None,
+            submission: None,
+            queued: None,
+        });
+    };
+    let incomplete =
+        |source: ActionError, record: Option<Value>| GenesisMeshError::RemediationNotRecorded {
+            source,
+            rotation: Box::new(evidence.clone()),
+            record: record.map(Box::new),
+        };
+    if version_id == disabled_version_id {
+        return Err(incomplete(
+            "the forward rotation issued the version it was to replace; nothing was disabled"
+                .into(),
+            None,
+        ));
+    }
+    if let Err(source) = disable(disabled_version_id.clone()).await {
+        return Err(incomplete(source, None));
+    }
+    let evidence_id = evidence["evidence_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let record = recorder
+        .sign_remediation(input(evidence_id, version_id))
+        .map_err(|err| incomplete(Box::new(err), None))?;
+    let (submission, queued) = if evidence_store.record_outbox().is_some() {
+        let delivery = evidence_store
+            .enqueue_record(record.clone())
+            .await
+            .map_err(|err| incomplete(Box::new(err), Some(record.clone())))?;
+        (delivery.submission, delivery.queued)
+    } else {
+        let submission = evidence_store
+            .submit_remediation(record.clone())
+            .await
+            .map_err(|err| incomplete(Box::new(err), Some(record.clone())))?;
+        (Some(submission), None)
+    };
+    Ok(RotateForwardResult {
+        rotation,
+        record: Some(record),
+        submission,
+        queued,
+    })
+}
+
+// ── Urgent changes (1.4.0) ───────────────────────────────────────────────────
+
+/// The emergency capability an urgent change falls back to (1.4.0): a
+/// capability of its own, selected by a policy with an `emergency` section.
+#[derive(Debug, Clone)]
+pub struct EmergencyOptions {
+    /// The emergency capability.
+    pub capability: String,
+    /// Why the change cannot wait: 1 to 1024 characters, no secret values.
+    /// Sent as the emergency policy's justification parameter, and recorded
+    /// as a break-glass record's justification.
+    pub justification: String,
+    /// The emergency policy's `justification_parameter`; `None` for
+    /// `justification`.
+    pub justification_parameter: Option<String>,
+    /// The policies the emergency capability's decision must bind
+    /// (`verify.expected_policies` for it).
+    pub expected_policies: Vec<Value>,
+}
+
+/// How an urgent change went (1.4.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UrgentPath {
+    /// The ordinary capability was allowed: the change ran under it.
+    Ordinary,
+    /// The ordinary capability was denied, or its evaluation got no answer,
+    /// and the emergency capability was decided (the outcome says whether it
+    /// was allowed).
+    Emergency,
+    /// The NA did not answer for the emergency capability either: the change
+    /// ran under break-glass naming it.
+    BreakGlass,
+}
+
+/// What [`urgent_action`] did (1.4.0).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct UrgentActionResult<T> {
+    /// Which path the change took.
+    pub path: UrgentPath,
+    /// The governed action's outcome on that path.
+    pub outcome: GovernedActionOutcome<T>,
+    /// The ordinary capability's DENY, when the emergency capability was
+    /// requested after it.
+    pub ordinary_denial: Option<GovernedActionResult<T>>,
+}
+
+/// An urgent change (1.4.0): never blocked, always governed and judged.
+///
+/// * The ordinary capability (`params`) is evaluated first, as
+///   [`governed_action`] does; an ALLOW runs the action under it
+///   ([`UrgentPath::Ordinary`]).
+/// * On a DENY, or when that evaluation gets no answer (a network error, a
+///   timeout, `5xx` or `429`; see [`evaluation_failure`]), the emergency
+///   capability is requested with the justification in its justification
+///   parameter; the NA decides it under the emergency policy before the
+///   change and reviews it after ([`UrgentPath::Emergency`]; the outcome's
+///   `authorized` is false when that is a DENY too).
+/// * When the NA does not answer for the emergency capability either, the
+///   action runs under break-glass naming the emergency capability, with the
+///   justification parameter in its request parameters; the NA judges it
+///   under the emergency policy once it is back ([`UrgentPath::BreakGlass`]).
+///
+/// The action gets the decision it runs under, or `None` under break-glass.
+/// Everything break-glass needs is checked before anything is evaluated, as
+/// [`governed_action_with_break_glass`] checks it: a record outbox, an
+/// attestation-based evaluation and `resource_id`. The emergency
+/// capability's decision is verified against `emergency.expected_policies`.
+pub async fn urgent_action<T, F, Fut>(
+    boundary: &BoundaryClient,
+    evidence_store: &EvidenceStoreClient,
+    recorder: &ExecutionRecorder,
+    params: GovernedActionParams,
+    emergency: EmergencyOptions,
+    action: F,
+) -> Result<UrgentActionResult<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(Option<Value>) -> Fut,
+    Fut: Future<Output = std::result::Result<ActionReport<T>, ActionError>>,
+{
+    let parameter = emergency
+        .justification_parameter
+        .as_deref()
+        .unwrap_or("justification");
+    let mut urgent = params.clone();
+    if !urgent.evaluate.is_object() {
+        return Err(GenesisMeshError::Configuration(
+            "evaluate must be a JSON object".into(),
+        ));
+    }
+    urgent.evaluate["requested_capability"] = json!(emergency.capability);
+    let context = &mut urgent.evaluate["context"];
+    if !context.is_object() {
+        *context = json!({});
+    }
+    // Each attempt is a request of its own.
+    if let Some(context) = context.as_object_mut() {
+        context.remove("context_id");
+    }
+    let parameters = &mut context["request_parameters"];
+    if parameters.is_null() {
+        *parameters = json!({});
+    }
+    if !parameters.is_object() {
+        return Err(GenesisMeshError::Configuration(
+            "context.request_parameters must be a JSON object".into(),
+        ));
+    }
+    parameters[parameter] = json!(emergency.justification);
+    urgent.verify.expected_policies = emergency.expected_policies;
+    let break_glass = BreakGlassOptions::new(emergency.justification);
+    check_break_glass(evidence_store, recorder, &urgent, &break_glass).await?;
+
+    let (ordinary_denial, action) = match attempt(
+        boundary,
+        evidence_store,
+        recorder,
+        params,
+        None,
+        true,
+        action,
+    )
+    .await?
+    {
+        Attempt::Done(outcome) => {
+            return Ok(UrgentActionResult {
+                path: UrgentPath::Ordinary,
+                outcome,
+                ordinary_denial: None,
+            })
+        }
+        Attempt::Denied(denied, action) => (Some(denied), action),
+        Attempt::Unanswered(_, action) => (None, action),
+    };
+    let outcome = run(
+        boundary,
+        evidence_store,
+        recorder,
+        urgent,
+        Some(&break_glass),
+        action,
+    )
+    .await?;
+    let path = match outcome {
+        GovernedActionOutcome::Evaluated(_) => UrgentPath::Emergency,
+        GovernedActionOutcome::BrokeGlass(_) => UrgentPath::BreakGlass,
+    };
+    Ok(UrgentActionResult {
+        path,
+        outcome,
+        ordinary_denial,
+    })
 }

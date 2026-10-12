@@ -31,8 +31,9 @@ sdk-rust/
     verify.rs      # offline verification, Python reason codes (pure)
     execution.rs   # ExecutionRecorder, secret-material guard
     out_of_band.rs # ObservationRecorder, break-glass records (1.3.0)
+    remediation.rs # remediation records, review checks, plans and the state table (1.4.0, pure)
     outbox.rs      # evidence and record outboxes
-    governance.rs  # governed_action, governed_action_with_break_glass, summarize_decision
+    governance.rs  # governed_action, governed_action_with_break_glass, rotate_forward_then_disable, summarize_decision
     lib.rs         # public exports
   Cargo.toml
 ```

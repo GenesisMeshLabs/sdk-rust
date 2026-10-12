@@ -19,6 +19,7 @@ mod health;
 mod out_of_band;
 mod outbox;
 mod policy;
+pub mod remediation;
 pub mod strict;
 mod strict_json;
 pub mod verify;
@@ -37,7 +38,10 @@ pub use data_usage::DataUsageClient;
 pub use disclosure::DisclosureClient;
 pub use errors::{ActionValue, GenesisMeshError, Result};
 pub use evidence::EvidenceClient;
-pub use evidence_store::{EvidenceStoreClient, FlushOptions, ResourceHead, MAX_PAGE};
+pub use evidence_store::{
+    EvidenceStoreClient, FlushOptions, RemediationQuery, ResourceHead, ReviewDecision, MAX_PAGE,
+    MAX_REMEDIATION_PAGE,
+};
 pub use execution::{
     check_metadata_only, ExecutionRecorder, PriorResource, RecordExecution, MAX_METADATA_BYTES,
 };
@@ -46,6 +50,10 @@ pub use governance::{
     without_refused_metadata, ActionError, ActionReport, BreakGlassOptions, BreakGlassResult,
     DecisionSummary, GateFailure, GovernedActionOutcome, GovernedActionParams,
     GovernedActionResult, GovernedVerification, RefusedMetadata,
+};
+pub use governance::{
+    rotate_forward_then_disable, urgent_action, EmergencyOptions, RotateForwardParams,
+    RotateForwardResult, RotatedVersion, UrgentActionResult, UrgentPath,
 };
 pub use health::HealthClient;
 #[doc(hidden)]
@@ -62,5 +70,8 @@ pub use outbox::{
     PREDECESSOR_DEAD_LETTERED, RECORD_PERMANENT_REFUSALS,
 };
 pub use policy::PolicyClient;
+pub use remediation::{
+    RemediationInput, RemediationSteps, RemediationSubject, REMEDIATION_PERMANENT_REFUSALS,
+};
 pub use serde_json::{json, Value};
 pub use strict_json::{check_strict_json, parse_strict_json};

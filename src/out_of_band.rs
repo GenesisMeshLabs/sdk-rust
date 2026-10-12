@@ -76,22 +76,33 @@ pub(crate) fn metadata_problem(values: &[(&str, &Value)]) -> Option<String> {
 /// `observation`) its `metadata` (absent: `{}`), `actor`, `source_event_id`
 /// and `version_id` (absent or `null` ones left out); for a break-glass record
 /// its `execution_parameters`, `request_parameters` and `attributes` (absent:
-/// `{}`), `outcome_detail` (absent or `null`: `""`) and `justification`. The
+/// `{}`), `outcome_detail` (absent or `null`: `""`) and `justification`; for a
+/// remediation record (`remediation`, 1.4.0) its `version_id`,
+/// `disabled_version_id` and `detail` (absent or `null` ones left out). The
 /// conformance suite `out_of_band` (`metadata_problem` vectors) checks it.
 #[doc(hidden)]
 pub fn record_metadata_problem(record_kind: &str, record: &Value) -> Option<String> {
     let field = |name: &str| record.get(name).filter(|v| !v.is_null()).cloned();
     let object = |name: &str| field(name).unwrap_or_else(|| json!({}));
+    let present = |names: &[(&'static str, Option<Value>)]| -> Vec<(&'static str, Value)> {
+        names
+            .iter()
+            .filter_map(|(name, value)| Some((*name, value.clone()?)))
+            .collect()
+    };
     let values: Vec<(&str, Value)> = if record_kind == "observation" {
-        [
+        present(&[
             ("metadata", Some(object("metadata"))),
             ("actor", field("actor")),
             ("source_event_id", field("source_event_id")),
             ("version_id", field("version_id")),
-        ]
-        .into_iter()
-        .filter_map(|(name, value)| Some((name, value?)))
-        .collect()
+        ])
+    } else if record_kind == "remediation" {
+        present(&[
+            ("version_id", field("version_id")),
+            ("disabled_version_id", field("disabled_version_id")),
+            ("detail", field("detail")),
+        ])
     } else {
         vec![
             ("execution_parameters", object("execution_parameters")),
@@ -184,7 +195,7 @@ pub(crate) fn refused(code: &str, message: impl Into<String>) -> GenesisMeshErro
 
 /// Sign a record's canonical form and add the signature, unless no reader
 /// would take it ([`check_nesting`]).
-fn signed(record: Map<String, Value>, key_id: &str, key: &SigningKey) -> Result<Value> {
+pub(crate) fn signed(record: Map<String, Value>, key_id: &str, key: &SigningKey) -> Result<Value> {
     let mut record = Value::Object(record);
     check_nesting(&record)?;
     let canonical = out_of_band_canonical(&record)?;

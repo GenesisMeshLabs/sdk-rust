@@ -215,6 +215,28 @@ pub enum GenesisMeshError {
     /// the record outbox methods and break-glass need one (v1.3.0).
     #[error("no record outbox is configured (ClientOptions::with_record_outbox)")]
     RecordOutboxRequired,
+
+    /// [`rotate_forward_then_disable`](crate::rotate_forward_then_disable)
+    /// rotated the resource forward (its execution evidence is `rotation`),
+    /// but the remediation was not recorded (1.4.0): the denied version was
+    /// not disabled, or the remediation record could not be signed,
+    /// submitted or kept (`record`, when it was signed). Code
+    /// `remediation_not_recorded`, as in the TypeScript SDK. Do not rotate
+    /// again: disable the denied version and sign the remediation with
+    /// [`RemediationSteps::RotateForwardThenDisable`](crate::RemediationSteps::RotateForwardThenDisable)
+    /// naming `rotation`'s `evidence_id`, or submit `record` once the cause
+    /// is fixed (the NA answers the same record again as a duplicate).
+    #[error("the forward rotation ran; the remediation was not recorded: {source}")]
+    #[non_exhaustive]
+    RemediationNotRecorded {
+        /// Why.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+        /// The forward rotation's signed execution evidence.
+        rotation: Box<Value>,
+        /// The signed remediation record, when the disable ran.
+        record: Option<Box<Value>>,
+    },
 }
 
 /// A governed action's value carried by an error that says the action ran
@@ -272,6 +294,7 @@ impl GenesisMeshError {
             Self::OutboxRequired => "outbox_required",
             Self::FlushInProgress => "outbox_flush_in_progress",
             Self::RecordOutboxRequired => "record_outbox_required",
+            Self::RemediationNotRecorded { .. } => "remediation_not_recorded",
             Self::Configuration(_) => "configuration",
             Self::Network(_) => "network",
             Self::ResponseBodyUnreadable { .. } => "response_body_unreadable",

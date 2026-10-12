@@ -3,6 +3,7 @@
 //!
 //! * [`verify_boundary_decision`]: `trust/context/decisions.py` `verify_boundary_decision`
 //! * [`verify_evidence_events`]: `trust/evidence_store.py` `verify_evidence_events`
+//! * the review checks (1.4.0): `trust/remediation.py`
 //!
 //! No network access; every key is supplied by the caller.
 
@@ -29,6 +30,10 @@ use crate::{
     },
     errors::{GenesisMeshError, Result},
     evidence_store::ResourceHead,
+    remediation::{
+        review_approval_problem, review_holder_problem, rotation_problem, ReviewHolders,
+        RotationFacts,
+    },
 };
 
 // ── Structural checks (no coercion or mutation of signed JSON) ───────────────
@@ -503,7 +508,8 @@ validator!(
             ("quarantine_id", bounded(128, 1)),
             (
                 "record_kind",
-                one_of(&["execution", "observation", "break_glass"])
+                // v1.4.0: also a refused remediation record.
+                one_of(&["execution", "observation", "break_glass", "remediation"])
             ),
             ("record", object()),
             ("record_digest", sha256()),
@@ -556,6 +562,160 @@ validator!(
         false
     )
 );
+
+// v1.4.0: remediation and review records. An absent optional field is left
+// out of the signed form; a null reads as absent.
+
+fn present(record: &Value, key: &str) -> bool {
+    record.get(key).is_some_and(|v| !v.is_null())
+}
+
+/// A remediation's outcome, steps and versions agree (the reference's model
+/// rules): `alerted` exactly when nothing changed (`none`); a forward
+/// rotation names its evidence, the version it issued and the one it
+/// disabled, two different versions; nothing else names rotation evidence or
+/// a new version; `none` disables nothing.
+fn remediation_consistent(record: &Value) -> bool {
+    let outcome = str_field(record, "outcome");
+    let steps = str_field(record, "steps");
+    let versions = if steps == Some("rotate_forward_then_disable") {
+        present(record, "rotation_evidence_id")
+            && present(record, "version_id")
+            && present(record, "disabled_version_id")
+            && record["version_id"] != record["disabled_version_id"]
+    } else {
+        !present(record, "rotation_evidence_id") && !present(record, "version_id")
+    };
+    (outcome == Some("alerted")) == (steps == Some("none"))
+        && versions
+        && !(steps == Some("none") && present(record, "disabled_version_id"))
+}
+
+validator!(valid_remediation, {
+    let fields = shape(
+        vec![
+            ("remediation_id", bounded(128, 1)),
+            ("executor_sovereign_id", bounded(256, 1)),
+            ("subject_kind", one_of(&["judgement", "decision"])),
+            ("subject_id", bounded(128, 1)),
+            (
+                "change_kind",
+                one_of(&["observation", "break_glass", "execution"]),
+            ),
+            ("change_id", bounded(128, 1)),
+            ("resource_id", bounded(256, 1)),
+            ("outcome", one_of(&["cancelled", "alerted"])),
+            (
+                "steps",
+                one_of(&["rotate_forward_then_disable", "disable", "delete", "none"]),
+            ),
+            ("rotation_evidence_id", absent(bounded(128, 1))),
+            ("version_id", absent(bounded(256, 1))),
+            ("disabled_version_id", absent(bounded(256, 1))),
+            ("remediated_at", utc_timestamp()),
+            ("detail", absent(bounded(1024, 1))),
+            ("signature", optional(signature())),
+        ],
+        false,
+    );
+    Box::new(move |v| fields(v) && v.is_some_and(remediation_consistent))
+});
+
+/// Whether a remediation record is well formed (1.4.0), for the record checks.
+pub(crate) fn valid_remediation_record(record: &Value) -> bool {
+    valid_remediation(Some(record))
+}
+
+/// An operator's signed admin request, kept whole in a review (1.4.0).
+fn admin_approval() -> Check {
+    shape(
+        vec![
+            ("key_id", bounded(256, 1)),
+            ("public_key", bounded(256, 1)),
+            ("method", bounded(16, 1)),
+            ("path", bounded(2048, 1)),
+            ("query", filled(dictionary(array(string())))),
+            ("audience", bounded(256, 1)),
+            ("body", filled(object())),
+            ("timestamp", bounded(256, 1)),
+            ("nonce", bounded(256, 1)),
+            ("admin_signature", bounded(256, 1)),
+        ],
+        false,
+    )
+}
+
+/// The longest waiver a review may record, in microseconds (90 days).
+const MAX_WAIVER_MICROS: i64 = crate::remediation::MAX_WAIVER_SECONDS * 1_000_000;
+
+/// A review's verdict, waiver and request agree (the reference's model
+/// rules): `waive_until` is present exactly for a waiver, after the decision
+/// and within 90 days of it; a requested review names its requester, holder,
+/// justification and request, and one the NA opened none of them.
+fn review_consistent(record: &Value) -> bool {
+    let waiver = str_field(record, "verdict") == Some("waive_until");
+    if waiver != present(record, "waive_until") {
+        return false;
+    }
+    if waiver {
+        let at = |key: &str| micros(str_field(record, key).unwrap_or_default());
+        let (Ok(decided), Ok(until)) = (at("decided_at"), at("waive_until")) else {
+            return false;
+        };
+        if !(decided < until && until - decided <= MAX_WAIVER_MICROS) {
+            return false;
+        }
+    }
+    let requested = str_field(record, "opened_for") == Some("requested");
+    let given = [
+        "requested_by",
+        "requester_holder",
+        "justification",
+        "request_approval",
+    ]
+    .map(|key| present(record, key));
+    if requested {
+        given.iter().all(|g| *g)
+    } else {
+        !given.iter().any(|g| *g)
+    }
+}
+
+validator!(valid_review, {
+    let fields = shape(
+        vec![
+            ("review_id", bounded(128, 1)),
+            ("subject_kind", one_of(&["judgement", "decision"])),
+            ("subject_id", bounded(128, 1)),
+            ("subject_digest", sha256()),
+            ("resource_id", absent(bounded(256, 1))),
+            ("capability", absent(bounded(256, 1))),
+            (
+                "opened_for",
+                one_of(&["requested", "flagged_for_review", "review_required"]),
+            ),
+            ("requested_by", absent(bounded(256, 1))),
+            ("requester_holder", absent(bounded(128, 1))),
+            ("justification", absent(bounded(1024, 1))),
+            ("request_approval", absent(admin_approval())),
+            ("requested_at", utc_timestamp()),
+            ("actor", absent(bounded(256, 1))),
+            ("actor_holder", absent(bounded(128, 1))),
+            ("verdict", one_of(&["uphold", "deny", "waive_until"])),
+            ("waive_until", absent(utc_timestamp())),
+            ("note", absent(bounded(1024, 1))),
+            ("decided_by", bounded(256, 1)),
+            ("decider_holder", bounded(128, 1)),
+            ("approval", admin_approval()),
+            ("decided_at", utc_timestamp()),
+            ("issuer_sovereign_id", string()),
+            ("issued_by", string()),
+            ("signature", optional(signature())),
+        ],
+        false,
+    );
+    Box::new(move |v| fields(v) && v.is_some_and(review_consistent))
+});
 
 validator!(
     valid_event,
@@ -696,13 +856,15 @@ pub fn verify_execution_signature(evidence: &Value, executor_public_key: &str) -
 type Validator = fn(Option<&Value>) -> bool;
 
 /// v1.3.0: the id field, model and validator of each record of a change made
-/// outside the controlled path.
-const OUT_OF_BAND_IDS: [(&str, &str, Validator); 5] = [
+/// outside the controlled path; v1.4.0: and of a remediation or review.
+const OUT_OF_BAND_IDS: [(&str, &str, Validator); 7] = [
     ("observation_id", "ObservationRecord", valid_observation),
     ("break_glass_id", "BreakGlassRecord", valid_break_glass),
     ("judgement_id", "JudgementRecord", valid_judgement),
     ("quarantine_id", "QuarantineRecord", valid_quarantine),
     ("registry_record_id", "RegistryRecord", valid_registry),
+    ("remediation_id", "RemediationRecord", valid_remediation),
+    ("review_id", "ReviewRecord", valid_review),
 ];
 
 /// Whether a Stage 2 record's signature covers it as received under one of
@@ -714,11 +876,13 @@ fn out_of_band_verifies(model: &str, record: &Value, keys: &[String]) -> bool {
 }
 
 /// True when a record of a change made outside the controlled path (v1.3.0:
-/// an observation, break-glass, judgement, quarantine or registry record,
-/// told by its id field) is well formed, its signature verifies under one of
-/// the keys over its form as received, and it is in the form the reference
-/// writes with no signed field this crate does not know, as
-/// [`verify_evidence_events`] checks a stored one.
+/// an observation, break-glass, judgement, quarantine or registry record;
+/// v1.4.0: a remediation or review record; told by its id field) is well
+/// formed, its signature verifies under one of the keys over its form as
+/// received, and it is in the form the reference writes with no signed field
+/// this crate does not know, as [`verify_evidence_events`] checks a stored
+/// one. A review's embedded approvals are checked apart
+/// ([`review_approval_problem`]).
 pub fn verify_out_of_band_record(record: &Value, public_keys: &[String]) -> bool {
     OUT_OF_BAND_IDS
         .iter()
@@ -997,6 +1161,12 @@ pub struct EvidenceVerification {
     /// Quarantine entries checked (v1.3.0); left out when zero.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub quarantined: u64,
+    /// Remediation entries checked (v1.4.0); left out when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub remediations: u64,
+    /// Review entries checked (v1.4.0); left out when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reviews: u64,
     /// Every failure, in order.
     pub failures: Vec<VerificationFailure>,
     /// Findings that do not fail verification (v1.2.0), such as
@@ -1017,8 +1187,9 @@ pub struct VerifyEvidenceOptions {
     /// Executor keys as listed by `GET /admin/evidence/executor-keys`
     /// (`key_id`, `public_key`, `executor_sovereign_id`); retired keys still
     /// verify old records. v1.3.0: a key's `role` is `executor` (the default
-    /// when absent), which signs execution evidence and break-glass records,
-    /// or `observer`, which signs observations only.
+    /// when absent), which signs execution evidence and break-glass records
+    /// (v1.4.0: and remediation records), or `observer`, which signs
+    /// observations only.
     pub executor_keys: Vec<Value>,
     /// True for an unbroken run of the store (an export or the whole store);
     /// false for a filtered history, where store links are checked only
@@ -1132,7 +1303,7 @@ fn check_payload_fields(
         // v1.3.0: the key the signature names, whatever its role or sovereign,
         // so an authentic record with a field this crate does not know is
         // refused by name first, as the reference refuses it.
-        "observation" | "break_glass" => payload
+        "observation" | "break_glass" | "remediation" => payload
             .get("signature")
             .and_then(|sig| str_field(sig, "key_id"))
             .and_then(|id| executor_keys.get(id))
@@ -1164,7 +1335,8 @@ fn check_payload_fields(
     }
 }
 
-/// v1.3.0: the model each Stage 2 entry kind holds.
+/// v1.3.0: the model each Stage 2 entry kind holds (v1.4.0: and each
+/// Stage 3 kind).
 fn out_of_band_model(kind: &str) -> Option<&'static str> {
     Some(match kind {
         "observation" => "ObservationRecord",
@@ -1172,6 +1344,8 @@ fn out_of_band_model(kind: &str) -> Option<&'static str> {
         "judgement" => "JudgementRecord",
         "quarantine" => "QuarantineRecord",
         "registry" => "RegistryRecord",
+        "remediation" => "RemediationRecord",
+        "review" => "ReviewRecord",
         _ => return None,
     })
 }
@@ -1184,7 +1358,8 @@ fn key_role(key: &Value) -> &str {
 /// The keys that may sign a Stage 2 record: the registered key it names, when
 /// that key belongs to the record's sovereign and has the role its kind needs
 /// (an observer key for an observation, an executor key for a break-glass
-/// record), or the NA's for the kinds the NA signs.
+/// record or, v1.4.0, a remediation record), or the NA's for the kinds the NA
+/// signs.
 fn out_of_band_keys(
     kind: &str,
     payload: &Value,
@@ -1193,7 +1368,7 @@ fn out_of_band_keys(
 ) -> Vec<String> {
     let (role, sovereign) = match kind {
         "observation" => ("observer", "observer_sovereign_id"),
-        "break_glass" => ("executor", "executor_sovereign_id"),
+        "break_glass" | "remediation" => ("executor", "executor_sovereign_id"),
         _ => return na_public_keys.to_vec(),
     };
     payload
@@ -1263,6 +1438,8 @@ fn valid_payload(kind: &str, payload: &Value) -> bool {
         "judgement" => valid_judgement(Some(payload)),
         "quarantine" => valid_quarantine(Some(payload)),
         "registry" => valid_registry(Some(payload)),
+        "remediation" => valid_remediation(Some(payload)),
+        "review" => valid_review(Some(payload)),
         _ => false,
     }
 }
@@ -1279,6 +1456,8 @@ fn record_id_of(kind: &str, payload: &Value) -> String {
         "judgement" => &payload["judgement_id"],
         "quarantine" => &payload["quarantine_id"],
         "registry" => &payload["registry_record_id"],
+        "remediation" => &payload["remediation_id"],
+        "review" => &payload["review_id"],
         _ => &Value::Null,
     };
     id.as_str().unwrap_or_default().to_owned()
@@ -1287,7 +1466,7 @@ fn record_id_of(kind: &str, payload: &Value) -> String {
 /// v1.3.1: the envelope fields a Stage 2 entry derives from its record, and
 /// the record field each must equal (an absent field is null). The NA
 /// searches and matches on them.
-const ENVELOPE_FIELDS: [(&str, &[(&str, &str)]); 5] = [
+const ENVELOPE_FIELDS: [(&str, &[(&str, &str)]); 7] = [
     (
         "observation",
         &[
@@ -1333,6 +1512,27 @@ const ENVELOPE_FIELDS: [(&str, &[(&str, &str)]); 5] = [
     (
         "registry",
         &[("record_id", "registry_record_id"), ("outcome", "event")],
+    ),
+    // v1.4.0
+    (
+        "remediation",
+        &[
+            ("record_id", "remediation_id"),
+            ("subject_id", "subject_id"),
+            ("resource_id", "resource_id"),
+            ("executor_sovereign_id", "executor_sovereign_id"),
+            ("outcome", "outcome"),
+        ],
+    ),
+    (
+        "review",
+        &[
+            ("record_id", "review_id"),
+            ("subject_id", "subject_id"),
+            ("resource_id", "resource_id"),
+            ("capability", "capability"),
+            ("outcome", "verdict"),
+        ],
     ),
 ];
 
@@ -1385,6 +1585,31 @@ fn fail(result: &mut EvidenceVerification, seq: Option<i64>, reason: &str, detai
 ///   (`retention_count_mismatch`);
 /// * a record with fields outside its signature is checked for its form as
 ///   the signer signed it.
+///
+/// v1.4.0, remediations and reviews, as the reference verifies them:
+///
+/// * one remediation per judgement or decision (`duplicate_remediation`); it
+///   names its judgement's change, resource and the version that change made
+///   (`remediation_subject_mismatch`); in a run from its start (entry 1, or
+///   right after the checkpoint) its subject and its forward rotation's
+///   execution evidence are held before it (`remediation_subject_missing`,
+///   `remediation_rotation_missing`); the rotation is of the same resource
+///   (`remediation_rotation_mismatch`), by the remediation's own executor
+///   sovereign (`remediation_rotation_other_executor`), made after the change
+///   (`remediation_rotation_before_change`) and cited by no earlier
+///   remediation (`remediation_rotation_reused`); a remediation record is
+///   signed by an executor key of its sovereign;
+/// * a review's embedded admin requests verify offline
+///   (`review_approval_invalid`, see
+///   [`review_approval_problem`]),
+///   with the public key and holder the holder registry records for each
+///   operator key at the time, when the run holds a record the NA signed for
+///   that key (`review_approval_key_mismatch`); its decider is a second
+///   holder (`review_same_holder`); it names its subject's payload digest
+///   (`review_subject_mismatch`; `review_subject_missing` in a run from its
+///   start); and no waiver follows a remediation of the same subject
+///   (`review_waiver_after_remediation`);
+/// * remediation and review ids are not decisions (`evidence_cites_judgement`).
 pub fn verify_evidence_events<'a>(
     events: impl IntoIterator<Item = &'a Value>,
     options: &VerifyEvidenceOptions,
@@ -1398,6 +1623,8 @@ pub fn verify_evidence_events<'a>(
         break_glass: 0,
         judgements: 0,
         quarantined: 0,
+        remediations: 0,
+        reviews: 0,
         failures: Vec::new(),
         warnings: Vec::new(),
     };
@@ -1433,6 +1660,10 @@ pub fn verify_evidence_events<'a>(
     let mut record_ids: HashSet<(String, String)> = HashSet::new();
     let mut matchable: HashSet<String> = HashSet::new();
     let mut checkpoints: HashMap<String, i64> = HashMap::new();
+    // v1.4.0: judgements and decisions by id (payload digest, resource),
+    // execution evidence's resources, remediated subjects, and operator keys
+    // as the holder registry records them.
+    let mut stage3 = Stage3::default();
     let mut first_sequence: Option<i64> = None;
     let mut from_start = false;
     let mut prev: Option<Value> = None;
@@ -1595,6 +1826,15 @@ pub fn verify_evidence_events<'a>(
                 let id = str_field(decision, "decision_id")
                     .unwrap_or_default()
                     .to_owned();
+                stage3.judged.insert(
+                    id.clone(),
+                    Subject {
+                        digest: str_field(entry, "payload_digest")
+                            .unwrap_or_default()
+                            .to_owned(),
+                        ..Subject::default()
+                    },
+                );
                 decisions.insert(id.clone(), decision.clone());
                 if valid_context(payload.get("context")) {
                     contexts.insert(id, payload["context"].clone());
@@ -1666,6 +1906,19 @@ pub fn verify_evidence_events<'a>(
                 }
                 last_exec.insert(decision_id, ev.clone());
                 matchable.insert(str_field(ev, "evidence_id").unwrap_or_default().to_owned());
+                stage3.executed.insert(
+                    str_field(ev, "evidence_id").unwrap_or_default().to_owned(),
+                    Execution {
+                        resource_id: str_field(ev, "resource_id").map(str::to_owned),
+                        store_sequence: seq,
+                        executed_at: micros(str_field(ev, "executed_at").unwrap_or_default())
+                            .unwrap_or_default(),
+                        executor_sovereign_id: str_field(ev, "executor_sovereign_id")
+                            .unwrap_or_default()
+                            .to_owned(),
+                        decision_id: str_field(ev, "decision_id").unwrap_or_default().to_owned(),
+                    },
+                );
                 if let Some(resource_id) = str_field(ev, "resource_id") {
                     let head = resource_heads.get(resource_id);
                     let expected = head.map_or(1, |h| h.resource_sequence + 1);
@@ -1735,6 +1988,19 @@ pub fn verify_evidence_events<'a>(
                     (kind.to_owned(), record_id.clone()),
                     (digest.to_owned(), seq),
                 );
+                // v1.4.0: the version the change made, for its remediation.
+                let version = if observation {
+                    &payload["version_id"]
+                } else {
+                    &payload["execution_parameters"]["version_id"]
+                };
+                stage3.versions.insert(
+                    (kind.to_owned(), record_id.clone()),
+                    version
+                        .as_str()
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned),
+                );
                 not_decisions.insert(record_id.clone());
                 if observation {
                     result.observations += 1;
@@ -1754,6 +2020,20 @@ pub fn verify_evidence_events<'a>(
                 let signed = out_of_band_signed(kind, payload, options, &executor_keys);
                 signature(&mut result, signed, model_of(kind), payload, kind);
                 result.judgements += 1;
+                stage3.judged.insert(
+                    record_id.clone(),
+                    Subject {
+                        digest: str_field(entry, "payload_digest")
+                            .unwrap_or_default()
+                            .to_owned(),
+                        resource_id: str_field(payload, "resource_id").map(str::to_owned),
+                        change_kind: str_field(payload, "subject_kind").map(str::to_owned),
+                        change_id: str_field(payload, "subject_id").map(str::to_owned),
+                        change_sequence: payload["subject_store_sequence"].as_i64(),
+                        changed_at: str_field(payload, "evaluated_as_of")
+                            .and_then(|at| micros(at).ok()),
+                    },
+                );
                 not_decisions.insert(record_id);
                 let subject_id = str_field(payload, "subject_id").unwrap_or_default();
                 // v1.3.1: keyed by the subject's kind and id.
@@ -1810,9 +2090,258 @@ pub fn verify_evidence_events<'a>(
             "registry" => {
                 let signed = out_of_band_signed(kind, payload, options, &executor_keys);
                 signature(&mut result, signed, model_of(kind), payload, kind);
+                // v1.4.0: the operator keys' public keys and holders over time,
+                // from registry records the NA signed only.
+                let authentic = signed && non_canonical_fields(model_of(kind), payload).is_empty();
+                if let (true, Some("operator_key_holder"), Some(key_id)) = (
+                    authentic,
+                    str_field(payload, "event"),
+                    str_field(payload, "key_id"),
+                ) {
+                    stage3
+                        .operator_keys
+                        .entry(key_id.to_owned())
+                        .or_default()
+                        .push((
+                            micros(str_field(payload, "effective_at").unwrap_or_default())
+                                .unwrap_or_default(),
+                            str_field(payload, "public_key").map(str::to_owned),
+                            str_field(payload, "holder").map(str::to_owned),
+                        ));
+                }
+            }
+            "remediation" => {
+                let signed = out_of_band_signed(kind, payload, options, &executor_keys);
+                signature(&mut result, signed, model_of(kind), payload, kind);
+                result.remediations += 1;
+                not_decisions.insert(record_id);
+                // A run from its start: entry 1, or right after the checkpoint.
+                let held_from_start = options.contiguous && from_start;
+                for (reason, detail) in stage3.remediation(payload, held_from_start) {
+                    fail(&mut result, s, reason, &detail);
+                }
+            }
+            "review" => {
+                let signed = out_of_band_signed(kind, payload, options, &executor_keys);
+                signature(&mut result, signed, model_of(kind), payload, kind);
+                result.reviews += 1;
+                not_decisions.insert(record_id);
+                // A run from its start: entry 1, or right after the checkpoint.
+                let held_from_start = options.contiguous && from_start;
+                for (reason, detail) in
+                    stage3.review(payload, &options.na_public_keys, held_from_start)
+                {
+                    fail(&mut result, s, reason, &detail);
+                }
             }
             other => fail(&mut result, s, "unknown_entry_kind", other),
         }
     }
     result
+}
+
+/// An operator key as the holder registry records it (v1.4.0): when (in
+/// microseconds), its public key and its holder.
+type HolderRecord = (i64, Option<String>, Option<String>);
+
+/// What a remediation or review checks of its judgement or decision (v1.4.0).
+#[derive(Default)]
+struct Subject {
+    /// The subject entry's payload digest.
+    digest: String,
+    /// A judgement's resource.
+    resource_id: Option<String>,
+    /// A judgement's change: its kind, id and store position, and when it
+    /// happened (microseconds).
+    change_kind: Option<String>,
+    change_id: Option<String>,
+    change_sequence: Option<i64>,
+    changed_at: Option<i64>,
+}
+
+/// What a remediation checks of execution evidence (v1.4.0).
+struct Execution {
+    resource_id: Option<String>,
+    store_sequence: i64,
+    /// Microseconds.
+    executed_at: i64,
+    executor_sovereign_id: String,
+    decision_id: String,
+}
+
+/// What an export verifier keeps for the Stage 3 checks (v1.4.0).
+#[derive(Default)]
+struct Stage3 {
+    /// Judgements and decisions by id.
+    judged: HashMap<String, Subject>,
+    /// Execution evidence by id.
+    executed: HashMap<String, Execution>,
+    /// The version each observation or break-glass record names, by kind and id.
+    versions: HashMap<(String, String), Option<String>>,
+    /// The forward rotations remediations already cite.
+    cited: HashSet<String>,
+    /// Subjects a remediation was recorded for.
+    remediated: HashSet<String>,
+    /// Operator keys as the holder registry records them: when, public key, holder.
+    operator_keys: HashMap<String, Vec<HolderRecord>>,
+}
+
+impl Stage3 {
+    /// One remediation per subject, of its subject's change and resource,
+    /// after a forward rotation of its own made after the change and cited
+    /// once.
+    fn remediation(
+        &mut self,
+        record: &Value,
+        held_from_start: bool,
+    ) -> Vec<(&'static str, String)> {
+        let mut failures = Vec::new();
+        let text = |key: &str| str_field(record, key);
+        let subject_id = text("subject_id").unwrap_or_default();
+        let resource_id = text("resource_id");
+        if !self.remediated.insert(subject_id.to_owned()) {
+            failures.push(("duplicate_remediation", subject_id.to_owned()));
+        }
+        let (mut change_sequence, mut changed_at) = (None, None);
+        let mismatch = match self.judged.get(subject_id) {
+            None => {
+                if held_from_start {
+                    failures.push(("remediation_subject_missing", subject_id.to_owned()));
+                }
+                false
+            }
+            Some(subject) if text("subject_kind") == Some("judgement") => {
+                let change = (
+                    text("change_kind").unwrap_or_default().to_owned(),
+                    text("change_id").unwrap_or_default().to_owned(),
+                );
+                let version = self.versions.get(&change).cloned().flatten();
+                let disabled = text("disabled_version_id");
+                change_sequence = subject.change_sequence;
+                changed_at = subject.changed_at;
+                subject.resource_id.as_deref() != resource_id
+                    || (Some(change.0.as_str()), Some(change.1.as_str()))
+                        != (subject.change_kind.as_deref(), subject.change_id.as_deref())
+                    || matches!((disabled, &version), (Some(d), Some(v)) if d != v)
+            }
+            // A decision's change is its execution evidence (or, never
+            // executed, the decision itself).
+            Some(_) if text("change_id") != Some(subject_id) => {
+                let change = self.executed.get(text("change_id").unwrap_or_default());
+                let wrong = text("change_kind") != Some("execution")
+                    || change.is_some_and(|c| {
+                        c.decision_id != subject_id || c.resource_id.as_deref() != resource_id
+                    });
+                if let (false, Some(change)) = (wrong, change) {
+                    change_sequence = Some(change.store_sequence);
+                    changed_at = Some(change.executed_at);
+                }
+                wrong
+            }
+            Some(_) => false,
+        };
+        if mismatch {
+            failures.push(("remediation_subject_mismatch", subject_id.to_owned()));
+        }
+        if let Some(rotation) = text("rotation_evidence_id") {
+            match self.executed.get(rotation) {
+                Some(held) => {
+                    if held.resource_id.as_deref() != resource_id {
+                        failures.push(("remediation_rotation_mismatch", rotation.to_owned()));
+                    }
+                    if let Some((code, _)) = rotation_problem(&RotationFacts {
+                        rotation_executor: &held.executor_sovereign_id,
+                        rotation_sequence: held.store_sequence,
+                        rotation_executed_at: held.executed_at,
+                        record_executor: text("executor_sovereign_id").unwrap_or_default(),
+                        change_sequence,
+                        changed_at,
+                        already_cited: self.cited.contains(rotation),
+                    }) {
+                        failures.push((code, rotation.to_owned()));
+                    }
+                }
+                None if held_from_start => {
+                    failures.push(("remediation_rotation_missing", rotation.to_owned()));
+                }
+                None if self.cited.contains(rotation) => {
+                    failures.push(("remediation_rotation_reused", rotation.to_owned()));
+                }
+                None => {}
+            }
+            self.cited.insert(rotation.to_owned());
+        }
+        failures
+    }
+
+    /// A review's approvals verify offline, from a second holder, on the
+    /// subject it names.
+    fn review(
+        &self,
+        record: &Value,
+        na_public_keys: &[String],
+        held_from_start: bool,
+    ) -> Vec<(&'static str, String)> {
+        let mut failures = Vec::new();
+        if let Some(problem) = review_approval_problem(record, na_public_keys) {
+            failures.push(("review_approval_invalid", problem));
+        }
+        for (key, approval, holder, at) in [
+            ("decided_by", "approval", "decider_holder", "decided_at"),
+            (
+                "requested_by",
+                "request_approval",
+                "requester_holder",
+                "requested_at",
+            ),
+        ] {
+            let (Some(key_id), Some(approval)) = (
+                str_field(record, key),
+                record.get(approval).filter(|a| !a.is_null()),
+            ) else {
+                continue;
+            };
+            let Some(recorded) = self.operator_keys.get(key_id) else {
+                continue;
+            };
+            let at = micros(str_field(record, at).unwrap_or_default()).unwrap_or_default();
+            // The latest record at or before the time; the first of equals.
+            let latest = recorded.iter().filter(|(when, ..)| *when <= at).fold(
+                None,
+                |latest: Option<&HolderRecord>, r| match latest {
+                    Some(l) if l.0 >= r.0 => Some(l),
+                    _ => Some(r),
+                },
+            );
+            let matches = latest.is_some_and(|(_, public_key, recorded_holder)| {
+                public_key.as_deref() == str_field(approval, "public_key")
+                    && recorded_holder.as_deref() == str_field(record, holder)
+            });
+            if !matches {
+                failures.push(("review_approval_key_mismatch", key_id.to_owned()));
+            }
+        }
+        if review_holder_problem(&ReviewHolders::of(record)).is_some() {
+            let decider = str_field(record, "decided_by").unwrap_or_default();
+            failures.push(("review_same_holder", decider.to_owned()));
+        }
+        let subject_id = str_field(record, "subject_id").unwrap_or_default();
+        match self.judged.get(subject_id) {
+            None if held_from_start => {
+                failures.push(("review_subject_missing", subject_id.to_owned()));
+            }
+            Some(subject)
+                if Some(subject.digest.as_str()) != str_field(record, "subject_digest") =>
+            {
+                failures.push(("review_subject_mismatch", subject_id.to_owned()));
+            }
+            _ => {}
+        }
+        if str_field(record, "verdict") == Some("waive_until")
+            && self.remediated.contains(subject_id)
+        {
+            failures.push(("review_waiver_after_remediation", subject_id.to_owned()));
+        }
+        failures
+    }
 }
