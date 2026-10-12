@@ -11,8 +11,9 @@ use genesis_mesh_sdk::{
     canonical::{out_of_band_canonical, out_of_band_digest, policy_canonical, policy_digest},
     json, public_key_from_seed,
     remediation::{
-        admin_approval_valid, check_remediation, due_after_denial, due_after_waiver, next_state,
-        policy_section_issues, remediation_plan, review_approval_problem, review_holder_problem,
+        admin_approval_valid, check_remediation, decision_plan, due_after_denial, due_after_waiver,
+        emergency_map, next_state, policy_section_issues, remediation_plan,
+        review_approval_problem, review_holder_problem, review_request_problem, rfc3339,
         steps_problem, ChangeFacts, RemediationDefaults, ReviewHolders,
     },
     verify::{
@@ -44,9 +45,17 @@ fn maybe_at(value: &Value) -> Option<DateTime<Utc>> {
     value.as_str().map(at)
 }
 
-/// The reference runner's time form: UTC with `Z`.
+/// The reference runner's time form: UTC with `Z`, six digits of
+/// microseconds when they are not all zero.
 fn iso(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+    genesis_mesh_sdk::canonical::python_timestamp(value)
+}
+
+fn defaults(input: &Value) -> RemediationDefaults {
+    RemediationDefaults {
+        grace_seconds: input["grace_seconds"].as_i64().unwrap(),
+        mode: input["mode"].as_str().unwrap().into(),
+    }
 }
 
 const COUNTS: [&str; 6] = [
@@ -73,10 +82,7 @@ fn run(v: &Value) -> Value {
         }
         "remediation_plan" => {
             let input = &v["input"];
-            let defaults = RemediationDefaults {
-                grace_seconds: input["defaults"]["grace_seconds"].as_i64().unwrap(),
-                mode: input["defaults"]["mode"].as_str().unwrap().into(),
-            };
+            let defaults = defaults(&input["defaults"]);
             let facts = ChangeFacts {
                 action: input["action"].as_str().unwrap().into(),
                 version_id: input["version_id"].as_str().map(str::to_owned),
@@ -111,10 +117,54 @@ fn run(v: &Value) -> Value {
         "transition" => match next_state(
             v["input"]["state"].as_str().unwrap(),
             v["input"]["event"].as_str().unwrap(),
+            v["input"]["review_pending"].as_bool().unwrap(),
         ) {
             Ok(state) => json!({ "state": state }),
             Err(refused) => json!({ "refused": refused.code }),
         },
+        "decision_plan" => {
+            let input = &v["input"];
+            let executed = input["executed"].as_array().map(|e| ChangeFacts {
+                action: e[0].as_str().unwrap().into(),
+                version_id: e[1].as_str().map(str::to_owned),
+                rotatable: e[2].as_bool().unwrap(),
+            });
+            let plan = decision_plan(
+                input["policies"].as_array().unwrap(),
+                executed.as_ref(),
+                &defaults(&input["defaults"]),
+            );
+            json!({
+                "mode": plan.mode, "steps": plan.steps, "fallback": plan.fallback,
+                "grace_seconds": plan.grace_seconds, "source": plan.source,
+            })
+        }
+        "rfc3339" => {
+            let parsed = rfc3339(v["input"].as_str().unwrap());
+            json!({
+                "valid": parsed.is_some(),
+                "utc": parsed.map(|at| iso(at.with_timezone(&Utc))),
+            })
+        }
+        "emergency_map" => json!({
+            "map": emergency_map(
+                v["input"]["policies"].as_array().unwrap(),
+                at(v["input"]["at"].as_str().unwrap()),
+            )
+        }),
+        "review_request" => {
+            let input = &v["input"];
+            let text = |key: &str| input[key].as_str();
+            json!({
+                "code": review_request_problem(
+                    text("requested_by").unwrap(),
+                    text("requester_holder").unwrap(),
+                    text("actor"),
+                    text("actor_holder"),
+                )
+                .map(|(code, _)| code)
+            })
+        }
         "canonical_form" => json!({
             "canonical": out_of_band_canonical(&v["record"]).unwrap(),
             "digest": out_of_band_digest(&v["record"]).unwrap(),
@@ -150,6 +200,7 @@ fn run(v: &Value) -> Value {
             let events = parse_export_lines(input["lines"].as_str().unwrap()).unwrap();
             let options = VerifyEvidenceOptions {
                 contiguous: input["contiguous"].as_bool().unwrap(),
+                checkpoint: input.get("checkpoint").cloned(),
                 ..VerifyEvidenceOptions::new(
                     strings(&input["na_public_keys"]),
                     input["executor_keys"].as_array().unwrap().clone(),
@@ -193,7 +244,7 @@ fn every_vector_gives_the_reference_outcome() {
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
-    assert_eq!(vectors.len(), 195);
+    assert_eq!(vectors.len(), 340);
 }
 
 fn vector(id: &str) -> Value {
@@ -539,4 +590,72 @@ fn a_remediation_subject_is_read_from_the_due_queue() {
     let mut decision = state;
     decision["change_id"] = Value::Null;
     assert_eq!(RemediationSubject::from_state(&decision), None);
+}
+
+#[test]
+fn a_pending_review_is_a_flag_that_stops_no_clock() {
+    // Every clock event applies with a review pending.
+    assert_eq!(
+        next_state("remediation_due", "due_passed", true),
+        Ok("overdue")
+    );
+    assert_eq!(
+        next_state("overdue", "record_remediation", true),
+        Ok("remediated")
+    );
+    assert_eq!(
+        next_state("judged_allowed", "open_review", false),
+        Ok("judged_allowed")
+    );
+    let refused = |state, event, pending| next_state(state, event, pending).unwrap_err().code;
+    assert_eq!(refused("upheld", "deny", false), "review_not_pending");
+    assert_eq!(
+        refused("waived", "open_review", true),
+        "review_already_pending"
+    );
+    assert_eq!(
+        refused("remediated", "open_review", true),
+        "review_after_remediation"
+    );
+    assert_eq!(
+        refused("waived", "record_remediation", false),
+        "remediation_not_due"
+    );
+}
+
+#[test]
+fn approval_timestamps_are_strict_rfc_3339() {
+    for valid in [
+        "2026-01-01T00:00:00Z",
+        "2026-01-01T00:00:00.5+01:00",
+        "2026-01-01T23:59:59.123456-23:59",
+    ] {
+        assert!(rfc3339(valid).is_some(), "{valid}");
+    }
+    for invalid in [
+        "2026-01-01T00:00:00",
+        "2026-01-01t00:00:00Z",
+        "2026-01-01T24:00:00Z",
+        "2026-01-01T23:59:60Z",
+        "2026-01-01T00:00:00.1234567Z",
+        "2026-01-01T00:00:00+01:00:30",
+        "20260101T000000Z",
+        "2026-W01-1T00:00:00Z",
+        "0000-01-01T00:00:00Z",
+        "2026-02-30T00:00:00Z",
+    ] {
+        assert!(rfc3339(invalid).is_none(), "{invalid}");
+    }
+}
+
+#[test]
+fn a_decision_never_executed_names_itself_as_its_change() {
+    let state = json!({"subject_kind": "decision", "subject_id": "decision-1",
+                       "change_kind": null, "change_id": null, "fallback": "not_executed",
+                       "resource_id": "kv:vendor-acme/api-key"});
+    let subject = RemediationSubject::from_state(&state).unwrap();
+    assert_eq!(
+        (subject.change_kind.as_str(), subject.change_id.as_str()),
+        ("execution", "decision-1")
+    );
 }

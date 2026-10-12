@@ -383,7 +383,9 @@ operator judges the rest with `judge_observation` and `judge_break_glass`.
 `resource_changes` lists every change to a resource, with how it was governed
 (`prior_decision` or `after_the_fact`) and its state (`recorded`, `matched`,
 `judged_allowed`, `judged_denied`, `indeterminate`, `observed`,
-`quarantined`). A judgement has no `authorized` field: it is never an
+`quarantined`); since 1.4.0 it follows the NA's pages
+(`resource_changes_page` reads one: `limit`, `after_sequence`). A judgement
+has no `authorized` field: it is never an
 approval, and `verify_evidence_events` refuses execution evidence that cites
 one (`evidence_cites_judgement`). `operator_holders`, `propose_holder` and
 `approve_holder` record which holder each operator key belongs to.
@@ -425,13 +427,27 @@ stable.
 ### The due queue and notices
 
 `remediations` reads one page of the due queue (`state`, `limit` 1 to 500,
-`after` the previous page's `next_after`; without a state, the open ones),
-and `remediations_all` follows the pages. Each item is a remediation state:
-the judged change (`subject_kind`, `subject_id`, `change_kind`, `change_id`,
-`resource_id`), the plan (`mode` `cancel` or `alert_only`, `steps`,
-`fallback`, `grace_seconds`, `guidance_source`), and its times
-(`remediation_due_at`, `overdue_since`, `waived_until`, `lifetime_ends_at`).
-`remediation(subject_id)` reads one with its reviews and stored records. Tell
+`after` the previous page's `next_after`), and `remediations_all` follows the
+pages. `state` is a stored state or `review_pending`
+(`remediation::QUEUE_FILTERS`); without it, the due, overdue and waived
+changes and every change with a pending review. Each item is a remediation
+state:
+
+- **the judged change**: `subject_kind`, `subject_id`, `change_kind`,
+  `change_id`, `change_version_id` (the version it made), `resource_id`,
+  `actor` and `actor_holder`;
+- **where it stands**: `state` (`remediation_due`, `overdue`, `remediated`,
+  `upheld`, `waived`, or `judged_allowed`, `matched` or `recorded` for an
+  allowed change under review or with a lifetime running) and
+  `review_pending`, a flag beside the state: a pending review stops no clock;
+- **the plan**: `mode` (`cancel` or `alert_only`), `steps`, `fallback`
+  (`not_executed` for a decision whose change never ran), `grace_seconds`,
+  `guidance_source`;
+- **its times**: `remediation_due_at`, `overdue_since`, `waived_until`,
+  `lifetime_ends_at`.
+
+`remediation(subject_id)` reads one with its newest 100 reviews and stored
+records (`reviews_truncated`, `records_truncated`). Tell
 the actor before `remediation_due_at`, then record the notice with
 `mark_notified(subject_id, Some("email"))`. The actor is what the source
 reported, not proof of who acted.
@@ -440,9 +456,11 @@ reported, not proof of who acted.
 
 `ExecutionRecorder::sign_remediation` signs a `RemediationRecord` with the
 executor key; `RemediationSubject::from_state` takes the subject from a due
-queue item, and `RemediationSteps` says what was done: `Disable` or `Delete`
-(a resource nothing reads yet), `RotateForwardThenDisable`, or `Alerted`
-(`alert_only`: nothing changed). Before signing it refuses what the NA would
+queue item (a decision never executed names itself as its change), and
+`RemediationSteps` says what was done: `Disable` or `Delete` (a resource
+nothing reads yet), `RotateForwardThenDisable`, or `Alerted` (`alert_only`:
+nothing changed). A remediation is recorded only for a change that is
+`remediation_due` or `overdue`. Before signing it refuses what the NA would
 refuse, with its code (`OutOfBandRecord`): `remediation_malformed`, or
 `remediation_secret_material` for secret material in its versions or detail.
 Submit it with `submit_remediation`, or keep it in the record outbox with
@@ -468,6 +486,7 @@ async fn cancel(gm: &GenesisMeshClient, recorder: &ExecutionRecorder, state: &Va
     let params = RotateForwardParams {
         governed, // the rotation's evaluation, resource and verification
         subject: RemediationSubject::from_state(state).ok_or("no change named")?,
+        state: Some(state.clone()), // its plan, state and version, checked first
         disabled_version_id: "v8".into(),
         detail: None,
     };
@@ -489,13 +508,20 @@ submitted directly otherwise. A DENY of the rotation stops it with nothing
 disabled. Once the rotation ran, a disable that fails, or a record that cannot
 be signed, submitted or kept, returns `RemediationNotRecorded`
 (`remediation_not_recorded`) with the rotation's evidence and the record when
-it was signed: do not rotate again. `remediation::check_remediation` names the
+it was signed: do not rotate again. Given the remediation `state`, it refuses
+before anything runs what the NA would refuse: another plan
+(`remediation_steps_mismatch`), a change that is not due or overdue
+(`remediation_not_due`, `remediation_already_recorded`), or another denied
+version than the change made (`remediation_subject_mismatch`). The NA admits
+only a rotation by the remediation's own executor, made after the change, and
+cited by no other remediation. `remediation::check_remediation` names the
 refusal the NA would answer for a signed record and a registered key.
 
 ### Reviews
 
 `request_review(subject_kind, subject_id, justification)` asks for a review
-(the operator key's holder must be named in the store). A privileged key of
+(the operator key's holder must be named in the store, and must not be the
+change's actor: `review_requested_by_actor`). A privileged key of
 another holder decides it with `decide_review(review_id, &decision)`:
 `ReviewDecision::Uphold`, `Deny` (remediation becomes due) or `WaiveUntil`
 (the change stands until a time the NA bounds), each with an optional note.
@@ -503,7 +529,10 @@ The NA refuses a decider who holds the requester's key or holder
 (`review_same_holder_as_requester`) or the actor's
 (`review_same_holder_as_actor`). `review(review_id)` reads it, with its signed
 record once decided. Both requests are embedded in the review as signed, so
-the request body is exactly what the record proves.
+the request body is exactly what the record proves; the review routes take
+no query string, and `waive_until` and the admin timestamps are strict
+RFC 3339 (`remediation::rfc3339`: `YYYY-MM-DDTHH:MM:SS`, a fraction of 1 to
+6 digits, `Z` or `+HH:MM`).
 
 ### Urgent changes
 
@@ -533,21 +562,34 @@ A boundary policy may carry `remediation` guidance (per gate, or `"*"`),
 left out of its signed form, so a policy without them keeps its 1.3 digest.
 `remediation::policy_section_issues` names the issues the NA would find in
 them. `verify::verify_evidence_events` verifies the two new entry kinds:
-remediation records under executor keys, once per subject
-(`duplicate_remediation`), of their judgement's resource
-(`remediation_subject_mismatch`) and after their forward rotation
-(`remediation_rotation_missing`, `remediation_rotation_mismatch`); reviews
-under the NA keys, with their embedded approvals verified offline
-(`review_approval_invalid`, `remediation::review_approval_problem`) against
-the holder registry (`review_approval_key_mismatch`), decided by a second
-holder (`review_same_holder`), naming their subject's digest
-(`review_subject_mismatch`), and no waiver after a remediation
-(`review_waiver_after_remediation`); `remediation_subject_missing` and
-`review_subject_missing` in an export from entry 1. The result counts them in
-`remediations` and `reviews`. The reference's pure rules are in
-`remediation` (`remediation_plan`, `next_state`, `due_after_denial`,
-`due_after_waiver`, `steps_problem`, `review_holder_problem`), checked by the
-shared conformance suite `remediation`.
+
+- **Remediation records**, under executor keys:
+  - once per subject (`duplicate_remediation`);
+  - naming their judgement's change, resource and the version it made
+    (`remediation_subject_mismatch`);
+  - after a forward rotation of the same resource
+    (`remediation_rotation_missing`, `remediation_rotation_mismatch`), by
+    their own executor (`remediation_rotation_other_executor`), made after
+    the change (`remediation_rotation_before_change`) and cited once
+    (`remediation_rotation_reused`).
+- **Reviews**, under the NA keys:
+  - their embedded approvals verify offline (`review_approval_invalid`,
+    `remediation::review_approval_problem`);
+  - against the holder registry records the NA signed
+    (`review_approval_key_mismatch`);
+  - decided by a second holder (`review_same_holder`);
+  - naming their subject's digest (`review_subject_mismatch`);
+  - no waiver after a remediation (`review_waiver_after_remediation`).
+- **In a run from its start** (entry 1, or right after the checkpoint
+  passed): `remediation_subject_missing`, `remediation_rotation_missing` and
+  `review_subject_missing`.
+
+The result counts them in `remediations` and `reviews`. The reference's pure
+rules are in `remediation` (`remediation_plan`, `decision_plan`,
+`next_state` with the review flag, `due_after_denial`, `due_after_waiver`,
+`steps_problem`, `review_holder_problem`, `review_request_problem`,
+`rfc3339`, `emergency_map`), checked by the shared conformance suite
+`remediation`.
 
 ## Transport and errors
 

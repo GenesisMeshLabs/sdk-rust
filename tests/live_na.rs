@@ -259,6 +259,7 @@ async fn remediate_review_and_verify_offline(na: &LiveNa) {
                 },
             },
             subject: RemediationSubject::from_state(state).unwrap(),
+            state: Some(state.clone()),
             disabled_version_id: "v8".into(),
             detail: None,
         },
@@ -286,7 +287,9 @@ async fn remediate_review_and_verify_offline(na: &LiveNa) {
         .request_review("judgement", &second_id, "Planned with the vendor")
         .await
         .unwrap();
-    assert_eq!(opened["state"], "review_pending");
+    // A pending review is a flag beside the state: the remediation stays due.
+    assert_eq!(opened["state"], "remediation_due");
+    assert_eq!(opened["review_pending"], true);
     let review_id = opened["review_id"].as_str().unwrap().to_owned();
     let refused = gm
         .evidence_store
@@ -386,7 +389,8 @@ async fn remediate_review_and_verify_offline(na: &LiveNa) {
     assert!(decided.authorized);
     let decision_id = decided.summary.decision_id.clone();
     let reviewed = gm.evidence_store.remediation(&decision_id).await.unwrap();
-    assert_eq!(reviewed["state"], "review_pending");
+    assert_eq!(reviewed["state"], "recorded");
+    assert_eq!(reviewed["review_pending"], true);
     assert_eq!(reviewed["review"]["opened_for"], "review_required");
     assert!(reviewed["lifetime_ends_at"].is_string());
     let unreachable = GenesisMeshClient::new(ClientOptions {
@@ -426,7 +430,8 @@ async fn remediate_review_and_verify_offline(na: &LiveNa) {
         .as_str()
         .unwrap();
     let held = gm.evidence_store.remediation(judgement).await.unwrap();
-    assert_eq!(held["state"], "review_pending");
+    assert_eq!(held["state"], "judged_allowed");
+    assert_eq!(held["review_pending"], true);
 
     // 4. The export verifies offline, remediation and review included.
     let exported = gm.evidence_store.export_all(0, 1000).await.unwrap();
@@ -587,13 +592,18 @@ async fn record_and_judge_changes_outside_the_controlled_path(na: &LiveNa) {
         .iter()
         .map(|c| (c["kind"].as_str().unwrap(), c["state"].as_str().unwrap()))
         .collect();
-    // With remediation on (1.4.0), the denial is due for remediation and the
-    // break-glass record, flagged for review, is under review.
-    let (denied_state, glass_state) = if na.reviewer.is_some() {
-        ("remediation_due", "review_pending")
+    // With remediation on (1.4.0), the denial is due for remediation, and the
+    // break-glass record, flagged for review, stays allowed with a review
+    // pending: a flag beside its state.
+    let denied_state = if na.reviewer.is_some() {
+        "remediation_due"
     } else {
-        ("judged_denied", "judged_allowed")
+        "judged_denied"
     };
+    let glass_state = "judged_allowed";
+    if na.reviewer.is_some() {
+        assert_eq!(changes["changes"][2]["remediation"]["review_pending"], true);
+    }
     assert_eq!(
         states,
         [

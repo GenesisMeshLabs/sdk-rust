@@ -25,7 +25,8 @@ use crate::{
     },
     outbox::{OutboxEntry, RecordOutboxEntry},
     remediation::{
-        remediation_input_problem, RemediationInput, RemediationSteps, RemediationSubject,
+        next_state, remediation_input_problem, steps_problem, RemediationInput, RemediationSteps,
+        RemediationSubject,
     },
     verify::{verify_boundary_decision, VerifyDecisionOptions},
 };
@@ -1077,6 +1078,10 @@ pub struct RotateForwardParams {
     /// The judged change, from the remediation state
     /// ([`RemediationSubject::from_state`]).
     pub subject: RemediationSubject,
+    /// The remediation state from the due queue, when the caller has it: its
+    /// plan (`mode`, `steps`), its `state` and the version the change made
+    /// (`change_version_id`) are checked before anything runs.
+    pub state: Option<Value>,
     /// The denied version, disabled once the new version is current.
     pub disabled_version_id: String,
     /// A short note for the remediation record, no secret values.
@@ -1146,6 +1151,13 @@ pub struct RotateForwardResult<T> {
 /// ([`GenesisMeshError::Configuration`]), a remediation the NA would admit
 /// ([`GenesisMeshError::OutOfBandRecord`], `remediation_malformed` or
 /// `remediation_secret_material`), and a record outbox that can be read.
+/// With the remediation `state`, the NA's refusals it already tells are
+/// refused too ([`GenesisMeshError::OutOfBandRecord`]): a plan other than
+/// `cancel` by `rotate_forward_then_disable` (`remediation_steps_mismatch`),
+/// a state from which no remediation is recorded, only `remediation_due` and
+/// `overdue` are (`remediation_not_due`, `remediation_already_recorded`),
+/// and another denied version than the change made
+/// (`remediation_subject_mismatch`).
 /// Errors of the rotation are those of [`governed_action`]. Once the rotation
 /// ran, a new version equal to the denied one (nothing is disabled), a
 /// disable that fails, or a record that cannot be signed, submitted or kept
@@ -1169,9 +1181,32 @@ where
     let RotateForwardParams {
         mut governed,
         subject,
+        state,
         disabled_version_id,
         detail,
     } = params;
+    if let Some(state) = &state {
+        let planned = json!({"outcome": "cancelled", "steps": "rotate_forward_then_disable"});
+        if let (Some(mode), Some(steps)) = (state["mode"].as_str(), state["steps"].as_str()) {
+            if let Some(problem) = steps_problem(mode, steps, &planned) {
+                return Err(refused("remediation_steps_mismatch", problem));
+            }
+        }
+        if let Some(current) = state["state"].as_str() {
+            let pending = state["review_pending"] == true;
+            if let Err(refusal) = next_state(current, "record_remediation", pending) {
+                return Err(refused(refusal.code, refusal.detail));
+            }
+        }
+        if let Some(version) = state["change_version_id"].as_str() {
+            if version != disabled_version_id {
+                return Err(refused(
+                    "remediation_subject_mismatch",
+                    format!("the change made version {version}, not {disabled_version_id}"),
+                ));
+            }
+        }
+    }
     if governed.resource_id.as_deref() != Some(subject.resource_id.as_str()) {
         return Err(GenesisMeshError::Configuration(
             "the forward rotation's resource_id must be the remediated resource".into(),

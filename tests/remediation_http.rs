@@ -518,6 +518,7 @@ fn forward(v: &Value, context_id: &str) -> RotateForwardParams {
             json!({"app_id": "billing"}),
         ),
         subject: subject(v["resource_id"].as_str().unwrap()),
+        state: None,
         disabled_version_id: "v8".into(),
         detail: Some("ticket 7".into()),
     }
@@ -1127,4 +1128,104 @@ async fn an_urgent_change_checks_what_break_glass_needs_before_anything_is_evalu
     .await
     .unwrap_err();
     assert_eq!(err.code(), "break_glass_malformed");
+}
+
+#[tokio::test]
+async fn the_forward_rotation_refuses_what_the_remediation_state_already_tells() {
+    let v = vectors();
+    // Nothing listens: every refusal comes before the NA is asked.
+    let (c, _) = with_records("http://127.0.0.1:9");
+    let due = json!({"state": "remediation_due", "review_pending": true, "mode": "cancel",
+                     "steps": "rotate_forward_then_disable", "change_version_id": "v8"});
+    for (changes, code) in [
+        (json!({"state": "upheld"}), "remediation_not_due"),
+        (
+            json!({"state": "remediated"}),
+            "remediation_already_recorded",
+        ),
+        (
+            json!({"mode": "alert_only", "steps": "none"}),
+            "remediation_steps_mismatch",
+        ),
+        (json!({"steps": "disable"}), "remediation_steps_mismatch"),
+        (
+            json!({"change_version_id": "v7"}),
+            "remediation_subject_mismatch",
+        ),
+    ] {
+        let mut state = due.clone();
+        for (key, value) in changes.as_object().unwrap() {
+            state[key] = value.clone();
+        }
+        let params = RotateForwardParams {
+            state: Some(state),
+            ..forward(&v, "c")
+        };
+        let err = rotate_forward_then_disable(
+            &c.boundary,
+            &c.evidence_store,
+            &executor(),
+            params,
+            |_| async { panic!("ran") },
+            |_: String| async { panic!("disabled") },
+        )
+        .await
+        .map(|_: genesis_mesh_sdk::RotateForwardResult<()>| ())
+        .unwrap_err();
+        assert_eq!(err.code(), code);
+    }
+    // Due, with a review pending, the NA is asked.
+    let params = RotateForwardParams {
+        state: Some(due),
+        ..forward(&v, "c")
+    };
+    let err = rotate_forward_then_disable(
+        &c.boundary,
+        &c.evidence_store,
+        &executor(),
+        params,
+        |_| async { panic!("ran") },
+        |_: String| async { panic!("disabled") },
+    )
+    .await
+    .map(|_: genesis_mesh_sdk::RotateForwardResult<()>| ())
+    .unwrap_err();
+    assert_eq!(err.code(), "network");
+}
+
+#[tokio::test]
+async fn a_resource_s_changes_are_read_page_by_page() {
+    let (url, task) = scripted(vec![
+        ok(json!({"resource_id": "kv:v/s", "truncated": true,
+                  "changes": [{"store_sequence": 3}], "next_after_sequence": 3})),
+        ok(json!({"resource_id": "kv:v/s", "truncated": false,
+                  "changes": [{"store_sequence": 9}], "next_after_sequence": null})),
+        // An NA before 1.4.0: one response.
+        ok(json!({"resource_id": "kv:v/s", "truncated": true, "changes": [{"store_sequence": 1}]})),
+        ok(json!({"changes": [], "next_after_sequence": null})),
+    ])
+    .await;
+    let store = client(&url).evidence_store;
+    let all = store.resource_changes("kv:v/s").await.unwrap();
+    assert_eq!(
+        all["changes"],
+        json!([{"store_sequence": 3}, {"store_sequence": 9}])
+    );
+    assert_eq!(all["truncated"], false);
+    let older = store.resource_changes("kv:v/s").await.unwrap();
+    assert_eq!(older["truncated"], true);
+    store
+        .resource_changes_page("kv:v/s", Some(10), Some(50))
+        .await
+        .unwrap();
+    let r = task.await.unwrap();
+    assert_eq!(r[0].target, "/admin/evidence/changes/kv%3Av/s");
+    assert_eq!(
+        r[1].target,
+        "/admin/evidence/changes/kv%3Av/s?after_sequence=3"
+    );
+    assert_eq!(
+        r[3].target,
+        "/admin/evidence/changes/kv%3Av/s?limit=50&after_sequence=10"
+    );
 }

@@ -30,7 +30,10 @@ use crate::{
     },
     errors::{GenesisMeshError, Result},
     evidence_store::ResourceHead,
-    remediation::{review_approval_problem, review_holder_problem, ReviewHolders},
+    remediation::{
+        review_approval_problem, review_holder_problem, rotation_problem, ReviewHolders,
+        RotationFacts,
+    },
 };
 
 // ── Structural checks (no coercion or mutation of signed JSON) ───────────────
@@ -1586,21 +1589,25 @@ fn fail(result: &mut EvidenceVerification, seq: Option<i64>, reason: &str, detai
 /// v1.4.0, remediations and reviews, as the reference verifies them:
 ///
 /// * one remediation per judgement or decision (`duplicate_remediation`); it
-///   names its judgement's resource (`remediation_subject_mismatch`); in a
-///   run from entry 1 its subject and its forward rotation's execution
-///   evidence are held before it (`remediation_subject_missing`,
-///   `remediation_rotation_missing`), and the rotation is of the same
-///   resource (`remediation_rotation_mismatch`); a remediation record is
+///   names its judgement's change, resource and the version that change made
+///   (`remediation_subject_mismatch`); in a run from its start (entry 1, or
+///   right after the checkpoint) its subject and its forward rotation's
+///   execution evidence are held before it (`remediation_subject_missing`,
+///   `remediation_rotation_missing`); the rotation is of the same resource
+///   (`remediation_rotation_mismatch`), by the remediation's own executor
+///   sovereign (`remediation_rotation_other_executor`), made after the change
+///   (`remediation_rotation_before_change`) and cited by no earlier
+///   remediation (`remediation_rotation_reused`); a remediation record is
 ///   signed by an executor key of its sovereign;
 /// * a review's embedded admin requests verify offline
 ///   (`review_approval_invalid`, see
 ///   [`review_approval_problem`]),
 ///   with the public key and holder the holder registry records for each
-///   operator key at the time, when the run holds a record for that key
-///   (`review_approval_key_mismatch`); its decider is a second holder
-///   (`review_same_holder`); it names its subject's payload digest
-///   (`review_subject_mismatch`; `review_subject_missing` in a run from
-///   entry 1); and no waiver follows a remediation of the same subject
+///   operator key at the time, when the run holds a record the NA signed for
+///   that key (`review_approval_key_mismatch`); its decider is a second
+///   holder (`review_same_holder`); it names its subject's payload digest
+///   (`review_subject_mismatch`; `review_subject_missing` in a run from its
+///   start); and no waiver follows a remediation of the same subject
 ///   (`review_waiver_after_remediation`);
 /// * remediation and review ids are not decisions (`evidence_cites_judgement`).
 pub fn verify_evidence_events<'a>(
@@ -1821,12 +1828,12 @@ pub fn verify_evidence_events<'a>(
                     .to_owned();
                 stage3.judged.insert(
                     id.clone(),
-                    (
-                        str_field(entry, "payload_digest")
+                    Subject {
+                        digest: str_field(entry, "payload_digest")
                             .unwrap_or_default()
                             .to_owned(),
-                        None,
-                    ),
+                        ..Subject::default()
+                    },
                 );
                 decisions.insert(id.clone(), decision.clone());
                 if valid_context(payload.get("context")) {
@@ -1901,7 +1908,16 @@ pub fn verify_evidence_events<'a>(
                 matchable.insert(str_field(ev, "evidence_id").unwrap_or_default().to_owned());
                 stage3.executed.insert(
                     str_field(ev, "evidence_id").unwrap_or_default().to_owned(),
-                    str_field(ev, "resource_id").map(str::to_owned),
+                    Execution {
+                        resource_id: str_field(ev, "resource_id").map(str::to_owned),
+                        store_sequence: seq,
+                        executed_at: micros(str_field(ev, "executed_at").unwrap_or_default())
+                            .unwrap_or_default(),
+                        executor_sovereign_id: str_field(ev, "executor_sovereign_id")
+                            .unwrap_or_default()
+                            .to_owned(),
+                        decision_id: str_field(ev, "decision_id").unwrap_or_default().to_owned(),
+                    },
                 );
                 if let Some(resource_id) = str_field(ev, "resource_id") {
                     let head = resource_heads.get(resource_id);
@@ -1972,6 +1988,19 @@ pub fn verify_evidence_events<'a>(
                     (kind.to_owned(), record_id.clone()),
                     (digest.to_owned(), seq),
                 );
+                // v1.4.0: the version the change made, for its remediation.
+                let version = if observation {
+                    &payload["version_id"]
+                } else {
+                    &payload["execution_parameters"]["version_id"]
+                };
+                stage3.versions.insert(
+                    (kind.to_owned(), record_id.clone()),
+                    version
+                        .as_str()
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned),
+                );
                 not_decisions.insert(record_id.clone());
                 if observation {
                     result.observations += 1;
@@ -1993,12 +2022,17 @@ pub fn verify_evidence_events<'a>(
                 result.judgements += 1;
                 stage3.judged.insert(
                     record_id.clone(),
-                    (
-                        str_field(entry, "payload_digest")
+                    Subject {
+                        digest: str_field(entry, "payload_digest")
                             .unwrap_or_default()
                             .to_owned(),
-                        str_field(payload, "resource_id").map(str::to_owned),
-                    ),
+                        resource_id: str_field(payload, "resource_id").map(str::to_owned),
+                        change_kind: str_field(payload, "subject_kind").map(str::to_owned),
+                        change_id: str_field(payload, "subject_id").map(str::to_owned),
+                        change_sequence: payload["subject_store_sequence"].as_i64(),
+                        changed_at: str_field(payload, "evaluated_as_of")
+                            .and_then(|at| micros(at).ok()),
+                    },
                 );
                 not_decisions.insert(record_id);
                 let subject_id = str_field(payload, "subject_id").unwrap_or_default();
@@ -2056,10 +2090,14 @@ pub fn verify_evidence_events<'a>(
             "registry" => {
                 let signed = out_of_band_signed(kind, payload, options, &executor_keys);
                 signature(&mut result, signed, model_of(kind), payload, kind);
-                // v1.4.0: the operator keys' public keys and holders over time.
-                if let (Some("operator_key_holder"), Some(key_id)) =
-                    (str_field(payload, "event"), str_field(payload, "key_id"))
-                {
+                // v1.4.0: the operator keys' public keys and holders over time,
+                // from registry records the NA signed only.
+                let authentic = signed && non_canonical_fields(model_of(kind), payload).is_empty();
+                if let (true, Some("operator_key_holder"), Some(key_id)) = (
+                    authentic,
+                    str_field(payload, "event"),
+                    str_field(payload, "key_id"),
+                ) {
                     stage3
                         .operator_keys
                         .entry(key_id.to_owned())
@@ -2077,7 +2115,8 @@ pub fn verify_evidence_events<'a>(
                 signature(&mut result, signed, model_of(kind), payload, kind);
                 result.remediations += 1;
                 not_decisions.insert(record_id);
-                let held_from_start = options.contiguous && first_sequence == Some(1);
+                // A run from its start: entry 1, or right after the checkpoint.
+                let held_from_start = options.contiguous && from_start;
                 for (reason, detail) in stage3.remediation(payload, held_from_start) {
                     fail(&mut result, s, reason, &detail);
                 }
@@ -2087,7 +2126,8 @@ pub fn verify_evidence_events<'a>(
                 signature(&mut result, signed, model_of(kind), payload, kind);
                 result.reviews += 1;
                 not_decisions.insert(record_id);
-                let held_from_start = options.contiguous && first_sequence == Some(1);
+                // A run from its start: entry 1, or right after the checkpoint.
+                let held_from_start = options.contiguous && from_start;
                 for (reason, detail) in
                     stage3.review(payload, &options.na_public_keys, held_from_start)
                 {
@@ -2104,13 +2144,42 @@ pub fn verify_evidence_events<'a>(
 /// microseconds), its public key and its holder.
 type HolderRecord = (i64, Option<String>, Option<String>);
 
+/// What a remediation or review checks of its judgement or decision (v1.4.0).
+#[derive(Default)]
+struct Subject {
+    /// The subject entry's payload digest.
+    digest: String,
+    /// A judgement's resource.
+    resource_id: Option<String>,
+    /// A judgement's change: its kind, id and store position, and when it
+    /// happened (microseconds).
+    change_kind: Option<String>,
+    change_id: Option<String>,
+    change_sequence: Option<i64>,
+    changed_at: Option<i64>,
+}
+
+/// What a remediation checks of execution evidence (v1.4.0).
+struct Execution {
+    resource_id: Option<String>,
+    store_sequence: i64,
+    /// Microseconds.
+    executed_at: i64,
+    executor_sovereign_id: String,
+    decision_id: String,
+}
+
 /// What an export verifier keeps for the Stage 3 checks (v1.4.0).
 #[derive(Default)]
 struct Stage3 {
-    /// Judgements and decisions by id: payload digest, and a judgement's resource.
-    judged: HashMap<String, (String, Option<String>)>,
-    /// Execution evidence by id: its resource.
-    executed: HashMap<String, Option<String>>,
+    /// Judgements and decisions by id.
+    judged: HashMap<String, Subject>,
+    /// Execution evidence by id.
+    executed: HashMap<String, Execution>,
+    /// The version each observation or break-glass record names, by kind and id.
+    versions: HashMap<(String, String), Option<String>>,
+    /// The forward rotations remediations already cite.
+    cited: HashSet<String>,
     /// Subjects a remediation was recorded for.
     remediated: HashSet<String>,
     /// Operator keys as the holder registry records them: when, public key, holder.
@@ -2118,41 +2187,89 @@ struct Stage3 {
 }
 
 impl Stage3 {
-    /// One remediation per subject, of its subject's resource, after its
-    /// forward rotation.
+    /// One remediation per subject, of its subject's change and resource,
+    /// after a forward rotation of its own made after the change and cited
+    /// once.
     fn remediation(
         &mut self,
         record: &Value,
         held_from_start: bool,
     ) -> Vec<(&'static str, String)> {
         let mut failures = Vec::new();
-        let subject_id = str_field(record, "subject_id").unwrap_or_default();
-        let resource_id = str_field(record, "resource_id");
+        let text = |key: &str| str_field(record, key);
+        let subject_id = text("subject_id").unwrap_or_default();
+        let resource_id = text("resource_id");
         if !self.remediated.insert(subject_id.to_owned()) {
             failures.push(("duplicate_remediation", subject_id.to_owned()));
         }
-        match self.judged.get(subject_id) {
-            None if held_from_start => {
-                failures.push(("remediation_subject_missing", subject_id.to_owned()));
+        let (mut change_sequence, mut changed_at) = (None, None);
+        let mismatch = match self.judged.get(subject_id) {
+            None => {
+                if held_from_start {
+                    failures.push(("remediation_subject_missing", subject_id.to_owned()));
+                }
+                false
             }
-            Some((_, judged_resource))
-                if str_field(record, "subject_kind") == Some("judgement")
-                    && judged_resource.as_deref() != resource_id =>
-            {
-                failures.push(("remediation_subject_mismatch", subject_id.to_owned()));
+            Some(subject) if text("subject_kind") == Some("judgement") => {
+                let change = (
+                    text("change_kind").unwrap_or_default().to_owned(),
+                    text("change_id").unwrap_or_default().to_owned(),
+                );
+                let version = self.versions.get(&change).cloned().flatten();
+                let disabled = text("disabled_version_id");
+                change_sequence = subject.change_sequence;
+                changed_at = subject.changed_at;
+                subject.resource_id.as_deref() != resource_id
+                    || (Some(change.0.as_str()), Some(change.1.as_str()))
+                        != (subject.change_kind.as_deref(), subject.change_id.as_deref())
+                    || matches!((disabled, &version), (Some(d), Some(v)) if d != v)
             }
-            _ => {}
+            // A decision's change is its execution evidence (or, never
+            // executed, the decision itself).
+            Some(_) if text("change_id") != Some(subject_id) => {
+                let change = self.executed.get(text("change_id").unwrap_or_default());
+                let wrong = text("change_kind") != Some("execution")
+                    || change.is_some_and(|c| {
+                        c.decision_id != subject_id || c.resource_id.as_deref() != resource_id
+                    });
+                if let (false, Some(change)) = (wrong, change) {
+                    change_sequence = Some(change.store_sequence);
+                    changed_at = Some(change.executed_at);
+                }
+                wrong
+            }
+            Some(_) => false,
+        };
+        if mismatch {
+            failures.push(("remediation_subject_mismatch", subject_id.to_owned()));
         }
-        if let Some(rotation) = str_field(record, "rotation_evidence_id") {
+        if let Some(rotation) = text("rotation_evidence_id") {
             match self.executed.get(rotation) {
-                Some(rotated) if rotated.as_deref() != resource_id => {
-                    failures.push(("remediation_rotation_mismatch", rotation.to_owned()));
+                Some(held) => {
+                    if held.resource_id.as_deref() != resource_id {
+                        failures.push(("remediation_rotation_mismatch", rotation.to_owned()));
+                    }
+                    if let Some((code, _)) = rotation_problem(&RotationFacts {
+                        rotation_executor: &held.executor_sovereign_id,
+                        rotation_sequence: held.store_sequence,
+                        rotation_executed_at: held.executed_at,
+                        record_executor: text("executor_sovereign_id").unwrap_or_default(),
+                        change_sequence,
+                        changed_at,
+                        already_cited: self.cited.contains(rotation),
+                    }) {
+                        failures.push((code, rotation.to_owned()));
+                    }
                 }
                 None if held_from_start => {
                     failures.push(("remediation_rotation_missing", rotation.to_owned()));
                 }
-                _ => {}
+                None if self.cited.contains(rotation) => {
+                    failures.push(("remediation_rotation_reused", rotation.to_owned()));
+                }
+                None => {}
             }
+            self.cited.insert(rotation.to_owned());
         }
         failures
     }
@@ -2213,7 +2330,9 @@ impl Stage3 {
             None if held_from_start => {
                 failures.push(("review_subject_missing", subject_id.to_owned()));
             }
-            Some((digest, _)) if Some(digest.as_str()) != str_field(record, "subject_digest") => {
+            Some(subject)
+                if Some(subject.digest.as_str()) != str_field(record, "subject_digest") =>
+            {
                 failures.push(("review_subject_mismatch", subject_id.to_owned()));
             }
             _ => {}

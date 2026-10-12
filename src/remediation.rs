@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use chrono::{DateTime, Duration, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveTime, TimeZone, Utc};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{canonical_json, verify_canonical},
-    canonical::{out_of_band_canonical, python_timestamp},
+    canonical::{out_of_band_canonical, parse_timestamp, python_timestamp},
     errors::Result,
     out_of_band::{length_problem, record_metadata_problem, refused, signed, time_problem},
     strict::{non_canonical_fields, unknown_fields},
@@ -41,49 +41,81 @@ use crate::{
 
 // ── The state table ──────────────────────────────────────────────────────────
 
-/// The states in which something is still to happen: the due queue's default.
-pub const OPEN_STATES: [&str; 4] = ["remediation_due", "overdue", "review_pending", "waived"];
+/// An allowed change a remediation state concerns: under review, or with an
+/// emergency change's lifetime running. It keeps its Stage 2 state.
+pub const STANDING_STATES: [&str; 3] = ["judged_allowed", "matched", "recorded"];
 
-/// The Stage 3 states a remediation state can hold (the due queue's `state`).
-pub const STAGE3_STATES: [&str; 7] = [
+/// The states a remediation state holds. A pending review is not a state
+/// but a flag beside it (`review_pending`): it stops no clock.
+pub const STORED_STATES: [&str; 8] = [
+    "judged_allowed",
+    "matched",
+    "recorded",
     "remediation_due",
     "overdue",
     "remediated",
-    "review_pending",
     "upheld",
     "waived",
-    "review_denied",
 ];
 
-const TRANSITIONS: [(&str, &str, &str); 25] = [
-    ("judged_denied", "arm", "remediation_due"),
-    ("indeterminate", "arm", "remediation_due"),
-    ("review_denied", "arm", "remediation_due"),
-    ("judged_denied", "open_review", "review_pending"),
-    ("indeterminate", "open_review", "review_pending"),
-    ("judged_allowed", "open_review", "review_pending"),
-    ("matched", "open_review", "review_pending"),
-    ("recorded", "open_review", "review_pending"),
-    ("remediation_due", "open_review", "review_pending"),
-    ("overdue", "open_review", "review_pending"),
-    ("upheld", "open_review", "review_pending"),
-    ("waived", "open_review", "review_pending"),
-    ("remediation_due", "due_passed", "overdue"),
-    ("remediation_due", "record_remediation", "remediated"),
-    ("overdue", "record_remediation", "remediated"),
-    ("review_pending", "record_remediation", "remediated"),
-    ("waived", "record_remediation", "remediated"),
-    ("review_denied", "record_remediation", "remediated"),
-    ("review_pending", "uphold", "upheld"),
-    ("review_pending", "deny", "review_denied"),
-    ("review_pending", "waive", "waived"),
-    // A review pending when the remediation was recorded is still decided; it
-    // changes nothing.
-    ("remediated", "uphold", "remediated"),
-    ("remediated", "deny", "remediated"),
-    ("waived", "waiver_expired", "remediation_due"),
-    ("upheld", "lifetime_ended", "remediation_due"),
+/// The due queue's `state` filter: a stored state, or `review_pending` (every
+/// change with a pending review, whatever its state).
+pub const QUEUE_FILTERS: [&str; 9] = [
+    "judged_allowed",
+    "matched",
+    "recorded",
+    "remediation_due",
+    "overdue",
+    "remediated",
+    "upheld",
+    "waived",
+    "review_pending",
 ];
+
+/// The states in which something is still to happen. The due queue's
+/// default is these, and every change with a pending review.
+pub const OPEN_STATES: [&str; 3] = ["remediation_due", "overdue", "waived"];
+
+/// The states a review can be opened, upheld or waived in.
+const REVIEWABLE: [&str; 7] = [
+    "judged_allowed",
+    "matched",
+    "recorded",
+    "remediation_due",
+    "overdue",
+    "upheld",
+    "waived",
+];
+
+/// The table's target for `event` in `state`, when it allows it.
+fn transition(state: &str, event: &str) -> Option<&'static str> {
+    let named = |states: &[&'static str]| states.iter().copied().find(|s| *s == state);
+    let standing_or_upheld = named(&STANDING_STATES).or_else(|| named(&["upheld"]));
+    match event {
+        "arm" => {
+            named(&["judged_denied", "indeterminate", "review_denied"]).map(|_| "remediation_due")
+        }
+        "due_passed" => named(&["remediation_due"]).map(|_| "overdue"),
+        "record_remediation" => named(&["remediation_due", "overdue"]).map(|_| "remediated"),
+        "waiver_expired" => named(&["waived"]).map(|_| "remediation_due"),
+        "lifetime_ended" => standing_or_upheld.map(|_| "remediation_due"),
+        // The flag is set; the state stays.
+        "open_review" => named(&REVIEWABLE),
+        "uphold" => named(&REVIEWABLE)
+            .map(|_| "upheld")
+            .or_else(|| named(&["remediated"])),
+        "waive" => named(&REVIEWABLE).map(|_| "waived"),
+        // A denial of a change already due changes nothing but, perhaps, its
+        // due time; a review pending when the remediation was recorded is
+        // still decided, and changes nothing.
+        "deny" => named(&["remediation_due", "overdue", "remediated"]).or_else(|| {
+            standing_or_upheld
+                .or_else(|| named(&["waived"]))
+                .map(|_| "review_denied")
+        }),
+        _ => None,
+    }
+}
 
 /// A transition the state table does not allow, named by a stable code:
 /// `review_waiver_after_remediation`, `review_after_remediation`,
@@ -100,20 +132,37 @@ pub struct TransitionRefused {
 
 /// The state after `event` (`arm`, `open_review`, `due_passed`,
 /// `record_remediation`, `uphold`, `deny`, `waive`, `waiver_expired`,
-/// `lifetime_ended`) in `state`, as the NA moves a change; refused with a
-/// stable code when the table does not allow it.
+/// `lifetime_ended`) in `state`, given whether a review is pending, as the NA
+/// moves a change; refused with a stable code when the table does not allow
+/// it. A review is decided only while one is pending (`review_not_pending`),
+/// and only one is pending at a time (`review_already_pending`); every other
+/// event applies whether a review is pending or not. A remediation is
+/// recorded only from `remediation_due` or `overdue`.
 pub fn next_state(
     state: &str,
     event: &str,
+    review_pending: bool,
 ) -> std::result::Result<&'static str, TransitionRefused> {
-    TRANSITIONS
-        .iter()
-        .find(|(from, on, _)| *from == state && *on == event)
-        .map(|(_, _, to)| *to)
-        .ok_or_else(|| TransitionRefused {
-            code: refusal(state, event),
-            detail: format!("{event} is not allowed in state {state}"),
-        })
+    let refused = |code: &'static str, detail: String| Err(TransitionRefused { code, detail });
+    if matches!(event, "uphold" | "deny" | "waive") && !review_pending {
+        return refused(
+            "review_not_pending",
+            format!("{event}: no review of this change is pending"),
+        );
+    }
+    if event == "open_review" && review_pending && state != "remediated" {
+        return refused(
+            "review_already_pending",
+            "a review of this change is already pending".into(),
+        );
+    }
+    match transition(state, event) {
+        Some(target) => Ok(target),
+        None => refused(
+            refusal(state, event),
+            format!("{event} is not allowed in state {state}"),
+        ),
+    }
 }
 
 fn refusal(state: &str, event: &str) -> &'static str {
@@ -121,8 +170,6 @@ fn refusal(state: &str, event: &str) -> &'static str {
         ("remediated", "waive") => "review_waiver_after_remediation",
         ("remediated", "open_review") => "review_after_remediation",
         ("remediated", "record_remediation") => "remediation_already_recorded",
-        (_, "uphold" | "deny" | "waive") => "review_not_pending",
-        ("review_pending", "open_review") => "review_already_pending",
         (_, "record_remediation") => "remediation_not_due",
         _ => "illegal_transition",
     }
@@ -172,7 +219,8 @@ pub struct RemediationPlan {
     /// `rotate_forward_then_disable`, `disable` or `none`.
     pub steps: String,
     /// Why a cancel fell back to `alert_only`: `not_versioned`,
-    /// `not_rotatable`, `not_reversible` or `indeterminate`.
+    /// `not_rotatable`, `not_reversible`, `indeterminate` or (a decision
+    /// never executed) `not_executed`.
     pub fallback: Option<String>,
     /// The grace before the remediation is due.
     pub grace_seconds: i64,
@@ -361,6 +409,34 @@ pub fn remediation_plan(
     )
 }
 
+/// The fallback of a decision whose change was never executed: an alert. Its
+/// remediation record names the decision itself as its change (`change_kind`
+/// `execution`, `change_id` the decision's id).
+pub const NOT_EXECUTED: &str = "not_executed";
+
+/// A decision's plan: from its latest execution evidence's facts
+/// ([`change_facts`]), as for a denied change; never executed (`None`), an
+/// alert (`fallback` `not_executed`) with the guidance's grace.
+pub fn decision_plan(
+    policies: &[Value],
+    executed: Option<&ChangeFacts>,
+    defaults: &RemediationDefaults,
+) -> RemediationPlan {
+    match executed {
+        Some(facts) => remediation_plan("deny", policies, &[], facts, defaults),
+        None => {
+            let (_, grace_seconds, source) = guidance(policies, &[], defaults);
+            RemediationPlan {
+                mode: "alert_only".into(),
+                steps: "none".into(),
+                fallback: Some(NOT_EXECUTED.into()),
+                grace_seconds,
+                source: source.into(),
+            }
+        }
+    }
+}
+
 /// When a remediation a review denied is due: the grace from the decision,
 /// never later than it was already due (a review holds a remediation, it
 /// does not extend it).
@@ -411,7 +487,7 @@ pub fn steps_problem(plan_mode: &str, plan_steps: &str, record: &Value) -> Optio
 /// registered yet), `remediation_subject_not_found` and
 /// `remediation_rotation_missing` (the subject or the forward rotation's
 /// evidence is not stored yet), and `remediation_disabled`.
-pub const REMEDIATION_PERMANENT_REFUSALS: [&str; 12] = [
+pub const REMEDIATION_PERMANENT_REFUSALS: [&str; 15] = [
     "invalid_remediation",
     "remediation_malformed",
     "remediation_invalid_signature",
@@ -421,10 +497,60 @@ pub const REMEDIATION_PERMANENT_REFUSALS: [&str; 12] = [
     "remediation_subject_mismatch",
     "remediation_steps_mismatch",
     "remediation_rotation_mismatch",
+    "remediation_rotation_before_change",
+    "remediation_rotation_other_executor",
+    "remediation_rotation_reused",
     "remediation_not_due",
     "remediation_already_recorded",
     "remediation_conflict",
 ];
+
+/// Why a forward rotation cannot be the one that replaces a change, as
+/// `(code, detail)`: it is execution evidence of the remediation's own
+/// executor sovereign (`remediation_rotation_other_executor`), stored after
+/// the record of the change and made no earlier than the change, when they
+/// are known (`remediation_rotation_before_change`: an older rotation would
+/// roll the resource back), and cited by no other remediation
+/// (`remediation_rotation_reused`). Times in microseconds.
+pub(crate) struct RotationFacts<'a> {
+    pub rotation_executor: &'a str,
+    pub rotation_sequence: i64,
+    pub rotation_executed_at: i64,
+    pub record_executor: &'a str,
+    pub change_sequence: Option<i64>,
+    pub changed_at: Option<i64>,
+    pub already_cited: bool,
+}
+
+pub(crate) fn rotation_problem(facts: &RotationFacts<'_>) -> Option<(&'static str, String)> {
+    if facts.rotation_executor != facts.record_executor {
+        return Some((
+            "remediation_rotation_other_executor",
+            format!(
+                "the rotation was executed by {}, not by {}",
+                facts.rotation_executor, facts.record_executor
+            ),
+        ));
+    }
+    let before_record = facts
+        .change_sequence
+        .is_some_and(|change| facts.rotation_sequence <= change);
+    let before_change = facts
+        .changed_at
+        .is_some_and(|changed| facts.rotation_executed_at < changed);
+    if before_record || before_change {
+        return Some((
+            "remediation_rotation_before_change",
+            "the rotation was made before the change it replaces".into(),
+        ));
+    }
+    facts.already_cited.then(|| {
+        (
+            "remediation_rotation_reused",
+            "another remediation already cites this rotation".into(),
+        )
+    })
+}
 
 /// The judged change a remediation is about, as the NA's remediation state
 /// names it.
@@ -445,15 +571,23 @@ pub struct RemediationSubject {
 impl RemediationSubject {
     /// The subject of a remediation state from the due queue
     /// ([`EvidenceStoreClient::remediations`](crate::EvidenceStoreClient::remediations)),
-    /// or `None` when it does not name all five (a decision before its
-    /// execution evidence is known).
+    /// or `None` when it does not name all five. A decision never executed
+    /// (`fallback` `not_executed`) names itself as its change (`execution`,
+    /// its own id).
     pub fn from_state(state: &Value) -> Option<Self> {
         let text = |key: &str| state[key].as_str().map(str::to_owned);
+        let subject_id = text("subject_id")?;
+        let not_executed = state["subject_kind"] == "decision" && state["fallback"] == NOT_EXECUTED;
+        let (change_kind, change_id) = if not_executed {
+            ("execution".to_owned(), subject_id.clone())
+        } else {
+            (text("change_kind")?, text("change_id")?)
+        };
         Some(Self {
             subject_kind: text("subject_kind")?,
-            subject_id: text("subject_id")?,
-            change_kind: text("change_kind")?,
-            change_id: text("change_id")?,
+            subject_id,
+            change_kind,
+            change_id,
             resource_id: text("resource_id")?,
         })
     }
@@ -674,9 +808,11 @@ pub(crate) fn sign_remediation(
 }
 
 /// Whether the NA would admit a signed remediation record's signature and
-/// key, or the refusal it would answer (`code`, detail), as the reference's
-/// `check_remediation` decides it (the 1.3.1 guards): a record in its exact
-/// form (`remediation_malformed`), signed (`remediation_invalid_signature`)
+/// key, or the refusal it would answer (`code`, detail), in the reference's
+/// order (`remediation_record_problem`): first its form
+/// (`remediation_malformed`: not an object, not a `RemediationRecord`, or not
+/// in its exact serialized form, a `null` field included), then the 1.3.1
+/// guards: signed (`remediation_invalid_signature`)
 /// by a registered key of its `executor_sovereign_id`
 /// (`remediation_unknown_key`) whose signature verifies, that is not retired
 /// (`remediation_key_retired`), is an executor key and covers the resource
@@ -688,7 +824,18 @@ pub(crate) fn sign_remediation(
 /// subject, the plan and the state besides.
 pub fn check_remediation(record: &Value, key: Option<&Value>) -> Option<(&'static str, String)> {
     let model = "RemediationRecord";
-    if !valid_remediation_record(record)
+    // The exact serialized form: no `null` field, and a signature of exactly
+    // its two fields when there is one.
+    let exact = record.as_object().is_some_and(|fields| {
+        fields.values().all(|v| !v.is_null())
+            && fields.get("signature").is_none_or(|sig| {
+                sig.as_object().is_some_and(|sig| {
+                    sig.len() == 2 && sig["key_id"].is_string() && sig["sig"].is_string()
+                })
+            })
+    });
+    if !exact
+        || !valid_remediation_record(record)
         || !unknown_fields(model, record).is_empty()
         || !non_canonical_fields(model, record).is_empty()
     {
@@ -828,16 +975,100 @@ pub fn review_holder_problem(holders: &ReviewHolders<'_>) -> Option<(&'static st
     None
 }
 
-/// An instant as the reference reads one: ISO 8601, `Z` or an offset, or
-/// none (UTC).
-fn instant(value: &Value) -> Option<DateTime<Utc>> {
-    let text = value.as_str()?;
-    match DateTime::parse_from_rfc3339(text) {
-        Ok(at) => Some(at.with_timezone(&Utc)),
-        Err(_) => NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f")
-            .ok()
-            .map(|naive| naive.and_utc()),
+/// `(code, detail)` when the requester of a review is the change's actor
+/// (its key, or its holder), or `None`: the person who made a change does not
+/// ask for its review (`review_requested_by_actor`).
+pub fn review_request_problem(
+    requested_by: &str,
+    requester_holder: &str,
+    actor: Option<&str>,
+    actor_holder: Option<&str>,
+) -> Option<(&'static str, String)> {
+    let actor = actor?;
+    (Some(requester_holder) == actor_holder || actor == requested_by || actor == requester_holder)
+        .then(|| {
+            (
+                "review_requested_by_actor",
+                format!(
+                    "holder {requester_holder:?} is the change's actor ({actor:?}); another holder \
+                     requests its review"
+                ),
+            )
+        })
+}
+
+/// `value` as an instant when it is an RFC 3339 timestamp in the one grammar
+/// of a review's `waive_until` and the admin timestamps it embeds:
+/// `YYYY-MM-DDTHH:MM:SS` with an upper-case `T`, an optional fraction of 1 to
+/// 6 digits, then `Z` or `+HH:MM` / `-HH:MM`. Not ISO 8601's basic format,
+/// week or ordinal dates, `24:00`, a leap second, an offset with seconds, or
+/// a time without an offset.
+pub fn rfc3339(value: &str) -> Option<DateTime<FixedOffset>> {
+    let b = value.as_bytes();
+    let number = |from: usize, len: usize| -> Option<u32> {
+        let part = b.get(from..from + len)?;
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| std::str::from_utf8(part).ok()?.parse().ok())?
+    };
+    let separators = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')];
+    if separators.iter().any(|(at, c)| b.get(*at) != Some(c)) {
+        return None;
     }
+    let (year, month, day) = (number(0, 4)?, number(5, 2)?, number(8, 2)?);
+    let (hour, minute, second) = (number(11, 2)?, number(14, 2)?, number(17, 2)?);
+    let mut at = 19;
+    let mut micros = 0;
+    if b.get(at) == Some(&b'.') {
+        let digits = b[at + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if !(1..=6).contains(&digits) {
+            return None;
+        }
+        micros = number(at + 1, digits)? * 10_u32.pow(6 - digits as u32);
+        at += 1 + digits;
+    }
+    let offset = match &b[at..] {
+        b"Z" => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let (hours, minutes) = (number(at + 1, 2)?, number(at + 4, 2)?);
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let seconds = (hours * 3600 + minutes * 60) as i32;
+            if *sign == b'+' {
+                seconds
+            } else {
+                -seconds
+            }
+        }
+        _ => return None,
+    };
+    if year < 1 {
+        return None;
+    }
+    let date = NaiveDate::from_ymd_opt(year as i32, month, day)?;
+    let time = NaiveTime::from_hms_micro_opt(hour, minute, second, micros)?;
+    if second > 59 {
+        return None;
+    }
+    FixedOffset::east_opt(offset)?
+        .from_local_datetime(&date.and_time(time))
+        .single()
+}
+
+/// An embedded admin timestamp or `waive_until`, in UTC, when it is RFC 3339
+/// ([`rfc3339`]).
+fn instant(value: &Value) -> Option<DateTime<Utc>> {
+    rfc3339(value.as_str()?).map(|at| at.with_timezone(&Utc))
+}
+
+/// A time the review records (`decided_at`, `requested_at`, `waive_until`),
+/// in UTC.
+fn recorded_at(value: &Value) -> Option<DateTime<Utc>> {
+    parse_timestamp(value.as_str()?).ok()
 }
 
 /// Whether an embedded admin request (`AdminApproval`: `key_id`,
@@ -958,7 +1189,7 @@ pub fn review_approval_problem(review: &Value, audiences: &[String]) -> Option<S
         review["decided_by"].as_str().unwrap_or_default(),
         &review_decision_path(review_id),
         audiences,
-        instant(&review["decided_at"]),
+        recorded_at(&review["decided_at"]),
     ) {
         return Some(problem);
     }
@@ -973,9 +1204,11 @@ pub fn review_approval_problem(review: &Value, audiences: &[String]) -> Option<S
     let recorded = field(review, "waive_until");
     let signed = given("waive_until");
     if signed.is_null() != recorded.is_null()
-        || (!signed.is_null() && instant(signed) != instant(recorded))
+        || (!signed.is_null() && instant(signed) != recorded_at(recorded))
     {
-        return Some("the decider's request gives another waiver time".into());
+        return Some(
+            "the decider's request gives another waiver time (an RFC 3339 timestamp)".into(),
+        );
     }
     let request = field(review, "request_approval");
     if request.is_null() {
@@ -987,7 +1220,7 @@ pub fn review_approval_problem(review: &Value, audiences: &[String]) -> Option<S
         review["requested_by"].as_str().unwrap_or_default(),
         REVIEW_REQUEST_PATH,
         audiences,
-        instant(&review["requested_at"]),
+        recorded_at(&review["requested_at"]),
     ) {
         return Some(problem);
     }
@@ -1139,7 +1372,8 @@ fn emergency_issues(policy: &Value) -> Vec<(&'static str, String)> {
             "the emergency capability must differ from the capability it stands for",
         ));
     }
-    if stands_for.ends_with(".*") {
+    // An exact capability ID, as a selector names one: no "*" at all.
+    if stands_for.contains('*') || stands_for.trim().is_empty() {
         issues.push(invalid("stands_for is an exact capability ID"));
     }
     if !parameter_name(parameter) {
@@ -1163,4 +1397,51 @@ fn emergency_issues(policy: &Value) -> Vec<(&'static str, String)> {
         ));
     }
     issues
+}
+
+/// Whether a policy's selector names `capability`, exactly or by a
+/// `prefix.*` pattern.
+fn selects(policy: &Value, capability: &str) -> bool {
+    policy["selector"]["capabilities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|pattern| {
+            pattern == capability
+                || pattern
+                    .strip_suffix('*')
+                    .is_some_and(|prefix| prefix.ends_with('.') && capability.starts_with(prefix))
+        })
+}
+
+/// Emergency capability -> the ordinary capability it stands for, from the
+/// policies given (those active at `at`) whose validity covers `at`, as the
+/// NA reads them to judge and match urgent changes. A capability that a
+/// policy without an emergency section also selects is no emergency
+/// capability.
+pub fn emergency_map(policies: &[Value], at: DateTime<Utc>) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for policy in policies {
+        let (Some(stands_for), Some([capability])) = (
+            policy["emergency"]["stands_for"].as_str(),
+            policy["selector"]["capabilities"]
+                .as_array()
+                .map(Vec::as_slice),
+        ) else {
+            continue;
+        };
+        let Some(capability) = capability.as_str() else {
+            continue;
+        };
+        let time = |key: &str| policy[key].as_str().and_then(|t| parse_timestamp(t).ok());
+        let valid = matches!((time("valid_from"), time("valid_until")), (Some(from), Some(until)) if from <= at && at <= until);
+        let ordinary_too = policies
+            .iter()
+            .any(|other| other["emergency"].is_null() && selects(other, capability));
+        if valid && !ordinary_too {
+            map.insert(capability.to_owned(), stands_for.to_owned());
+        }
+    }
+    map
 }

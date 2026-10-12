@@ -920,13 +920,55 @@ impl EvidenceStoreClient {
     /// Every change to a resource, oldest first, with how it was governed
     /// (`prior_decision` or `after_the_fact`) and its state (`recorded`,
     /// `matched`, `judged_allowed`, `judged_denied`, `indeterminate`,
-    /// `observed`, `quarantined`) (admin, v1.3.0). `truncated: true` when
-    /// the resource has more changes than one response holds.
+    /// `observed`, `quarantined`; 1.4.0: the remediation state, with a
+    /// `remediation` object) (admin, v1.3.0). Since 1.4.0 it follows the
+    /// pages ([`resource_changes_page`](Self::resource_changes_page)) and
+    /// returns every change; against an NA before 1.4.0, which serves one
+    /// response, `truncated: true` says it held more.
     pub async fn resource_changes(&self, resource_id: &str) -> Result<Value> {
+        let mut after = None;
+        let mut changes = Vec::new();
+        loop {
+            let mut page = self.resource_changes_page(resource_id, after, None).await?;
+            if let Value::Array(items) = page["changes"].take() {
+                changes.extend(items);
+            }
+            match page["next_after_sequence"].as_u64() {
+                Some(next) if after.is_none_or(|a| next > a) => after = Some(next),
+                Some(_) => {
+                    return Err(GenesisMeshError::Verification(
+                        "resource changes cursor did not advance".into(),
+                    ))
+                }
+                None => {
+                    page["changes"] = Value::Array(changes);
+                    return Ok(page);
+                }
+            }
+        }
+    }
+
+    /// One page of a resource's changes (admin, 1.4.0): `limit` 1 to 10,000
+    /// (the NA's default 1,000) after `after_sequence` (the previous page's
+    /// `next_after_sequence`); `truncated` and `next_after_sequence` when
+    /// there are more; `400 invalid_page`.
+    pub async fn resource_changes_page(
+        &self,
+        resource_id: &str,
+        after_sequence: Option<u64>,
+        limit: Option<u32>,
+    ) -> Result<Value> {
+        let mut query = Vec::new();
+        if let Some(limit) = limit {
+            query.push(("limit".to_owned(), limit.to_string()));
+        }
+        if let Some(after) = after_sequence {
+            query.push(("after_sequence".to_owned(), after.to_string()));
+        }
         self.http
             .admin_get(
                 &format!("/admin/evidence/changes/{}", resource_path(resource_id)?),
-                &[],
+                &query,
             )
             .await
     }
@@ -989,10 +1031,12 @@ impl EvidenceStoreClient {
 
     /// One page of the due queue (admin, read tier, 1.4.0): remediation
     /// states oldest first, `{state, count, remediations, next_after}`.
-    /// `state` is one of [`STAGE3_STATES`](crate::remediation::STAGE3_STATES)
-    /// (default: `remediation_due`, `overdue`, `review_pending` and
-    /// `waived`); `limit` 1 to 500 (default 100); `after` the previous
-    /// page's `next_after`.
+    /// `state` is one of [`QUEUE_FILTERS`](crate::remediation::QUEUE_FILTERS):
+    /// a stored state, or `review_pending` (every change with a pending
+    /// review, whatever its state); without it, the `remediation_due`,
+    /// `overdue` and `waived` ones and those with a pending review. `limit`
+    /// 1 to 500 (default 100); `after` the previous page's `next_after`. Each
+    /// state carries `review_pending`, `actor_holder` and `change_version_id`.
     pub async fn remediations(&self, query: &RemediationQuery) -> Result<Value> {
         let mut pairs = Vec::new();
         if let Some(state) = &query.state {
