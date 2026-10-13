@@ -31,12 +31,7 @@ fn strings(value: &Value) -> Vec<String> {
 }
 
 fn no_keys() -> VerifyEvidenceOptions {
-    VerifyEvidenceOptions {
-        na_public_keys: vec![],
-        executor_keys: vec![],
-        contiguous: true,
-        checkpoint: None,
-    }
+    VerifyEvidenceOptions::new(vec![], vec![])
 }
 
 #[test]

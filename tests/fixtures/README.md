@@ -21,3 +21,10 @@ runs of anchors, and the whole `genesis-mesh evidence verify-export --known-anch
 --format json` output for exports checked against them. Regenerate it with
 `python scripts/generate_anchor_vectors.py` (the core installed); the core's
 verification corpus supersedes it once that covers anchors.
+
+`audit.json` (1.5.0) is the core's `audit` conformance suite (key histories, key
+windows, exports and anchors across a key succession, decisions at their own
+time, packs and the completeness check), copied unchanged; so is
+`audit-pack-1.5.0/`, the frozen 1.5.0 pack with its root key and the anchors an
+auditor holds. Its files are byte-exact (`.gitattributes`): its manifest holds
+their digests.

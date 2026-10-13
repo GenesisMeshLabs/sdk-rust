@@ -5,6 +5,7 @@
 use genesis_mesh_sdk::{
     canonical::anchor_digest,
     json,
+    key_history::NaKeys,
     verify::{
         check_anchors, check_events_against_anchors, export_checkpoint, parse_anchors,
         parse_export_lines, verify_evidence_events, verify_store_anchors, VerificationFailure,
@@ -40,7 +41,7 @@ fn verify_export_with_anchors(input: &Value) -> Value {
         )
     };
     let mut result = verify_evidence_events(&events, &options);
-    for f in verify_store_anchors(&anchors, Some(&keys), None).failures {
+    for f in verify_store_anchors(&anchors, Some(&NaKeys::Any(keys.clone())), None).failures {
         result.verified = false;
         result.failures.push(VerificationFailure {
             store_sequence: None,
@@ -74,8 +75,11 @@ fn every_vector_gives_the_reference_outcome() {
                 let anchors = check_anchors(input["anchors"].as_array().unwrap().clone())
                     .unwrap_or_else(|e| panic!("{}: {e}", v["id"]));
                 let keys = strings(&input["na_public_keys"]);
-                let result =
-                    verify_store_anchors(&anchors, Some(&keys), input["sovereign_id"].as_str());
+                let result = verify_store_anchors(
+                    &anchors,
+                    Some(&NaKeys::Any(keys)),
+                    input["sovereign_id"].as_str(),
+                );
                 let mut expected = v["expected"].clone();
                 let digests = expected.as_object_mut().unwrap().remove("digests").unwrap();
                 assert_eq!(
@@ -116,7 +120,7 @@ fn signatures_are_skipped_only_when_asked() {
         .unwrap();
     let anchors = check_anchors(other_key["input"]["anchors"].as_array().unwrap().clone()).unwrap();
     assert!(verify_store_anchors(&anchors, None, None).verified);
-    assert!(!verify_store_anchors(&anchors, Some(&[]), None).verified);
+    assert!(!verify_store_anchors(&anchors, Some(&NaKeys::Any(vec![])), None).verified);
 }
 
 #[test]

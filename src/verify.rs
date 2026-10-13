@@ -21,6 +21,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::key_history::{succession_form_refusal, succession_signed_by, NaKeyHistory, NaKeys};
 use crate::strict::{
     is_known_entry_kind, non_canonical_fields, prefixed_unknown_fields, unknown_fields,
     without_unknown_fields,
@@ -30,8 +31,9 @@ use crate::{
     canonical::{
         anchor_canonical, anchor_digest, attestation_digest, checkpoint_canonical,
         decision_canonical, entry_digest, execution_canonical, execution_digest,
-        freshness_proof_canonical, justification_canonical, micros, out_of_band_canonical,
-        parse_timestamp, payload_digest, policy_canonical, policy_digest, policy_set_digest,
+        freshness_proof_canonical, justification_canonical, key_succession_digest, micros,
+        out_of_band_canonical, parse_timestamp, payload_digest, policy_canonical, policy_digest,
+        policy_set_digest,
     },
     errors::{GenesisMeshError, Result},
     evidence_store::ResourceHead,
@@ -626,6 +628,20 @@ validator!(valid_remediation, {
     Box::new(move |v| fields(v) && v.is_some_and(remediation_consistent))
 });
 
+/// Whether a record reads as its model (1.5.0, for the audit pack checks):
+/// well formed with no field the model does not define, as the reference's
+/// models (which forbid unknown fields) read it.
+pub(crate) fn reads_as(model: &str, record: &Value) -> bool {
+    let valid = match model {
+        "RetentionCheckpoint" => valid_checkpoint(Some(record)),
+        "RegistryRecord" => valid_registry(Some(record)),
+        "JudgementRecord" => valid_judgement(Some(record)),
+        "BoundaryDecision" => valid_decision(Some(record)),
+        _ => false,
+    };
+    valid && unknown_fields(model, record).is_empty()
+}
+
 /// Whether a remediation record is well formed (1.4.0), for the record checks.
 pub(crate) fn valid_remediation_record(record: &Value) -> bool {
     valid_remediation(Some(record))
@@ -722,6 +738,29 @@ validator!(valid_review, {
     Box::new(move |v| fields(v) && v.is_some_and(review_consistent))
 });
 
+// v1.5.0: an archive record, signed by the NA.
+validator!(
+    valid_archive,
+    shape(
+        vec![
+            ("archive_id", bounded(128, 1)),
+            ("pack_id", bounded(128, 1)),
+            ("from_sequence", positive()),
+            ("through_sequence", positive()),
+            ("through_entry_digest", sha256()),
+            ("end_anchor_sequence", positive()),
+            ("manifest_sha256", sha256()),
+            ("location", bounded(1024, 1)),
+            ("archived_at", utc_timestamp()),
+            ("recorded_by", absent(string())),
+            ("issuer_sovereign_id", string()),
+            ("issued_by", string()),
+            ("signature", optional(signature())),
+        ],
+        false
+    )
+);
+
 validator!(
     valid_event,
     shape(
@@ -767,7 +806,11 @@ validator!(
 
 // ── Signatures ────────────────────────────────────────────────────────────────
 
-fn signed_by(canonical: Result<String>, signature: Option<&Value>, keys: &[String]) -> bool {
+pub(crate) fn signed_by(
+    canonical: Result<String>,
+    signature: Option<&Value>,
+    keys: &[String],
+) -> bool {
     let (Ok(canonical), Some(sig)) = (canonical, signature.and_then(|s| s.get("sig")?.as_str()))
     else {
         return false;
@@ -862,7 +905,8 @@ type Validator = fn(Option<&Value>) -> bool;
 
 /// v1.3.0: the id field, model and validator of each record of a change made
 /// outside the controlled path; v1.4.0: and of a remediation or review.
-const OUT_OF_BAND_IDS: [(&str, &str, Validator); 7] = [
+const OUT_OF_BAND_IDS: [(&str, &str, Validator); 8] = [
+    ("archive_id", "ArchiveRecord", valid_archive),
     ("observation_id", "ObservationRecord", valid_observation),
     ("break_glass_id", "BreakGlassRecord", valid_break_glass),
     ("judgement_id", "JudgementRecord", valid_judgement),
@@ -925,11 +969,17 @@ pub struct VerifyDecisionOptions {
     pub expected_policies: Option<Vec<Value>>,
     /// The decision must bind this attestation: id, subject, issuer and digest.
     pub expected_attestation: Option<Value>,
-    /// Judge expiry as of the decision's own time, `decision_made_at`, not
-    /// as of `now` (1.5.0), so an archived decision still verifies when it is
-    /// audited years later; `now` is then ignored. Off by default: a decision
-    /// about to be acted on is judged as of now.
-    pub as_of_record_time: bool,
+    /// Judge the decision as of its own time, `decision_made_at`, not as of
+    /// `now` (1.5.0; the reference's `at_record_time`), so an archived
+    /// decision still verifies when it is audited years later; `now` is then
+    /// ignored. Off by default: a decision about to be acted on is judged as
+    /// of now.
+    pub at_record_time: bool,
+    /// The NA's key history (1.5.0): when given, the decision must be signed
+    /// by the key valid at its `decision_made_at`
+    /// (`na_key_not_valid_at_time` for another key of the history), and
+    /// `operator_public_keys` is not used.
+    pub key_history: Option<NaKeyHistory>,
 }
 
 /// Outcome of [`verify_boundary_decision`]. `accepted` means the decision is
@@ -970,8 +1020,10 @@ pub fn verify_boundary_decision(
     if decision.get("signature").is_none_or(Value::is_null) {
         return reject("missing_signature");
     }
-    let now = if options.as_of_record_time {
-        micros(str_field(decision, "decision_made_at").unwrap_or_default()).unwrap_or_default()
+    let made_at =
+        micros(str_field(decision, "decision_made_at").unwrap_or_default()).unwrap_or_default();
+    let now = if options.at_record_time {
+        made_at
     } else {
         options.now.unwrap_or_else(Utc::now).timestamp_micros()
     };
@@ -979,8 +1031,17 @@ pub fn verify_boundary_decision(
     if valid_until.is_ok_and(|until| now > until) {
         return reject("decision_expired");
     }
-    if !decision_signed(decision, &options.operator_public_keys) {
-        return reject("invalid_signature");
+    let keys = match &options.key_history {
+        Some(history) => NaKeys::History(history.clone()),
+        None => NaKeys::Any(options.operator_public_keys.clone()),
+    };
+    if !decision_signed(decision, &keys.at(Some(made_at))) {
+        // v1.5.0: signed by a key of the history, but not the one valid then.
+        return reject(if decision_signed(decision, &keys.not_at(made_at)) {
+            "na_key_not_valid_at_time"
+        } else {
+            "invalid_signature"
+        });
     }
     // v1.2.0: an authentic decision with a signed field this crate does not
     // know, or expected inputs it cannot read, is refused by name.
@@ -1181,6 +1242,12 @@ pub struct EvidenceVerification {
     /// Review entries checked (v1.4.0); left out when zero.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub reviews: u64,
+    /// Key succession entries checked (v1.5.0); left out when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub key_successions: u64,
+    /// Archive entries checked (v1.5.0); left out when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub archives: u64,
     /// Every failure, in order.
     pub failures: Vec<VerificationFailure>,
     /// Findings that do not fail verification (v1.2.0), such as
@@ -1191,6 +1258,27 @@ pub struct EvidenceVerification {
 
 fn is_zero(count: &u64) -> bool {
     *count == 0
+}
+
+impl EvidenceVerification {
+    pub(crate) fn empty() -> Self {
+        EvidenceVerification {
+            verified: true,
+            checked_entries: 0,
+            decisions: 0,
+            executions: 0,
+            observations: 0,
+            break_glass: 0,
+            judgements: 0,
+            quarantined: 0,
+            remediations: 0,
+            reviews: 0,
+            key_successions: 0,
+            archives: 0,
+            failures: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
 }
 
 /// How to verify a run of evidence events.
@@ -1211,6 +1299,17 @@ pub struct VerifyEvidenceOptions {
     pub contiguous: bool,
     /// Resource heads for chains whose early records retention removed.
     pub checkpoint: Option<Value>,
+    /// The NA's key history (1.5.0): when given, an NA signature must be made
+    /// by the key valid at the entry's `recorded_at`
+    /// (`na_key_not_valid_at_time` for another key of the history), a key
+    /// succession entry must be one of its successions, and
+    /// `na_public_keys` is not used.
+    pub key_history: Option<NaKeyHistory>,
+    /// An audit pack's cited records (1.5.0): records before the run that its
+    /// records rest on, verified for authenticity (signatures, digests) but
+    /// not as a run. The run then holds every chain from its start, and a
+    /// record it cites that neither holds is `cited_record_missing`.
+    pub prior: Option<Vec<Value>>,
 }
 
 impl VerifyEvidenceOptions {
@@ -1221,6 +1320,17 @@ impl VerifyEvidenceOptions {
             executor_keys,
             contiguous: true,
             checkpoint: None,
+            key_history: None,
+            prior: None,
+        }
+    }
+
+    /// The NA keys these options name: the key history, or keys valid at
+    /// every time.
+    pub fn na_keys(&self) -> NaKeys {
+        match &self.key_history {
+            Some(history) => NaKeys::History(history.clone()),
+            None => NaKeys::Any(self.na_public_keys.clone()),
         }
     }
 }
@@ -1233,10 +1343,12 @@ struct CheckedPayload {
     payload: Value,
 }
 
+/// `na` is every NA key (and, for a key succession, the root key): an
+/// unknown field signed by any of them is refused by name.
 fn check_payload_fields(
     kind: &str,
     payload: &Value,
-    options: &VerifyEvidenceOptions,
+    na: &[String],
     executor_keys: &HashMap<&str, &Value>,
 ) -> CheckedPayload {
     let none = |payload: &Value| CheckedPayload {
@@ -1260,7 +1372,7 @@ fn check_payload_fields(
             "context.",
         ));
         let found = prefixed_unknown_fields("BoundaryDecision", decision, "decision.");
-        if !found.is_empty() && decision_signed(decision, &options.na_public_keys) {
+        if !found.is_empty() && decision_signed(decision, na) {
             return CheckedPayload {
                 signed: found,
                 unsigned,
@@ -1311,9 +1423,11 @@ fn check_payload_fields(
         "justification" => signed_by(
             justification_canonical(payload),
             payload.get("signature"),
-            &options.na_public_keys,
+            na,
         ),
-        "retention_checkpoint" => checkpoint_signed(payload, &options.na_public_keys),
+        "retention_checkpoint" => checkpoint_signed(payload, na),
+        // v1.5.0: signed by the root key and the outgoing NA key.
+        "key_succession" => succession_signed_by(payload, na),
         // v1.3.0: the key the signature names, whatever its role or sovereign,
         // so an authentic record with a field this crate does not know is
         // refused by name first, as the reference refuses it.
@@ -1328,11 +1442,7 @@ fn check_payload_fields(
                     &[str_field(key, "public_key").unwrap_or_default().to_owned()],
                 )
             }),
-        _ => signed_by(
-            out_of_band_canonical(payload),
-            payload.get("signature"),
-            &options.na_public_keys,
-        ),
+        _ => signed_by(out_of_band_canonical(payload), payload.get("signature"), na),
     };
     if signed_as_received {
         CheckedPayload {
@@ -1360,8 +1470,20 @@ fn out_of_band_model(kind: &str) -> Option<&'static str> {
         "registry" => "RegistryRecord",
         "remediation" => "RemediationRecord",
         "review" => "ReviewRecord",
+        // v1.5.0
+        "key_succession" => "KeySuccessionRecord",
+        "archive" => "ArchiveRecord",
         _ => return None,
     })
+}
+
+/// Whether a record with a field outside its signature is no record of its
+/// kind (the reference's model forbids unknown fields): every Stage 2, 3 and
+/// 4 record, and (1.5.0, as the reference has since 0.59) a retention
+/// checkpoint. A justification, execution evidence or a decision's wrapper
+/// with such a field gets the warning `unsigned_field` and verifies the rest.
+fn refuses_unsigned_fields(kind: &str) -> bool {
+    kind == "retention_checkpoint" || out_of_band_model(kind).is_some()
 }
 
 /// What a registered key signs (v1.3.0): `executor` unless it says otherwise.
@@ -1428,14 +1550,14 @@ fn model_of(kind: &str) -> &'static str {
 fn out_of_band_signed(
     kind: &str,
     payload: &Value,
-    options: &VerifyEvidenceOptions,
+    na: &[String],
     executor_keys: &HashMap<&str, &Value>,
 ) -> bool {
     out_of_band_model(kind).is_some_and(|model| {
         out_of_band_verifies(
             model,
             payload,
-            &out_of_band_keys(kind, payload, &options.na_public_keys, executor_keys),
+            &out_of_band_keys(kind, payload, na, executor_keys),
         )
     })
 }
@@ -1444,16 +1566,17 @@ fn out_of_band_signed(
 /// kind requires, the same check for an export entry and for a single record
 /// (1.5.0): a justification or retention checkpoint by the NA, execution
 /// evidence by an executor key of its sovereign, and a Stage 2 or Stage 3
-/// record by the key its kind allows.
+/// record by the key its kind allows. `na` are the NA keys that may have
+/// signed it (since 1.5.0, those valid at its time).
 fn record_signed(
     kind: &str,
     payload: &Value,
-    options: &VerifyEvidenceOptions,
+    na: &[String],
     executor_keys: &HashMap<&str, &Value>,
 ) -> bool {
     match kind {
-        "justification" => verify_justification_signature(payload, &options.na_public_keys),
-        "retention_checkpoint" => verify_retention_checkpoint(payload, &options.na_public_keys),
+        "justification" => verify_justification_signature(payload, na),
+        "retention_checkpoint" => verify_retention_checkpoint(payload, na),
         // v1.3.0: only an executor key signs execution evidence.
         "execution" => payload
             .get("signature")
@@ -1468,7 +1591,7 @@ fn record_signed(
                         str_field(key, "public_key").unwrap_or_default(),
                     )
             }),
-        other => out_of_band_signed(other, payload, options, executor_keys),
+        other => out_of_band_signed(other, payload, na, executor_keys),
     }
 }
 
@@ -1486,6 +1609,9 @@ fn valid_payload(kind: &str, payload: &Value) -> bool {
         "registry" => valid_registry(Some(payload)),
         "remediation" => valid_remediation(Some(payload)),
         "review" => valid_review(Some(payload)),
+        // v1.5.0
+        "key_succession" => crate::key_history::valid_succession_record(payload),
+        "archive" => valid_archive(Some(payload)),
         _ => false,
     }
 }
@@ -1504,6 +1630,8 @@ fn record_id_of(kind: &str, payload: &Value) -> String {
         "registry" => &payload["registry_record_id"],
         "remediation" => &payload["remediation_id"],
         "review" => &payload["review_id"],
+        "key_succession" => &payload["succession_id"],
+        "archive" => &payload["archive_id"],
         _ => &Value::Null,
     };
     id.as_str().unwrap_or_default().to_owned()
@@ -1512,7 +1640,10 @@ fn record_id_of(kind: &str, payload: &Value) -> String {
 /// v1.3.1: the envelope fields a Stage 2 entry derives from its record, and
 /// the record field each must equal (an absent field is null). The NA
 /// searches and matches on them.
-const ENVELOPE_FIELDS: [(&str, &[(&str, &str)]); 7] = [
+const ENVELOPE_FIELDS: [(&str, &[(&str, &str)]); 9] = [
+    // v1.5.0: a key succession or archive entry carries its record's id only.
+    ("key_succession", &[("record_id", "succession_id")]),
+    ("archive", &[("record_id", "archive_id")]),
     (
         "observation",
         &[
@@ -1675,20 +1806,9 @@ pub fn verify_evidence_events<'a>(
     events: impl IntoIterator<Item = &'a Value>,
     options: &VerifyEvidenceOptions,
 ) -> EvidenceVerification {
-    let mut result = EvidenceVerification {
-        verified: true,
-        checked_entries: 0,
-        decisions: 0,
-        executions: 0,
-        observations: 0,
-        break_glass: 0,
-        judgements: 0,
-        quarantined: 0,
-        remediations: 0,
-        reviews: 0,
-        failures: Vec::new(),
-        warnings: Vec::new(),
-    };
+    let mut main = EvidenceVerification::empty();
+    let na = options.na_keys();
+    let na_all = na.all();
     let executor_keys: HashMap<&str, &Value> = options
         .executor_keys
         .iter()
@@ -1730,48 +1850,71 @@ pub fn verify_evidence_events<'a>(
     let mut prev: Option<Value> = None;
 
     if let Some(checkpoint) = checkpoint {
-        if !valid_checkpoint(Some(checkpoint))
-            || !checkpoint_signed(checkpoint, &options.na_public_keys)
-        {
-            fail(
-                &mut result,
-                None,
-                "invalid_signature",
-                "retention_checkpoint",
-            );
-            return result;
+        // v1.5.0: signed by the NA key valid at its `created_at`.
+        let created = micros(str_field(checkpoint, "created_at").unwrap_or_default()).ok();
+        if !valid_checkpoint(Some(checkpoint)) || !checkpoint_signed(checkpoint, &na.at(created)) {
+            fail(&mut main, None, "invalid_signature", "retention_checkpoint");
+            return main;
         }
         let unknown = prefixed_unknown_fields("RetentionCheckpoint", checkpoint, "checkpoint.");
         if !unknown.is_empty() {
-            fail(&mut result, None, "unknown_field", &unknown.join(", "));
-            return result;
+            fail(&mut main, None, "unknown_field", &unknown.join(", "));
+            return main;
         }
     }
 
-    for event in events {
+    // v1.5.0: an audit pack's cited records come first, in store order, into
+    // their own result: their failures fail the run, their counts do not
+    // count. The run's chains then continue from the records they hold.
+    let pack = options.prior.is_some();
+    let mut cited: Vec<&Value> = options.prior.iter().flatten().collect();
+    cited.sort_by_key(|e| e["entry"]["store_sequence"].as_i64());
+    let run: Vec<&Value> = events.into_iter().collect();
+    let mut cited_result = EvidenceVerification::empty();
+    let mut merged = !pack;
+    let visits = cited
+        .iter()
+        .map(|e| (*e, true))
+        .chain(run.iter().map(|e| (*e, false)));
+    for (event, cited_run) in visits {
+        if !cited_run && !merged {
+            merge_cited(&mut main, &mut cited_result);
+            prev = None;
+            merged = true;
+        }
+        // Checks that need a record's predecessors in the run; a pack's
+        // cited records are not a run.
+        let chained = !cited_run;
+        let result = if cited_run {
+            &mut cited_result
+        } else {
+            &mut main
+        };
         result.checked_entries += 1;
         if !valid_event(Some(event)) {
-            fail(&mut result, None, "payload_invalid", "event envelope");
+            fail(result, None, "payload_invalid", "event envelope");
             continue;
         }
         let entry = &event["entry"];
         let seq = entry["store_sequence"].as_i64().unwrap_or_default();
         let s = Some(seq);
         if entry_digest(entry).ok().as_deref() != str_field(event, "entry_digest") {
-            fail(&mut result, s, "entry_digest_mismatch", "");
+            fail(result, s, "entry_digest_mismatch", "");
         }
         if payload_digest(&event["payload"]).ok().as_deref() != str_field(entry, "payload_digest") {
-            fail(&mut result, s, "payload_digest_mismatch", "");
+            fail(result, s, "payload_digest_mismatch", "");
         }
         let prev_seq = prev.as_ref().and_then(|p| p["store_sequence"].as_i64());
         match (&prev, prev_seq) {
-            (Some(prev), Some(prev_seq)) if options.contiguous || seq == prev_seq + 1 => {
+            (Some(prev), Some(prev_seq))
+                if (options.contiguous && chained) || seq == prev_seq + 1 =>
+            {
                 if seq != prev_seq + 1 {
-                    fail(&mut result, s, "store_sequence_gap", "");
+                    fail(result, s, "store_sequence_gap", "");
                 } else if str_field(entry, "prev_entry_digest")
                     != entry_digest(prev).ok().as_deref()
                 {
-                    fail(&mut result, s, "store_chain_break", "");
+                    fail(result, s, "store_chain_break", "");
                 }
             }
             (None, _) => {
@@ -1784,7 +1927,7 @@ pub fn verify_evidence_events<'a>(
                             != str_field(checkpoint, "last_removed_entry_digest")
                     {
                         fail(
-                            &mut result,
+                            result,
                             s,
                             "store_chain_break",
                             "does not continue from the checkpoint",
@@ -1794,9 +1937,10 @@ pub fn verify_evidence_events<'a>(
             }
             _ => {}
         }
-        if first_sequence.is_none() {
+        if first_sequence.is_none() && chained {
             first_sequence = Some(seq);
-            from_start = seq == 1
+            from_start = pack
+                || seq == 1
                 || checkpoint.is_some_and(|c| {
                     c["removed_through_sequence"].as_i64().map(|n| n + 1) == Some(seq)
                 });
@@ -1804,14 +1948,22 @@ pub fn verify_evidence_events<'a>(
         prev = Some(entry.clone());
 
         let kind = str_field(entry, "entry_kind").unwrap_or_default();
+        // v1.5.0: NA signatures by the key valid at the entry's time.
+        let recorded = micros(str_field(entry, "recorded_at").unwrap_or_default()).ok();
+        let na_now = na.at(recorded);
+        let na_other = recorded.map(|at| na.not_at(at)).unwrap_or_default();
         if !is_known_entry_kind(kind) {
             // v1.2.0: a kind from a later release; its envelope still chains.
-            fail(&mut result, s, "unknown_entry_kind", kind);
+            fail(result, s, "unknown_entry_kind", kind);
             continue;
         }
-        let checked = check_payload_fields(kind, &event["payload"], options, &executor_keys);
+        let mut signers = na_all.clone();
+        if kind == "key_succession" {
+            signers.extend(na.history().and_then(|h| h.root_public_key.clone()));
+        }
+        let checked = check_payload_fields(kind, &event["payload"], &signers, &executor_keys);
         if !checked.signed.is_empty() {
-            fail(&mut result, s, "unknown_field", &checked.signed.join(", "));
+            fail(result, s, "unknown_field", &checked.signed.join(", "));
             continue;
         }
         if !checked.unsigned.is_empty() {
@@ -1823,13 +1975,8 @@ pub fn verify_evidence_events<'a>(
             // v1.3.0: the reference stores these records exactly as signed; a
             // field outside the signature is no part of one (the reference
             // refuses it as it reads the record).
-            if out_of_band_model(kind).is_some() {
-                fail(
-                    &mut result,
-                    s,
-                    "payload_invalid",
-                    &checked.unsigned.join(", "),
-                );
+            if refuses_unsigned_fields(kind) {
+                fail(result, s, "payload_invalid", &checked.unsigned.join(", "));
                 continue;
             }
         }
@@ -1838,26 +1985,37 @@ pub fn verify_evidence_events<'a>(
         // reference does not write, is refused by name, as the reference
         // refuses it (v1.3.0); since 1.3.1 also one whose fields outside its
         // signature were set aside, checked as the signer signed it.
+        // v1.5.0: a record signed by another key of the NA's history than the
+        // one valid at its time is `na_key_not_valid_at_time`; a form the
+        // reference does not write is refused first, as the reference does.
         let signature = |result: &mut EvidenceVerification,
-                         signed: bool,
+                         (signed, by_other): (bool, bool),
                          model: &str,
                          record: &Value,
                          detail: &str| {
-            if !signed {
-                fail(result, s, "invalid_signature", detail);
-            } else if !non_canonical_fields(model, record).is_empty() {
+            let canonical = non_canonical_fields(model, record).is_empty();
+            if (signed || by_other) && !canonical {
                 fail(result, s, "non_canonical_form", detail);
+            } else if by_other && !signed {
+                fail(result, s, "na_key_not_valid_at_time", detail);
+            } else if !signed {
+                fail(result, s, "invalid_signature", detail);
             }
         };
+        let signed_now = |kind: &str, record: &Value| {
+            let signed = record_signed(kind, record, &na_now, &executor_keys);
+            let by_other = !signed && record_signed(kind, record, &na_other, &executor_keys);
+            (signed, by_other)
+        };
         if !valid_payload(kind, payload) {
-            fail(&mut result, s, "payload_invalid", "");
+            fail(result, s, "payload_invalid", "");
             continue;
         }
         // v1.3.1: a record appears once per kind; a copied entry is a replay.
         let record_id = record_id_of(kind, payload);
         if !record_ids.insert((kind.to_owned(), record_id.clone())) {
             fail(
-                &mut result,
+                result,
                 s,
                 "duplicate_record",
                 &format!("{kind} {record_id}"),
@@ -1867,7 +2025,7 @@ pub fn verify_evidence_events<'a>(
         let wrong = envelope_mismatches(kind, entry, payload);
         if !wrong.is_empty() {
             fail(
-                &mut result,
+                result,
                 s,
                 "envelope_mismatch",
                 &format!("{kind}: {}", wrong.join(", ")),
@@ -1876,9 +2034,11 @@ pub fn verify_evidence_events<'a>(
         match kind {
             "decision" => {
                 let decision = &payload["decision"];
+                let signed = verify_decision_signature(decision, &na_now);
+                let by_other = !signed && verify_decision_signature(decision, &na_other);
                 signature(
-                    &mut result,
-                    verify_decision_signature(decision, &options.na_public_keys),
+                    result,
+                    (signed, by_other),
                     "BoundaryDecision",
                     decision,
                     "decision",
@@ -1900,13 +2060,13 @@ pub fn verify_evidence_events<'a>(
                 if valid_context(payload.get("context")) {
                     contexts.insert(id, payload["context"].clone());
                 } else {
-                    fail(&mut result, s, "payload_invalid", "context");
+                    fail(result, s, "payload_invalid", "context");
                 }
             }
             "justification" => {
                 signature(
-                    &mut result,
-                    record_signed(kind, payload, options, &executor_keys),
+                    result,
+                    signed_now(kind, payload),
                     "JustificationProof",
                     payload,
                     "justification",
@@ -1914,8 +2074,13 @@ pub fn verify_evidence_events<'a>(
             }
             "execution" => {
                 let ev = payload;
-                let signed = record_signed(kind, ev, options, &executor_keys);
-                signature(&mut result, signed, "ExecutionEvidence", ev, "execution");
+                signature(
+                    result,
+                    signed_now(kind, ev),
+                    "ExecutionEvidence",
+                    ev,
+                    "execution",
+                );
                 result.executions += 1;
                 let decision_id = str_field(ev, "decision_id").unwrap_or_default().to_owned();
                 let decision = decisions.get(&decision_id);
@@ -1928,29 +2093,40 @@ pub fn verify_evidence_events<'a>(
                         micros(str_field(decision, "decision_valid_until").unwrap_or_default())
                             .unwrap_or_default();
                     if decision.get("authorized").and_then(Value::as_bool) != Some(true) {
-                        fail(&mut result, s, "evidence_decision_denied", "");
+                        fail(result, s, "evidence_decision_denied", "");
                     } else if at < made || at > until {
-                        fail(&mut result, s, "evidence_outside_decision_window", "");
+                        fail(result, s, "evidence_outside_decision_window", "");
                     } else if contexts.get(&decision_id).is_some_and(|c| {
                         str_field(ev, "executed_capability") != str_field(c, "requested_capability")
                     }) {
-                        fail(&mut result, s, "evidence_capability_mismatch", "");
+                        fail(result, s, "evidence_capability_mismatch", "");
                     }
+                } else if pack && chained {
+                    // v1.5.0: a pack holds the decision every execution in its range rests on.
+                    let detail = format!("decision {decision_id}");
+                    fail(result, s, "cited_record_missing", &detail);
                 }
                 // v1.3.0: execution evidence never rests on a judgement or a record of one.
                 if not_decisions.contains(&decision_id) {
-                    fail(&mut result, s, "evidence_cites_judgement", &decision_id);
+                    fail(result, s, "evidence_cites_judgement", &decision_id);
                 }
                 let sequence_no = ev["sequence_no"].as_i64();
                 let prev_digest = str_field(ev, "prev_evidence_digest");
-                if let Some(prior) = last_exec.get(&decision_id) {
-                    if sequence_no != prior["sequence_no"].as_i64().map(|n| n + 1)
-                        || prev_digest != execution_digest(prior).ok().as_deref()
-                    {
-                        fail(&mut result, s, "evidence_chain_break", "");
+                match last_exec.get(&decision_id) {
+                    Some(prior) if chained => {
+                        if sequence_no != prior["sequence_no"].as_i64().map(|n| n + 1)
+                            || prev_digest != execution_digest(prior).ok().as_deref()
+                        {
+                            fail(result, s, "evidence_chain_break", "");
+                        }
                     }
-                } else if decision.is_some() && (sequence_no != Some(1) || prev_digest.is_some()) {
-                    fail(&mut result, s, "evidence_chain_break", "");
+                    None if chained
+                        && decision.is_some()
+                        && (sequence_no != Some(1) || prev_digest.is_some()) =>
+                    {
+                        fail(result, s, "evidence_chain_break", "");
+                    }
+                    _ => {}
                 }
                 last_exec.insert(decision_id, ev.clone());
                 matchable.insert(str_field(ev, "evidence_id").unwrap_or_default().to_owned());
@@ -1974,12 +2150,13 @@ pub fn verify_evidence_events<'a>(
                     // v1.3.1: a run that starts after entry 1 and not right
                     // after the checkpoint takes the first record it holds of
                     // a resource as that chain's start.
-                    if (head.is_some() || from_start)
+                    if chained
+                        && (head.is_some() || from_start)
                         && (resource_sequence != Some(expected)
                             || str_field(ev, "prev_resource_digest")
                                 != head.map(|h| h.record_digest.as_str()))
                     {
-                        fail(&mut result, s, "resource_chain_break", resource_id);
+                        fail(result, s, "resource_chain_break", resource_id);
                     }
                     resource_heads.insert(
                         resource_id.to_owned(),
@@ -1992,8 +2169,8 @@ pub fn verify_evidence_events<'a>(
             }
             "retention_checkpoint" => {
                 signature(
-                    &mut result,
-                    record_signed(kind, payload, options, &executor_keys),
+                    result,
+                    signed_now(kind, payload),
                     "RetentionCheckpoint",
                     payload,
                     "retention_checkpoint",
@@ -2011,14 +2188,14 @@ pub fn verify_evidence_events<'a>(
                 if let Some(problem) =
                     start.and_then(|start| checkpoint_count_problem(payload, start))
                 {
-                    fail(&mut result, s, "retention_count_mismatch", &problem);
+                    fail(result, s, "retention_count_mismatch", &problem);
                 }
                 checkpoints.insert(record_id, through);
             }
             "observation" | "break_glass" => {
                 let observation = kind == "observation";
-                let signed = out_of_band_signed(kind, payload, options, &executor_keys);
-                signature(&mut result, signed, model_of(kind), payload, kind);
+                let signed = signed_now(kind, payload);
+                signature(result, signed, model_of(kind), payload, kind);
                 let resource = str_field(payload, "resource_id")
                     .unwrap_or_default()
                     .to_owned();
@@ -2045,8 +2222,11 @@ pub fn verify_evidence_events<'a>(
                     result.observations += 1;
                     let position = entry["observation_sequence"].as_i64();
                     let head = observation_heads.get(&resource).copied();
-                    if (head.is_some() || from_start) && position != Some(head.unwrap_or(0) + 1) {
-                        fail(&mut result, s, "observation_chain_break", &resource);
+                    if chained
+                        && (head.is_some() || from_start)
+                        && position != Some(head.unwrap_or(0) + 1)
+                    {
+                        fail(result, s, "observation_chain_break", &resource);
                     }
                     let next = position.filter(|&p| p != 0).unwrap_or(head.unwrap_or(0));
                     observation_heads.insert(resource, next);
@@ -2056,8 +2236,8 @@ pub fn verify_evidence_events<'a>(
                 }
             }
             "judgement" => {
-                let signed = out_of_band_signed(kind, payload, options, &executor_keys);
-                signature(&mut result, signed, model_of(kind), payload, kind);
+                let signed = signed_now(kind, payload);
+                signature(result, signed, model_of(kind), payload, kind);
                 result.judgements += 1;
                 stage3.judged.insert(
                     record_id.clone(),
@@ -2083,7 +2263,7 @@ pub fn verify_evidence_events<'a>(
                     subject_id.to_owned(),
                 );
                 if !judged.insert(subject.clone()) {
-                    fail(&mut result, s, "duplicate_judgement", subject_id);
+                    fail(result, s, "duplicate_judgement", subject_id);
                 }
                 let subject_sequence = payload["subject_store_sequence"].as_i64();
                 match subjects.get(&subject) {
@@ -2091,47 +2271,56 @@ pub fn verify_evidence_events<'a>(
                         if Some(digest.as_str()) != str_field(payload, "subject_digest")
                             || Some(*sequence) != subject_sequence
                         {
-                            fail(&mut result, s, "judgement_subject_mismatch", subject_id);
+                            fail(result, s, "judgement_subject_mismatch", subject_id);
                         }
                     }
                     None => {
-                        if options.contiguous
+                        if chained
+                            && options.contiguous
                             && first_sequence.is_some_and(|first| subject_sequence >= Some(first))
                         {
-                            fail(&mut result, s, "judgement_subject_missing", subject_id);
+                            fail(result, s, "judgement_subject_missing", subject_id);
+                        } else if pack && chained {
+                            let detail = format!("{} {subject_id}", subject.0);
+                            fail(result, s, "cited_record_missing", &detail);
                         }
                     }
                 }
                 if let Some(evidence_id) = str_field(payload, "matched_evidence_id") {
                     if !matched.insert(evidence_id.to_owned()) {
-                        fail(&mut result, s, "match_reused", evidence_id);
+                        fail(result, s, "match_reused", evidence_id);
                     }
                     // v1.3.1: the NA matches a record it already holds, so a
                     // run from entry 1 holds it.
-                    if options.contiguous
+                    if chained
+                        && options.contiguous
                         && first_sequence == Some(1)
                         && !matchable.contains(evidence_id)
                     {
-                        fail(&mut result, s, "judgement_match_missing", evidence_id);
+                        fail(result, s, "judgement_match_missing", evidence_id);
+                    } else if pack && chained && !matchable.contains(evidence_id) {
+                        let detail = format!("matched record {evidence_id}");
+                        fail(result, s, "cited_record_missing", &detail);
                     }
                 }
             }
             "quarantine" => {
-                let signed = out_of_band_signed(kind, payload, options, &executor_keys);
-                signature(&mut result, signed, model_of(kind), payload, kind);
+                let signed = signed_now(kind, payload);
+                signature(result, signed, model_of(kind), payload, kind);
                 result.quarantined += 1;
                 if payload_digest(&payload["record"]).ok().as_deref()
                     != str_field(payload, "record_digest")
                 {
-                    fail(&mut result, s, "quarantine_digest_mismatch", "");
+                    fail(result, s, "quarantine_digest_mismatch", "");
                 }
             }
             "registry" => {
-                let signed = out_of_band_signed(kind, payload, options, &executor_keys);
-                signature(&mut result, signed, model_of(kind), payload, kind);
+                let signed = signed_now(kind, payload);
+                signature(result, signed, model_of(kind), payload, kind);
                 // v1.4.0: the operator keys' public keys and holders over time,
                 // from registry records the NA signed only.
-                let authentic = signed && non_canonical_fields(model_of(kind), payload).is_empty();
+                let authentic =
+                    signed.0 && non_canonical_fields(model_of(kind), payload).is_empty();
                 if let (true, Some("operator_key_holder"), Some(key_id)) = (
                     authentic,
                     str_field(payload, "event"),
@@ -2150,33 +2339,80 @@ pub fn verify_evidence_events<'a>(
                 }
             }
             "remediation" => {
-                let signed = out_of_band_signed(kind, payload, options, &executor_keys);
-                signature(&mut result, signed, model_of(kind), payload, kind);
+                let signed = signed_now(kind, payload);
+                signature(result, signed, model_of(kind), payload, kind);
                 result.remediations += 1;
                 not_decisions.insert(record_id);
                 // A run from its start: entry 1, or right after the checkpoint.
-                let held_from_start = options.contiguous && from_start;
+                let held_from_start = chained && options.contiguous && from_start;
                 for (reason, detail) in stage3.remediation(payload, held_from_start) {
-                    fail(&mut result, s, reason, &detail);
+                    fail(result, s, reason, &detail);
                 }
             }
             "review" => {
-                let signed = out_of_band_signed(kind, payload, options, &executor_keys);
-                signature(&mut result, signed, model_of(kind), payload, kind);
+                let signed = signed_now(kind, payload);
+                signature(result, signed, model_of(kind), payload, kind);
                 result.reviews += 1;
                 not_decisions.insert(record_id);
                 // A run from its start: entry 1, or right after the checkpoint.
-                let held_from_start = options.contiguous && from_start;
-                for (reason, detail) in
-                    stage3.review(payload, &options.na_public_keys, held_from_start)
-                {
-                    fail(&mut result, s, reason, &detail);
+                let held_from_start = chained && options.contiguous && from_start;
+                for (reason, detail) in stage3.review(payload, &na_all, held_from_start) {
+                    fail(result, s, reason, &detail);
                 }
             }
-            other => fail(&mut result, s, "unknown_entry_kind", other),
+            // v1.5.0: a key succession is signed by its outgoing key, an NA
+            // key; given the NA's key history, it is one of the history's
+            // successions and the root key signed it.
+            "key_succession" => {
+                result.key_successions += 1;
+                let root = na.history().and_then(|h| h.root_public_key.clone());
+                let id = str_field(payload, "succession_id").unwrap_or_default();
+                let previous = str_field(payload, "previous_public_key").unwrap_or_default();
+                if let Some(refusal) = succession_form_refusal(payload, &signers) {
+                    let reason = if refusal == "unknown_field" {
+                        "invalid_signature"
+                    } else {
+                        refusal
+                    };
+                    fail(result, s, reason, kind);
+                } else if !na_all.iter().any(|k| k == previous)
+                    || !succession_signed_by(payload, &[previous.to_owned()])
+                {
+                    fail(result, s, "invalid_signature", kind);
+                } else if let Some(root) = root {
+                    let digest = key_succession_digest(payload).unwrap_or_default();
+                    if !succession_signed_by(payload, &[root]) {
+                        fail(result, s, "succession_invalid_root_signature", id);
+                    } else if na
+                        .history()
+                        .is_some_and(|h| !h.succession_digests.contains(&digest))
+                    {
+                        fail(result, s, "succession_not_in_history", id);
+                    }
+                }
+            }
+            "archive" => {
+                let signed = signed_now(kind, payload);
+                signature(result, signed, model_of(kind), payload, kind);
+                result.archives += 1;
+            }
+            other => fail(result, s, "unknown_entry_kind", other),
         }
     }
-    result
+    if !merged {
+        merge_cited(&mut main, &mut cited_result);
+    }
+    main
+}
+
+/// An audit pack's cited records' failures and warnings, folded into the
+/// run's result (1.5.0): a cited record that fails fails the pack.
+fn merge_cited(main: &mut EvidenceVerification, cited: &mut EvidenceVerification) {
+    for failure in cited.failures.drain(..) {
+        let detail = format!("cited {}", failure.detail).trim_end().to_owned();
+        fail(main, failure.store_sequence, &failure.reason, &detail);
+    }
+    main.warnings.append(&mut cited.warnings);
 }
 
 /// An operator key as the holder registry records it (v1.4.0): when (in
@@ -2389,7 +2625,9 @@ impl Stage3 {
 
 /// The kinds [`verify_record`] verifies: each entry kind of an evidence
 /// export, and the policies and attestations a decision binds.
-pub const RECORD_KINDS: [&str; 13] = [
+pub const RECORD_KINDS: [&str; 15] = [
+    "key_succession",
+    "archive",
     "decision",
     "justification",
     "execution",
@@ -2426,6 +2664,25 @@ pub struct VerifyRecordOptions {
     pub expected_policies: Option<Vec<Value>>,
     /// A decision only: as [`VerifyDecisionOptions::expected_attestation`].
     pub expected_attestation: Option<Value>,
+    /// The NA's key history (1.5.0): when given, `na_public_keys` is not
+    /// used, and an NA signature must be made by the key valid at the
+    /// record's own time where it has one (a decision's `decision_made_at`, a
+    /// retention checkpoint's `created_at`, a policy's or an attestation's
+    /// `issued_at`); another record read alone is accepted under any key of
+    /// the history. A key succession must be one of its successions.
+    pub key_history: Option<NaKeyHistory>,
+}
+
+/// The time an NA-signed record read on its own is signed at (1.5.0), in
+/// microseconds, when the reference names one.
+fn own_time(kind: &str, record: &Value) -> Option<i64> {
+    let field = match kind {
+        "retention_checkpoint" => "created_at",
+        "policy" | "attestation" => "issued_at",
+        "decision" => "decision_made_at",
+        _ => return None,
+    };
+    micros(str_field(record, field)?).ok()
 }
 
 /// Outcome of [`verify_record`].
@@ -2500,18 +2757,25 @@ pub fn verify_record(
         failures: Vec::new(),
         warnings: Vec::new(),
     };
-    let keys = &options.na_public_keys;
+    let na = match &options.key_history {
+        Some(history) => NaKeys::History(history.clone()),
+        None => NaKeys::Any(options.na_public_keys.clone()),
+    };
+    let at = own_time(kind, record);
+    let keys = &na.at(at);
+    let other = at.map(|at| na.not_at(at)).unwrap_or_default();
     match kind {
         "decision" => {
             let check = verify_boundary_decision(
                 record,
                 &VerifyDecisionOptions {
-                    operator_public_keys: keys.clone(),
+                    operator_public_keys: options.na_public_keys.clone(),
                     freshness_proof_issuer_keys: options.freshness_proof_issuer_keys.clone(),
                     now: options.at,
                     expected_policies: options.expected_policies.clone(),
                     expected_attestation: options.expected_attestation.clone(),
-                    as_of_record_time: options.at.is_none(),
+                    at_record_time: options.at.is_none(),
+                    key_history: options.key_history.clone(),
                 },
             );
             out.record_id = check.decision_id;
@@ -2523,20 +2787,28 @@ pub fn verify_record(
             }
         }
         "policy" | "attestation" => {
-            let (model, id, signed) = if kind == "policy" {
-                let signed = signed_by(policy_canonical(record), record.get("signature"), keys);
-                ("BoundaryPolicy", "policy_id", signed)
-            } else {
-                let canonical = crate::canonical::attestation_canonical(record);
-                let signed = any_signed(canonical, record.get("signatures"), keys);
-                ("MembershipAttestation", "attestation_id", signed)
+            let signed_with = |keys: &[String]| {
+                if kind == "policy" {
+                    signed_by(policy_canonical(record), record.get("signature"), keys)
+                } else {
+                    let canonical = crate::canonical::attestation_canonical(record);
+                    any_signed(canonical, record.get("signatures"), keys)
+                }
             };
+            let (model, id) = if kind == "policy" {
+                ("BoundaryPolicy", "policy_id")
+            } else {
+                ("MembershipAttestation", "attestation_id")
+            };
+            let signed = signed_with(keys);
             out.record_id = str_field(record, id).map(str::to_owned);
             let unknown = unknown_fields(model, record);
             if !record.is_object() {
                 out.fail("payload_invalid", "");
             } else if signed && !unknown.is_empty() {
                 out.fail("unknown_field", &unknown.join(", "));
+            } else if !signed && signed_with(&other) {
+                out.fail("na_key_not_valid_at_time", kind);
             } else if !signed {
                 out.fail("invalid_signature", kind);
             }
@@ -2546,14 +2818,18 @@ pub fn verify_record(
                 out.fail("unknown_entry_kind", kind);
                 return out;
             };
-            let evidence = VerifyEvidenceOptions::new(keys.clone(), options.executor_keys.clone());
-            let executor_keys: HashMap<&str, &Value> = evidence
+            let executor_keys: HashMap<&str, &Value> = options
                 .executor_keys
                 .iter()
                 .filter_map(|k| Some((str_field(k, "key_id")?, k)))
                 .collect();
+            let root = na.history().and_then(|h| h.root_public_key.clone());
+            let mut signers = na.all();
+            if kind == "key_succession" {
+                signers.extend(root.clone());
+            }
             out.record_id = Some(record_id_of(kind, record)).filter(|id| !id.is_empty());
-            let checked = check_payload_fields(kind, record, &evidence, &executor_keys);
+            let checked = check_payload_fields(kind, record, &signers, &executor_keys);
             if !checked.signed.is_empty() {
                 out.fail("unknown_field", &checked.signed.join(", "));
                 return out;
@@ -2564,7 +2840,7 @@ pub fn verify_record(
                     reason: "unsigned_field".to_owned(),
                     detail: checked.unsigned.join(", "),
                 });
-                if out_of_band_model(kind).is_some() {
+                if refuses_unsigned_fields(kind) {
                     out.fail("payload_invalid", &checked.unsigned.join(", "));
                     return out;
                 }
@@ -2574,10 +2850,21 @@ pub fn verify_record(
                 out.fail("payload_invalid", "");
                 return out;
             }
-            if !record_signed(kind, payload, &evidence, &executor_keys) {
-                out.fail("invalid_signature", kind);
-            } else if !non_canonical_fields(model, payload).is_empty() {
+            if kind == "key_succession" {
+                if let Some(reason) = succession_alone(payload, &na) {
+                    out.fail(reason, kind);
+                }
+                return out;
+            }
+            let signed = record_signed(kind, payload, keys, &executor_keys);
+            let by_other = !signed && record_signed(kind, payload, &other, &executor_keys);
+            let canonical = non_canonical_fields(model, payload).is_empty();
+            if (signed || by_other) && !canonical {
                 out.fail("non_canonical_form", kind);
+            } else if by_other {
+                out.fail("na_key_not_valid_at_time", kind);
+            } else if !signed {
+                out.fail("invalid_signature", kind);
             }
             match kind {
                 "retention_checkpoint"
@@ -2595,7 +2882,7 @@ pub fn verify_record(
                     }
                 }
                 "review" => {
-                    if let Some(problem) = review_approval_problem(payload, keys) {
+                    if let Some(problem) = review_approval_problem(payload, &na.all()) {
                         out.fail("review_approval_invalid", &problem);
                     }
                     if review_holder_problem(&ReviewHolders::of(payload)).is_some() {
@@ -2608,6 +2895,38 @@ pub fn verify_record(
         }
     }
     out
+}
+
+/// Why a key succession read on its own is refused, or `None`, as an export
+/// refuses its entry (1.5.0): its form under the NA keys and the root key,
+/// a signature by its outgoing key (a key of the history), and, given the
+/// key history, the root key's signature (`succession_invalid_root_signature`)
+/// and its place in the history (`succession_not_in_history`).
+fn succession_alone(payload: &Value, na: &NaKeys) -> Option<&'static str> {
+    let root = na.history().and_then(|h| h.root_public_key.clone());
+    let all = na.all();
+    let mut signers = all.clone();
+    signers.extend(root.clone());
+    if let Some(refusal) = succession_form_refusal(payload, &signers) {
+        return Some(if refusal == "unknown_field" {
+            "invalid_signature"
+        } else {
+            refusal
+        });
+    }
+    let previous = str_field(payload, "previous_public_key").unwrap_or_default();
+    if !all.iter().any(|k| k == previous) || !succession_signed_by(payload, &[previous.to_owned()])
+    {
+        return Some("invalid_signature");
+    }
+    let root = root?;
+    if !succession_signed_by(payload, &[root]) {
+        return Some("succession_invalid_root_signature");
+    }
+    let digest = key_succession_digest(payload).unwrap_or_default();
+    na.history()
+        .filter(|h| !h.succession_digests.contains(&digest))
+        .map(|_| "succession_not_in_history")
 }
 
 // ── Store anchors (1.5.0; the reference's since 1.2.0) ────────────────────────
@@ -2713,7 +3032,9 @@ pub struct AnchorVerification {
 
 /// Verify a run of anchors ordered by `anchor_sequence`, as the reference's
 /// `verify_store_anchors`: each signed by one of the NA keys
-/// (`anchor_invalid_signature`; `None` skips signatures), of `sovereign_id`
+/// (`anchor_invalid_signature`; `None` skips signatures; given the NA's key
+/// history, by the key valid at its `anchored_at`, else
+/// `na_key_not_valid_at_time`), of `sovereign_id`
 /// when given (`anchor_sovereign_mismatch`), positions without gaps
 /// (`anchor_sequence_gap`), each naming the digest of the one before and the
 /// first at position 1 naming none (`anchor_chain_break`), store positions
@@ -2721,7 +3042,7 @@ pub struct AnchorVerification {
 /// 1: an auditor may hold only recent anchors.
 pub fn verify_store_anchors(
     anchors: &[Value],
-    na_public_keys: Option<&[String]>,
+    na_keys: Option<&NaKeys>,
     sovereign_id: Option<&str>,
 ) -> AnchorVerification {
     let mut result = AnchorVerification {
@@ -2748,9 +3069,19 @@ pub fn verify_store_anchors(
         result.checked_anchors += 1;
         result.first_anchor_sequence.get_or_insert(n);
         result.last_anchor_sequence = Some(n);
-        if let Some(keys) = na_public_keys {
-            if !signed_by(anchor_canonical(anchor), anchor.get("signature"), keys) {
-                fail(&mut result, n, "anchor_invalid_signature", "");
+        if let Some(keys) = na_keys {
+            // v1.5.0: by the NA key valid at its `anchored_at`.
+            let signed = |keys: &[String]| {
+                signed_by(anchor_canonical(anchor), anchor.get("signature"), keys)
+            };
+            if !signed(&keys.at(at(anchor))) {
+                let late = at(anchor).is_some_and(|at| signed(&keys.not_at(at)));
+                let reason = if late {
+                    "na_key_not_valid_at_time"
+                } else {
+                    "anchor_invalid_signature"
+                };
+                fail(&mut result, n, reason, "");
             }
         }
         if let Some(sovereign) = sovereign_id {

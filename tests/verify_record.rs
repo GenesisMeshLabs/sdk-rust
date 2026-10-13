@@ -139,7 +139,7 @@ fn a_decision_is_judged_as_of_its_own_time_when_asked() {
         "decision_expired"
     );
     let archived = VerifyDecisionOptions {
-        as_of_record_time: true,
+        at_record_time: true,
         ..options.clone()
     };
     let result = verify_boundary_decision(decision, &archived);
@@ -278,4 +278,25 @@ fn a_signed_field_this_crate_does_not_know_is_refused_by_name() {
         verify_record("attestation", &attestation, &options).reason,
         "invalid_signature"
     );
+}
+
+/// 1.5.0: as the reference refuses it, a retention checkpoint with a field
+/// outside its signature is no checkpoint; a justification keeps the warning.
+#[test]
+fn a_checkpoint_with_a_field_outside_its_signature_is_refused() {
+    let v = reference();
+    let options = VerifyRecordOptions {
+        na_public_keys: keys(&v),
+        ..VerifyRecordOptions::default()
+    };
+    let mut checkpoint = v["checkpoint"].clone();
+    checkpoint["x_added_field"] = json!(1);
+    let result = verify_record("retention_checkpoint", &checkpoint, &options);
+    assert_eq!(result.reason, "payload_invalid", "{result:?}");
+    assert_eq!(result.warnings[0].reason, "unsigned_field");
+    let mut proof = v["allowed"]["justification_proof"].clone();
+    proof["x_added_field"] = json!(1);
+    let result = verify_record("justification", &proof, &options);
+    assert!(result.verified, "{result:?}");
+    assert_eq!(result.warnings[0].reason, "unsigned_field");
 }

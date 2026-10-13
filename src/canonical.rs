@@ -179,6 +179,54 @@ pub fn payload_digest(payload: &Value) -> Result<String> {
     canonical_digest(payload)
 }
 
+/// The signed form of a record of a registry root as received, as every
+/// verifier rebuilds it (the reference's `received_canonical`, 1.5.0): its
+/// `canonical_fields` when the registry lists them, otherwise every field but
+/// its signature field, a field it leaves out when absent (`omit_when_none`)
+/// left out when `null`. Nothing unknown is dropped: a signature over a field
+/// this crate does not know still verifies, and is then refused by name.
+pub fn received_canonical(model: &str, record: &Value) -> Result<String> {
+    let spec = crate::strict::model_spec(model);
+    let Some(object) = record.as_object() else {
+        return canonical_json(record);
+    };
+    let listed = |rule: &str, key: &str| {
+        spec[rule]
+            .as_array()
+            .is_some_and(|keys| keys.iter().any(|k| k.as_str() == Some(key)))
+    };
+    let body: Map<String, Value> = match spec["canonical_fields"].as_array() {
+        Some(fields) => fields
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|k| (k.to_owned(), object.get(k).cloned().unwrap_or(Value::Null)))
+            .collect(),
+        None => object
+            .iter()
+            .filter(|(k, v)| {
+                spec["signature_field"].as_str() != Some(k.as_str())
+                    && !(v.is_null() && listed("omit_when_none", k))
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
+    canonical_json(&Value::Object(body))
+}
+
+/// `KeySuccessionRecord.to_canonical_json()` (1.5.0): what the root key and
+/// the outgoing NA key both sign, every field but `signatures`, an absent
+/// `previous_succession_digest` left out.
+pub fn key_succession_canonical(record: &Value) -> Result<String> {
+    received_canonical("KeySuccessionRecord", record)
+}
+
+/// `KeySuccessionRecord.digest()`: the next succession links to it.
+pub fn key_succession_digest(record: &Value) -> Result<String> {
+    Ok(crate::auth::sha256_hex(
+        key_succession_canonical(record)?.as_bytes(),
+    ))
+}
+
 /// A store anchor's signed fields (1.5.0, as the reference signs them since
 /// 1.2.0): every field but `signature`, an absent previous anchor digest left
 /// out, and `anchored_at` in the form Pydantic writes it.

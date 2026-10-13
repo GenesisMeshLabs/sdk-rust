@@ -23,6 +23,11 @@ static REGISTRY: LazyLock<Value> = LazyLock::new(|| {
         .expect("the embedded canonical registry is valid JSON")
 });
 
+/// A model's entry in the registry (`Null` when it has none).
+pub(crate) fn model_spec(model: &str) -> &'static Value {
+    &REGISTRY["models"][model]
+}
+
 /// The embedded registry, for the conformance tests. Regenerate it with
 /// `python scripts/sync_canonical_registry.py` after copying a new suite.
 #[doc(hidden)]
