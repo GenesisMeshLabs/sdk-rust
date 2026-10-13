@@ -1528,13 +1528,23 @@ fn py_str(value: &Value) -> String {
 /// U+007F to U+009F) and the line and paragraph separators `\uXXXX`. A value
 /// is written as itself when it is a string, in decimal when it is an
 /// integer, `true` or `false`, empty when absent, and as canonical JSON
-/// otherwise.
+/// otherwise. A number with an integral value is written as an integer even
+/// when it was read as a float (`1.0` is `1`; below 2^53 in magnitude).
 pub fn report_cell(value: &Value) -> String {
     let text = match value {
         Value::Null => String::new(),
         Value::Bool(b) => b.to_string(),
         Value::String(s) => s.clone(),
         Value::Number(n) if n.is_i64() || n.is_u64() => n.to_string(),
+        // A number with an integral value is written as an integer even when
+        // it was read as a float (`1.0` is `1`): JSON does not tell the two
+        // apart in every language.
+        Value::Number(n)
+            if n.as_f64()
+                .is_some_and(|f| f.fract() == 0.0 && f.abs() < 9_007_199_254_740_992.0) =>
+        {
+            format!("{}", n.as_f64().unwrap_or_default() as i64)
+        }
         other => pack_json(other),
     };
     let mut out = String::with_capacity(text.len());
