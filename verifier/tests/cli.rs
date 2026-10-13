@@ -316,7 +316,10 @@ fn each_way_of_stopping_has_its_exit_code() {
         ),
         (vec!["export", export, "--na-key", key, "--colour"], 2),
         (vec!["audit", export], 2),
-        (vec!["pack", "pack-dir", "--anchor", key], 4),
+        (vec!["pack", "pack-dir", "--anchor", key], 3),
+        (vec!["pack", export], 2),
+        (vec!["key-history", record], 2),
+        (vec!["export", export, "--key-history", record], 2),
     ] {
         let r = run(&args);
         assert_eq!(r.code, code, "{args:?}: {}", r.stderr);
@@ -327,9 +330,9 @@ fn each_way_of_stopping_has_its_exit_code() {
         assert!(r.stdout.is_empty(), "{args:?}");
     }
     // With --json, the error is also on standard output.
-    let r = run(&["pack", "pack-dir", "--json"]);
-    assert_eq!(r.code, 4);
-    assert_eq!(r.json()["error"]["exit_code"], 4);
+    let r = run(&["pack", "pack-dir", "--anchor", key, "--json"]);
+    assert_eq!(r.code, 3);
+    assert_eq!(r.json()["error"]["exit_code"], 3);
 }
 
 #[test]
@@ -386,4 +389,230 @@ fn the_binary_holds_no_network_or_signing_code() {
             "clippy.toml no longer refuses {path}"
         );
     }
+}
+
+/// The frozen 1.5.0 pack (the core's conformance/fixtures/audit-pack-1.5.0),
+/// copied into a scratch directory so a test can change it.
+fn frozen_pack(name: &str) -> (Scratch, String, String, String) {
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/audit-pack-1.5.0");
+    let scratch = Scratch::new(name);
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let path = entry.unwrap().path();
+            let target = to.join(path.file_name().unwrap());
+            if path.is_dir() {
+                copy(&path, &target);
+            } else {
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+    copy(&fixture, scratch.path());
+    let at = |p: &str| scratch.path().join(p).to_str().unwrap().to_owned();
+    let (pack, root, anchors) = (at("pack"), at("root.pub"), at("anchors.json"));
+    (scratch, pack, root, anchors)
+}
+
+#[test]
+fn the_frozen_pack_verifies_and_agrees_with_its_own_checks() {
+    let (_scratch, pack, root, anchors) = frozen_pack("frozen");
+    let readable = run(&[
+        "pack",
+        &pack,
+        "--anchor",
+        &root,
+        "--known-anchors",
+        &anchors,
+    ]);
+    assert_eq!(readable.code, 0, "{}", readable.stdout);
+    assert!(readable
+        .stdout
+        .contains("Range      : entries 6 to 11 (6 entries)"));
+    assert!(readable
+        .stdout
+        .contains("NA keys    : 2 in the key history"));
+    assert!(readable.stdout.contains("Result     : VERIFIED"));
+    assert!(!readable.stdout.contains("differs"), "{}", readable.stdout);
+    let out = run(&[
+        "pack",
+        &pack,
+        "--anchor",
+        &root,
+        "--known-anchors",
+        &anchors,
+        "--json",
+    ])
+    .json();
+    assert_eq!(out["verified"], true);
+    assert_eq!(out["report_differences"], json!([]));
+    assert_eq!(out["counts"]["key_successions"], 1);
+    assert_eq!(out["keys"].as_array().unwrap().len(), 2);
+    // Without held anchors: the pack's integrity only, said as a warning.
+    let alone = run(&["pack", &pack, "--anchor", &root, "--json"]).json();
+    assert_eq!(alone["verified"], true);
+    assert_eq!(alone["warnings"][0]["reason"], "no_held_anchors");
+    // Another root key: nothing in the pack vouches for itself.
+    let other = run(&[
+        "pack",
+        &pack,
+        "--anchor",
+        &key_of(7),
+        "--known-anchors",
+        &anchors,
+        "--json",
+    ]);
+    assert_eq!(other.code, 1);
+    assert_eq!(
+        other.json()["failures"][0]["reason"],
+        "genesis_root_mismatch"
+    );
+}
+
+fn key_of(byte: u8) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    // Not a key anyone holds a private half of: only its form matters here.
+    STANDARD.encode([byte; 32])
+}
+
+#[test]
+fn a_changed_pack_fails_by_name() {
+    // A file tampered with.
+    let (scratch, pack, root, anchors) = frozen_pack("tampered");
+    let report = scratch.path().join("pack/report.md");
+    let text = std::fs::read_to_string(&report).unwrap();
+    std::fs::write(&report, text.replace("**yes**", "**no**")).unwrap();
+    let r = run(&[
+        "pack",
+        &pack,
+        "--anchor",
+        &root,
+        "--known-anchors",
+        &anchors,
+        "--json",
+    ]);
+    assert_eq!(r.code, 1);
+    let failures = r.json()["failures"].clone();
+    assert_eq!(failures[0]["reason"], "manifest_digest_mismatch");
+    assert_eq!(failures[0]["file"], "report.md");
+    // A record removed from the range.
+    let (scratch, pack, root, anchors) = frozen_pack("removed");
+    let entries = scratch.path().join("pack/entries.jsonl");
+    let text = std::fs::read_to_string(&entries).unwrap();
+    let kept: Vec<&str> = text
+        .lines()
+        .enumerate()
+        .filter(|(i, _)| *i != 2)
+        .map(|(_, l)| l)
+        .collect();
+    std::fs::write(&entries, kept.join("\n") + "\n").unwrap();
+    let r = run(&[
+        "pack",
+        &pack,
+        "--anchor",
+        &root,
+        "--known-anchors",
+        &anchors,
+        "--json",
+    ]);
+    assert_eq!(r.code, 1);
+    assert_eq!(
+        r.json()["failures"][0]["reason"],
+        "manifest_digest_mismatch"
+    );
+    // A file the manifest does not list.
+    let (scratch, pack, root, anchors) = frozen_pack("unlisted");
+    scratch.file("pack/notes.txt", "added later");
+    let r = run(&[
+        "pack",
+        &pack,
+        "--anchor",
+        &root,
+        "--known-anchors",
+        &anchors,
+    ]);
+    assert_eq!(r.code, 1);
+    assert!(
+        r.stdout.contains("notes.txt #None: manifest_unlisted_file"),
+        "{}",
+        r.stdout
+    );
+    // A rewritten range the NA re-signed and re-anchored fails against the
+    // anchors held (the audit suite's pack-rewritten-re-anchored, run by the
+    // differential harness, is the same case with a consistent manifest).
+}
+
+#[test]
+fn a_pack_is_matched_against_an_outside_log() {
+    let (scratch, pack, root, anchors) = frozen_pack("changes");
+    let csv = scratch.file(
+        "changes.csv",
+        "source,source_event_id,resource_id,action,changed_at,actor\n\
+         ,,kv:vault/unknown,delete,2026-01-12T00:00:00+00:00,someone\n",
+    );
+    let r = run(&[
+        "pack",
+        &pack,
+        "--anchor",
+        &root,
+        "--known-anchors",
+        &anchors,
+        "--changes",
+        &csv,
+        "--json",
+    ]);
+    assert_eq!(r.code, 1, "{}", r.stdout);
+    let out = r.json();
+    assert_eq!(out["failures"][0]["reason"], "change_unmatched");
+    assert_eq!(out["completeness"]["unmatched_changes"][0]["index"], 1);
+    let bad = scratch.file(
+        "bad.csv",
+        "resource_id,action,changed_at\nr,update,2026-01-12T00:00:00\n",
+    );
+    assert_eq!(
+        run(&["pack", &pack, "--anchor", &root, "--changes", &bad]).code,
+        3
+    );
+}
+
+#[test]
+fn a_key_history_verifies_from_the_root_key_held() {
+    let (scratch, pack, root, _) = frozen_pack("history");
+    let genesis: Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{pack}/genesis.json")).unwrap())
+            .unwrap();
+    let history: Value = serde_json::from_str(
+        &std::fs::read_to_string(format!("{pack}/keys/na-key-history.json")).unwrap(),
+    )
+    .unwrap();
+    let file = scratch.json(
+        "history.json",
+        &json!({"genesis": genesis, "successions": history["successions"]}),
+    );
+    let r = run(&["key-history", &file, "--root-key", &root]);
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    assert!(r.stdout.contains("Key 2"), "{}", r.stdout);
+    let refused = run(&["key-history", &file, "--root-key", &key_of(9), "--json"]);
+    assert_eq!(refused.code, 1);
+    assert_eq!(
+        refused.json()["failures"][0]["reason"],
+        "genesis_root_mismatch"
+    );
+    // An export verified with a history that does not verify fails.
+    let export = scratch.file(
+        "export.jsonl",
+        &std::fs::read_to_string(format!("{pack}/entries.jsonl")).unwrap(),
+    );
+    let r = run(&[
+        "export",
+        &export,
+        "--key-history",
+        &file,
+        "--root-key",
+        &key_of(9),
+        "--json",
+    ]);
+    assert_eq!(r.code, 1);
+    assert_eq!(r.json()["failures"][0]["reason"], "genesis_root_mismatch");
 }

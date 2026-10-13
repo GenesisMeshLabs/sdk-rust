@@ -2,8 +2,11 @@
 
 use std::fmt::Write as _;
 
-use genesis_mesh_sdk::verify::{
-    AnchorCoverage, EvidenceVerification, RecordVerification, VerificationFailure,
+use genesis_mesh_sdk::{
+    audit_pack::PackVerification,
+    key_history::KeyHistoryVerification,
+    verify::{AnchorCoverage, EvidenceVerification, RecordVerification, VerificationFailure},
+    Value,
 };
 
 fn failures(out: &mut String, failures: &[VerificationFailure]) {
@@ -36,6 +39,124 @@ pub fn record(result: &RecordVerification) -> String {
     }
     for w in &result.warnings {
         let _ = writeln!(out, "Warning    : {} {}", w.reason, w.detail);
+    }
+    out
+}
+
+/// A pack's result, in the reference CLI's readable form, with where it
+/// differs from what the pack says of itself.
+pub fn pack(result: &PackVerification, differences: &[Value]) -> String {
+    let mut out = String::new();
+    let range = |key: &str| {
+        result
+            .range
+            .get(key)
+            .map_or("None".to_owned(), Value::to_string)
+    };
+    let _ = writeln!(
+        out,
+        "Range      : entries {} to {} ({} entries)",
+        range("from_sequence"),
+        range("through_sequence"),
+        range("entries")
+    );
+    let counts: Vec<String> = result
+        .counts
+        .iter()
+        .filter(|(k, v)| **v > 0 && k.as_str() != "checked_entries")
+        .map(|(k, v)| format!("{k} {v}"))
+        .collect();
+    let counts = if counts.is_empty() {
+        "none".to_owned()
+    } else {
+        counts.join(", ")
+    };
+    let _ = writeln!(out, "Records    : {counts}");
+    let _ = writeln!(out, "NA keys    : {} in the key history", result.keys.len());
+    if let Some(c) = &result.completeness {
+        let len = |key: &str| c[key].as_array().map_or(0, Vec::len);
+        let _ = writeln!(
+            out,
+            "Changes    : {}: {} matched, {} without a record, {} outside the period, {} records without a change",
+            c["changes"],
+            len("pairs"),
+            len("unmatched_changes"),
+            len("outside_period"),
+            len("unmatched_records")
+        );
+    }
+    let verdict = if result.verified {
+        "VERIFIED"
+    } else {
+        "FAILED"
+    };
+    let _ = writeln!(out, "Result     : {verdict}");
+    for f in &result.failures {
+        let at = f
+            .store_sequence
+            .map_or_else(|| "None".to_owned(), |s| s.to_string());
+        let line = format!(
+            "{} #{at}: {} {}",
+            f.file.as_deref().unwrap_or("-"),
+            f.reason,
+            f.detail
+        );
+        let _ = writeln!(out, "  - {}", line.trim_end());
+    }
+    for w in &result.warnings {
+        let _ = writeln!(out, "Warning    : {} {}", w.reason, w.detail);
+    }
+    for d in differences {
+        let _ = writeln!(
+            out,
+            "  ! differs from the pack's own checks: {}: pack {}, here {}",
+            d["field"].as_str().unwrap_or_default(),
+            d["pack"],
+            d["verifier"]
+        );
+    }
+    out
+}
+
+/// A key history's result.
+pub fn key_history(result: &KeyHistoryVerification) -> String {
+    let mut out = String::new();
+    for key in result.history.iter().flat_map(|h| h.keys.iter()) {
+        let shown = key.to_json();
+        let at = |field: &str| shown[field].as_str().unwrap_or("-").to_owned();
+        let until = if key.succeeded_at.is_some() {
+            at("succeeded_at")
+        } else {
+            at("valid_to")
+        };
+        let _ = writeln!(
+            out,
+            "Key {}      : {} ({}), from {} until {}{}",
+            key.key_sequence,
+            key.public_key,
+            key.key_id.as_deref().unwrap_or("no id"),
+            at("valid_from"),
+            until,
+            if key.valid_to_enforced {
+                ""
+            } else {
+                " (end not enforced)"
+            }
+        );
+    }
+    let verdict = if result.verified {
+        "VERIFIED"
+    } else {
+        "FAILED"
+    };
+    let _ = writeln!(out, "Result     : {verdict}");
+    for f in &result.failures {
+        let _ = writeln!(
+            out,
+            "  - key {}: {}",
+            f.key_sequence.unwrap_or_default(),
+            f.reason
+        );
     }
     out
 }

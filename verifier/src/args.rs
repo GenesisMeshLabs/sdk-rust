@@ -7,7 +7,8 @@ use genesis_mesh_sdk::verify::RECORD_KINDS;
 use crate::Stop;
 
 pub const USAGE: &str = "\
-genesis-mesh-verify: verify Genesis Mesh records and evidence exports offline.
+genesis-mesh-verify: verify Genesis Mesh records, evidence exports and audit
+packs offline.
 
 It never contacts a network and never needs a private key. Every key is a
 base64 Ed25519 public key, given inline or as a file ('#' lines ignored).
@@ -15,16 +16,21 @@ base64 Ed25519 public key, given inline or as a file ('#' lines ignored).
 Usage:
   genesis-mesh-verify record <kind> <file> [options]
   genesis-mesh-verify export <file> [options]
-  genesis-mesh-verify pack <dir> --anchor <key> --known-anchors <path>
+  genesis-mesh-verify pack <dir> --anchor <root key> [options]
+  genesis-mesh-verify key-history <file> --root-key <key>
   genesis-mesh-verify --help | --version
 
 record: verify one signed record (a JSON file) as an export verifies it.
   <kind>                    decision, justification, execution, checkpoint,
                             observation, break-glass, judgement, quarantine,
-                            registry, remediation, review, policy, attestation
-  --na-key <key>            an NA public key (repeatable)
+                            registry, remediation, review, key-succession,
+                            archive, policy, attestation
+  --na-key <key>            an NA public key, valid at every time (repeatable)
+  --key-history <file>      the NA's key history (GET /na/key-history): each
+                            NA key valid at its own times; needs --root-key
+  --root-key <key>          the root public key you hold, for --key-history
   --executor-keys <file>    JSON from GET /admin/evidence/executor-keys
-  --at <time>               judge a decision's expiry at this RFC 3339 time
+  --at <time>               judge a decision at this RFC 3339 time
                             (default: as of the decision's own time)
   --freshness-key <key>     a decision's freshness proof issuer (repeatable)
   --expect-policy <file>    a decision must bind this policy (repeatable)
@@ -32,8 +38,8 @@ record: verify one signed record (a JSON file) as an export verifies it.
                             a decision must bind this attestation
 
 export: verify a gm.evidence.event JSON Lines export.
-  --na-key <key>            an NA public key (repeatable)
-  --executor-keys <file>    JSON from GET /admin/evidence/executor-keys
+  --na-key, --key-history, --root-key, --executor-keys
+                            as for record
   --known-anchors <path>    anchors you hold: a directory from 'genesis-mesh
                             evidence anchors fetch', or a JSON file
   --checkpoint <file>       the retention checkpoint the export continues from
@@ -42,7 +48,19 @@ export: verify a gm.evidence.event JSON Lines export.
                             checked against the anchors
   --from-anchor             the export continues from a held anchor
 
-pack: verify an audit pack (not available yet).
+pack: verify an audit pack directory, as 'genesis-mesh audit verify' does.
+  --anchor <key>            the root public key you hold (required)
+  --known-anchors <path>    anchors you hold; without them the pack proves
+                            its integrity, not that nothing was removed
+  --executor-keys <file>    executor keys you hold, for a store without
+                            registry records
+  --changes <file>          changes from a log outside Genesis Mesh (CSV, or
+                            JSON) to match against the pack
+  --tolerance-seconds <n>   how far apart a change and its record may be
+                            (default 300)
+
+key-history: verify a key history ({\"genesis\", \"successions\"}) from the
+root key you hold, and list each NA key's validity.
 
 Global options:
   --json                    print the result as JSON
@@ -61,6 +79,7 @@ pub enum Command {
     Record(RecordArgs),
     Export(ExportArgs),
     Pack(PackArgs),
+    KeyHistory(KeyHistoryArgs),
 }
 
 /// The command and the output form.
@@ -80,6 +99,8 @@ pub struct RecordArgs {
     pub freshness_keys: Vec<String>,
     pub expect_policies: Vec<PathBuf>,
     pub expect_attestation: Option<PathBuf>,
+    pub key_history: Option<PathBuf>,
+    pub root_key: Option<String>,
 }
 
 #[derive(Debug)]
@@ -91,13 +112,24 @@ pub struct ExportArgs {
     pub checkpoint: Option<PathBuf>,
     pub partial: bool,
     pub from_anchor: bool,
+    pub key_history: Option<PathBuf>,
+    pub root_key: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct PackArgs {
     pub dir: PathBuf,
-    pub anchors: Vec<String>,
+    pub root_key: String,
     pub known_anchors: Option<PathBuf>,
+    pub executor_keys: Option<PathBuf>,
+    pub changes: Option<PathBuf>,
+    pub tolerance_seconds: i64,
+}
+
+#[derive(Debug)]
+pub struct KeyHistoryArgs {
+    pub file: PathBuf,
+    pub root_key: Option<String>,
 }
 
 /// Options of one command: the positionals, then each option's values in
@@ -220,6 +252,8 @@ pub fn parse(argv: &[String]) -> Result<Cli, Stop> {
                     "freshness-key",
                     "expect-policy",
                     "expect-attestation",
+                    "key-history",
+                    "root-key",
                 ],
                 &[],
             )?;
@@ -237,12 +271,21 @@ pub fn parse(argv: &[String]) -> Result<Cli, Stop> {
                     .map(PathBuf::from)
                     .collect(),
                 expect_attestation: parsed.one("expect-attestation")?.map(PathBuf::from),
+                key_history: parsed.one("key-history")?.map(PathBuf::from),
+                root_key: parsed.one("root-key")?,
             })
         }
         Some("export") => {
             let parsed = split(
                 &tokens[1..],
-                &["na-key", "executor-keys", "known-anchors", "checkpoint"],
+                &[
+                    "na-key",
+                    "executor-keys",
+                    "known-anchors",
+                    "checkpoint",
+                    "key-history",
+                    "root-key",
+                ],
                 &["partial", "from-anchor"],
             )?;
             let [file] = positionals::<1>(&parsed, "export <file> [options]")?;
@@ -254,21 +297,59 @@ pub fn parse(argv: &[String]) -> Result<Cli, Stop> {
                 checkpoint: parsed.one("checkpoint")?.map(PathBuf::from),
                 partial: parsed.flag("partial"),
                 from_anchor: parsed.flag("from-anchor"),
+                key_history: parsed.one("key-history")?.map(PathBuf::from),
+                root_key: parsed.one("root-key")?,
             })
         }
         Some("pack") => {
-            let parsed = split(&tokens[1..], &["anchor", "known-anchors"], &[])?;
-            let [dir] =
-                positionals::<1>(&parsed, "pack <dir> --anchor <key> --known-anchors <path>")?;
+            let parsed = split(
+                &tokens[1..],
+                &[
+                    "anchor",
+                    "known-anchors",
+                    "executor-keys",
+                    "changes",
+                    "tolerance-seconds",
+                ],
+                &[],
+            )?;
+            let usage = "pack <dir> --anchor <root key> [options]";
+            let [dir] = positionals::<1>(&parsed, usage)?;
+            let root_key = parsed.one("anchor")?.ok_or_else(|| {
+                Stop::Usage(
+                    "pack needs --anchor <root key>: the pack's keys prove nothing alone".into(),
+                )
+            })?;
+            let tolerance_seconds = match parsed.one("tolerance-seconds")? {
+                None => 300,
+                Some(n) => n
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|n| (0..=86_400).contains(n))
+                    .ok_or_else(|| {
+                        Stop::Usage(format!("--tolerance-seconds {n:?} is not 0 to 86400"))
+                    })?,
+            };
             Command::Pack(PackArgs {
                 dir: dir.into(),
-                anchors: parsed.all("anchor"),
+                root_key,
                 known_anchors: parsed.one("known-anchors")?.map(PathBuf::from),
+                executor_keys: parsed.one("executor-keys")?.map(PathBuf::from),
+                changes: parsed.one("changes")?.map(PathBuf::from),
+                tolerance_seconds,
+            })
+        }
+        Some("key-history") => {
+            let parsed = split(&tokens[1..], &["root-key"], &[])?;
+            let [file] = positionals::<1>(&parsed, "key-history <file> --root-key <key>")?;
+            Command::KeyHistory(KeyHistoryArgs {
+                file: file.into(),
+                root_key: parsed.one("root-key")?,
             })
         }
         Some(other) => {
             return Err(Stop::Usage(format!(
-                "unknown command {other:?}; one of: record, export, pack"
+                "unknown command {other:?}; one of: record, export, pack, key-history"
             )))
         }
     };
@@ -303,6 +384,7 @@ mod tests {
     fn names_kinds_as_the_sdk_does() {
         assert_eq!(record_kind("checkpoint").unwrap(), "retention_checkpoint");
         assert_eq!(record_kind("Break-Glass").unwrap(), "break_glass");
+        assert_eq!(record_kind("key-succession").unwrap(), "key_succession");
         assert!(matches!(record_kind("anchor"), Err(Stop::Usage(_))));
     }
 
@@ -316,6 +398,9 @@ mod tests {
             "export e.jsonl --checkpoint",
             "export e.jsonl --checkpoint a --checkpoint b",
             "verify e.jsonl",
+            "pack dir",
+            "pack dir --anchor k --tolerance-seconds -1",
+            "pack dir --anchor k --tolerance-seconds 90000",
         ] {
             assert!(matches!(parse(&argv(line)), Err(Stop::Usage(_))), "{line}");
         }

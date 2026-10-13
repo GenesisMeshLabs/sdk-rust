@@ -9,7 +9,7 @@
 //! and reported, so the corpus can land before its adapters do. Update this
 //! file when the corpus format is final.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::Path};
 
 use serde_json::{json, Map, Value};
 
@@ -40,6 +40,14 @@ pub enum Projection {
     RecordValid,
     /// The exit code and the whole JSON output, as the reference CLI's.
     CliOutput,
+    /// The corpus's export verdict: `verified` when it names one, and every
+    /// failure's `store_sequence` and `reason`.
+    CorpusExport,
+    /// `verified`, the failures' `key_sequence` and `reason`, and the keys.
+    KeyHistory,
+    /// `verified`, the sorted failure reasons and warnings, and the
+    /// unmatched changes when the pack was checked against a log.
+    Pack,
 }
 
 /// One vector as a run of the binary.
@@ -209,9 +217,157 @@ fn anchors_case(v: &Value, scratch: &Scratch) -> Adapted {
     })
 }
 
+/// A case of the core's verification corpus (`corpus.json`, 1.5.0) as a run
+/// of the binary: `export` (a one-entry or whole export with the key
+/// history), `key-history` and `pack`, each in the directory it names.
+pub fn adapt_corpus(case: &Value, dir: &Path) -> Adapted {
+    let path = dir.join(case["path"].as_str().unwrap_or_default());
+    let file = |name: &str| path.join(name).to_str().unwrap_or_default().to_owned();
+    let has = |name: &str| path.join(name).exists();
+    let expected = case["expected"].clone();
+    let (args, projection) = match case["command"].as_str().unwrap_or_default() {
+        "export" => (
+            vec![
+                "export".to_owned(),
+                file("export.jsonl"),
+                "--key-history".to_owned(),
+                file("key-history.json"),
+                "--root-key".to_owned(),
+                file("root.pub"),
+                "--executor-keys".to_owned(),
+                file("executor-keys.json"),
+                "--json".to_owned(),
+            ],
+            Projection::CorpusExport,
+        ),
+        "key-history" => (
+            vec![
+                "key-history".to_owned(),
+                file("key-history.json"),
+                "--root-key".to_owned(),
+                file("root.pub"),
+                "--json".to_owned(),
+            ],
+            Projection::KeyHistory,
+        ),
+        "pack" => {
+            let mut args = vec![
+                "pack".to_owned(),
+                file("pack"),
+                "--anchor".to_owned(),
+                file("root.pub"),
+                "--json".to_owned(),
+            ];
+            if has("anchors.json") {
+                args.extend(["--known-anchors".to_owned(), file("anchors.json")]);
+            }
+            if has("changes.json") {
+                args.extend(["--changes".to_owned(), file("changes.json")]);
+            }
+            (args, Projection::Pack)
+        }
+        other => return Adapted::Skip(format!("no adapter for corpus command {other}")),
+    };
+    Adapted::Run(Case {
+        args,
+        expected,
+        projection,
+    })
+}
+
+fn key_history_file(input: &Value, scratch: &Scratch) -> (String, String) {
+    let history = json!({"genesis": input["genesis"], "successions": input["successions"]});
+    (
+        scratch.json("key-history.json", &history),
+        input["root_public_key"]
+            .as_str()
+            .unwrap_or(NO_KEY)
+            .to_owned(),
+    )
+}
+
+fn history_export_case(v: &Value, scratch: &Scratch) -> Adapted {
+    let input = &v["input"];
+    let (history, root) = key_history_file(input, scratch);
+    Adapted::Run(Case {
+        args: vec![
+            "export".to_owned(),
+            scratch.file("export.jsonl", input["lines"].as_str().unwrap_or_default()),
+            "--key-history".to_owned(),
+            history,
+            "--root-key".to_owned(),
+            root,
+            "--executor-keys".to_owned(),
+            scratch.json("keys.json", &input["executor_keys"]),
+            "--json".to_owned(),
+        ],
+        expected: v["expected"].clone(),
+        projection: Projection::CorpusExport,
+    })
+}
+
+fn key_history_case(v: &Value, scratch: &Scratch) -> Adapted {
+    let (history, root) = key_history_file(&v["input"], scratch);
+    Adapted::Run(Case {
+        args: vec![
+            "key-history".to_owned(),
+            history,
+            "--root-key".to_owned(),
+            root,
+            "--json".to_owned(),
+        ],
+        expected: v["expected"].clone(),
+        projection: Projection::KeyHistory,
+    })
+}
+
+fn pack_case(v: &Value, scratch: &Scratch) -> Adapted {
+    let input = &v["input"];
+    for (path, text) in input["files"].as_object().into_iter().flatten() {
+        scratch.file(&format!("pack/{path}"), text.as_str().unwrap_or_default());
+    }
+    let mut args = vec![
+        "pack".to_owned(),
+        scratch
+            .path()
+            .join("pack")
+            .to_str()
+            .unwrap_or_default()
+            .to_owned(),
+        "--anchor".to_owned(),
+        input["root_public_key"]
+            .as_str()
+            .unwrap_or(NO_KEY)
+            .to_owned(),
+        "--json".to_owned(),
+    ];
+    if !input["held_anchors"].is_null() {
+        args.extend([
+            "--known-anchors".to_owned(),
+            scratch.json("anchors.json", &input["held_anchors"]),
+        ]);
+    }
+    if input.get("changes").is_some_and(|c| !c.is_null()) {
+        let changes = json!({ "changes": input["changes"] });
+        args.extend([
+            "--changes".to_owned(),
+            scratch.json("changes.json", &changes),
+        ]);
+    }
+    Adapted::Run(Case {
+        args,
+        expected: v["expected"].clone(),
+        projection: Projection::Pack,
+    })
+}
+
 /// A vector of a suite as a run of the binary.
 pub fn adapt(suite: &str, v: &Value, scratch: &Scratch) -> Adapted {
     match (suite, v["kind"].as_str().unwrap_or_default()) {
+        // 1.5.0: the audit suite's exports carry the NA's key history.
+        ("audit", "verify_export") => history_export_case(v, scratch),
+        ("audit", "key_history") => key_history_case(v, scratch),
+        ("audit", "pack") => pack_case(v, scratch),
         (_, "verify_export") => export_case(v, scratch, Projection::Export),
         ("field_registry", "export") => export_case(v, scratch, Projection::ExportFailures),
         (_, "verify_decision") => decision_case(v, scratch),
@@ -301,5 +457,50 @@ pub fn project(case: &Case, run: &Run) -> Value {
             json!({ "valid": !refused })
         }
         Projection::CliOutput => json!({"exit_code": run.code, "output": out}),
+        Projection::CorpusExport => {
+            let failures: Vec<Value> = out["failures"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|f| json!({"store_sequence": f["store_sequence"], "reason": f["reason"]}))
+                .collect();
+            if case.expected.get("verified").is_some() {
+                json!({"verified": out["verified"], "failures": failures})
+            } else {
+                json!({ "failures": failures })
+            }
+        }
+        Projection::KeyHistory => json!({
+            "verified": out["verified"],
+            "failures": out["failures"].as_array().into_iter().flatten()
+                .map(|f| json!({"key_sequence": f["key_sequence"], "reason": f["reason"]}))
+                .collect::<Vec<_>>(),
+            "keys": out.get("keys").cloned().unwrap_or(json!([])),
+        }),
+        Projection::Pack => {
+            let set = |key: &str| -> Value {
+                let set: BTreeSet<String> = out[key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|f| f["reason"].as_str().map(str::to_owned))
+                    .collect();
+                json!(set)
+            };
+            let mut got = json!({
+                "verified": out["verified"],
+                "reasons": set("failures"),
+                "warnings": set("warnings"),
+            });
+            if let Some(completeness) = out.get("completeness") {
+                got["unmatched_changes"] = json!(completeness["unmatched_changes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|c| c["index"].clone())
+                    .collect::<Vec<_>>());
+            }
+            got
+        }
     }
 }

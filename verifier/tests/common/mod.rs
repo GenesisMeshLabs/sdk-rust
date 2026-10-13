@@ -90,6 +90,7 @@ pub fn run<S: AsRef<str>>(args: &[S]) -> Run {
 pub fn fixture(name: &str) -> Value {
     let text = match name {
         "anchors" => include_str!("../../../tests/fixtures/anchors.json"),
+        "audit" => include_str!("../../../tests/fixtures/audit.json"),
         "canonical" => include_str!("../../../tests/fixtures/canonical.json"),
         "field_registry" => include_str!("../../../tests/fixtures/field_registry.json"),
         "out_of_band" => include_str!("../../../tests/fixtures/out_of_band.json"),

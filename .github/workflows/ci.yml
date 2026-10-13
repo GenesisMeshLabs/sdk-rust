@@ -65,7 +65,7 @@ jobs:
           path: core
       - name: The signing vectors are the core's
         run: |
-          for suite in admin_auth field_registry canonical out_of_band; do
+          for suite in admin_auth field_registry canonical out_of_band remediation audit; do
             if [ -f "core/conformance/vectors/$suite.json" ]; then
               cmp "core/conformance/vectors/$suite.json" "tests/fixtures/$suite.json"
             else
@@ -79,6 +79,25 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -e ./core
+      # 1.5.0: the frozen audit pack is the core's, byte for byte.
+      - name: The frozen audit pack is the core's
+        run: |
+          if [ -d core/conformance/fixtures/audit-pack-1.5.0 ]; then
+            diff -r core/conformance/fixtures/audit-pack-1.5.0 tests/fixtures/audit-pack-1.5.0
+          else
+            echo "::notice::The core revision has no frozen 1.5.0 pack yet; skipped."
+          fi
+      # genesis-mesh-verify against the core's verification corpus, generated
+      # from the same core revision; every case must have an adapter.
+      - name: genesis-mesh-verify against the reference corpus
+        run: |
+          if [ -f core/scripts/export_reference_corpus.py ]; then
+            python core/scripts/export_reference_corpus.py --suite verification --out "$RUNNER_TEMP/corpus"
+            export GM_VERIFY_CORPUS="$RUNNER_TEMP/corpus/verification" GM_VERIFY_CORPUS_STRICT=1
+            cargo test --locked -p genesis-mesh-verify --test differential -- --nocapture
+          else
+            echo "::notice::The core revision has no verification corpus yet; skipped."
+          fi
       - name: Governed-action lifecycle against a live NA
         run: cargo test --locked --test live_na -- --nocapture
         env:

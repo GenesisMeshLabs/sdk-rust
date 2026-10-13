@@ -92,6 +92,38 @@ pub fn executor_keys(path: &Path) -> Result<Vec<Value>, Stop> {
     Ok(rows)
 }
 
+/// Every file of an audit pack directory, by its `/`-separated path, as
+/// bytes (the reference's `read_pack_dir`).
+pub fn pack_files(dir: &Path) -> Result<std::collections::BTreeMap<String, Vec<u8>>, Stop> {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        files: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), Stop> {
+        for entry in fs::read_dir(dir).map_err(|e| unreadable(dir, e))? {
+            let path = entry.map_err(|e| unreadable(dir, e))?.path();
+            if path.is_dir() {
+                walk(root, &path, files)?;
+            } else if path.is_file() {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                let name: Vec<String> = relative
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                let data = fs::read(&path).map_err(|e| unreadable(&path, e))?;
+                files.insert(name.join("/"), data);
+            }
+        }
+        Ok(())
+    }
+    if !dir.is_dir() {
+        return Err(unreadable(dir, "not a directory"));
+    }
+    let mut files = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut files)?;
+    Ok(files)
+}
+
 /// Anchors held out of band: a directory written by `genesis-mesh evidence
 /// anchors fetch` (`anchor-*.json`, an empty file is an interrupted write
 /// and holds none), or a JSON or JSON Lines file. In `anchor_sequence`
