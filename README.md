@@ -617,7 +617,8 @@ read a mismatch.
 ### In the library
 
 - **Key succession** (`key_history`): `verify_key_history` verifies a genesis
-  block and its `KeySuccessionRecord`s from the root key held, in the
+  block and its `KeySuccessionRecord`s (each signed by the root key, the new
+  key and the outgoing key) from the root key held, in the
   reference's order and with its reason codes, and gives the `NaKeyHistory`:
   which NA key is valid when (`NaKey::accepts`, with the 300-second
   hand-over). `NaKeys` is either keys valid at every time or the history.
@@ -632,9 +633,10 @@ read a mismatch.
   archived decision verifies at any later audit. It is off by default: a
   decision about to be acted on is still judged as of now.
 - **Audit packs** (`audit_pack`): `verify_audit_pack` checks a pack as
-  `genesis-mesh audit verify` does; `differences_from_pack_checks` and
-  `differences_from_report` compare the result with what the pack says of
-  itself; `parse_changes` and `check_completeness` are the completeness check.
+  `genesis-mesh audit verify` does, `render_report` renders its `report.md`
+  byte for byte, and `differences_from_pack_checks` compares the result with
+  the pack's own `checks.json`; `parse_changes` and `check_completeness` are
+  the completeness check.
   `VerifyEvidenceOptions::prior` verifies a range with a pack's cited records
   as its predecessors (`cited_record_missing`).
 - **New entry kinds**: `key_succession` and `archive` entries verify in an

@@ -115,7 +115,12 @@ The same checks, options and JSON as `genesis-mesh evidence verify-export`:
   (by default the one the export holds, if it starts right after one);
 - `--partial`: the export is a deliberate slice, so its ends are not checked
   against the anchors;
-- `--from-anchor`: the export starts right after a held anchor.
+- `--from-anchor`: the export starts right after a held anchor;
+- `--cited <file>`: the entries before the export that its records rest on
+  (a pack's `cited.jsonl`): the export is then verified as a pack's range,
+  every chain from its start, and a record it cites that neither holds is
+  `cited_record_missing`. No checkpoint is taken from the export then; give
+  one with `--checkpoint`.
 
 ### An audit pack
 
@@ -129,21 +134,35 @@ The checks, reason codes and JSON of `genesis-mesh audit verify` (the core's
 
 - `--anchor <key>`: the root public key you hold (required): the NA's keys
   are accepted only through the key history, from the root key down;
-- `--known-anchors <path>`: the anchors you hold. Unlike `audit verify`, it
-  may be left out: the pack then proves its integrity, not that nothing was
-  removed, and the result carries the warning `no_held_anchors`;
+- `--known-anchors <path>`: the anchors you hold. Without them the pack proves
+  its integrity, not that nothing was removed: the result carries the
+  warning `no_held_anchors`, and `--require-anchors` makes their absence fail;
+- `--prior <dir>` (repeatable): a pack verified before, from the same root key
+  and anchors; it must verify itself, and the entries this pack cites must
+  equal the ones it holds (`cited_entry_mismatch`). `--prior-entries <file>`
+  gives the same as JSON (`{"<store position>": "<entry digest>"}`). A cited
+  entry that neither a prior pack nor a held anchor covers is a warning,
+  `cited_entry_unanchored`: its signature verifies, its place in the store
+  is not proven;
+- `--period <from> <until>`: two RFC 3339 times; the pack must cover them
+  (`pack_period_not_covered`);
+- `--report <file>`: writes the report this verification renders, from what
+  it verified;
 - `--executor-keys <file>`: executor keys you hold, for a store without
   registry records (the pack's own `keys/executor-keys.json` is never
-  trusted);
+  trusted, and a key the pack's registry records place wins);
 - `--changes <file>`: changes from a log outside Genesis Mesh (CSV with a
-  header row, or JSON), matched against the pack (`change_unmatched`);
-  `--tolerance-seconds` (default 300) bounds how far apart a change and its
-  record may be.
+  header row, or JSON; times in strict RFC 3339, fields strings or null),
+  matched against the pack (`change_unmatched`; warnings
+  `changes_outside_period` and `change_duplicate`); `--tolerance-seconds`
+  (default 300) bounds how far apart a change and its record may be.
 
-The result also lists `report_differences`: where this verification differs
-from the NA's own checks in the pack, `checks.json` (`verified`, the sorted
-reason codes, a count) and, beyond `audit verify`, what `report.md` says
-(fields starting with `report.md`). A difference is not a failure by itself:
+`report.md` is normative: the verifier renders the report from the pack's
+files (the manifest, the entries, `checks.json`, `states.json`) byte for byte
+and fails a pack whose report says anything else (`report_mismatch`); the
+lines that differ are in `report_differences`. `check_differences` lists where
+this verification differs from the NA's own checks in `checks.json`
+(`verified`, the sorted reason codes, a count): not a failure by itself, since
 the NA checked the pack against its own anchors.
 
 ### A key history
@@ -166,6 +185,9 @@ hand-over).
 | 3 | An input could not be read: missing, not UTF-8, not strict JSON, or not the document it should be |
 | 4 | Not available in this version (no command uses it in 1.5.0) |
 
+`pack` also exits 1 when `--require-anchors` is given without anchors, or a
+`--prior` pack does not verify.
+
 Anything but 0 means the input is not verified. A genuine decision that denies
 its action is verified (0): `authorized` is `false` and the reason is the
 reference's `unauthorized_...` code.
@@ -178,7 +200,8 @@ counts, `failures` with `store_sequence`, `reason` and `detail`, `warnings`,
 and `anchors` with `--known-anchors`); `pack` prints the reference's
 `audit verify --format json` (`verified`, `failures` and `warnings` with
 `file`, `store_sequence`, `reason` and `detail`, `counts`, `range`, `keys`,
-`anchors`, `completeness`, `report_differences`); `key-history` prints
+`anchors`, `period`, `completeness`, `report_differences` when the report
+differs, and `check_differences`); `key-history` prints
 `verified`, `failures` and `keys`. A key history given with `--key-history`
 that does not verify fails the record or export (exit 1) with its reason. A
 usage or input error prints `{"error": {"exit_code", "message"}}`.
@@ -196,7 +219,7 @@ the same reason codes, in the same order: fields the crate does not know
 | Signed by | Kinds |
 |---|---|
 | The NA (`--key-history` or `--na-key`) | `decision`, `justification`, `checkpoint`, `judgement`, `quarantine`, `registry`, `review`, `archive`, `policy`, `attestation` |
-| The root key and the outgoing NA key (`--key-history`) | `key-succession` |
+| The root key, the new key and the outgoing NA key (`--key-history`) | `key-succession` |
 | An executor key of the record's sovereign (`--executor-keys`) | `execution`, `break-glass`, `remediation` |
 | An observer key of the record's sovereign (`--executor-keys`) | `observation` |
 
@@ -225,15 +248,45 @@ time the verifier runs.
 
 With the NA's key history, an NA signature must be made by the key valid at
 the record's own time; a signature by another key of the history is
-`na_key_not_valid_at_time`. The record's time is a store entry's
-`recorded_at`, an anchor's `anchored_at`, a retention checkpoint read alone
-or a manifest's `created_at`, a policy's or an attestation's `issued_at`,
-and a decision verified alone its `decision_made_at`. Another record read
-alone with `record` has no time the specification names and is accepted
-under any key of the history; in an export it is judged at its entry's
-`recorded_at`. A key succession entry must be signed by its outgoing key and
-the root key, and be one of the history's successions
-(`succession_invalid_root_signature`, `succession_not_in_history`).
+`na_key_not_valid_at_time`. In the store every entry is placed at its
+`recorded_at`, and its key must also be valid at the latest `recorded_at`
+before it in store order. Read alone, a record is placed at its own time:
+
+| Record | Placed at |
+|---|---|
+| Decision | `decision_made_at` |
+| Policy, attestation, treaty | `issued_at` |
+| Retention checkpoint, audit pack manifest | `created_at` |
+| Justification | `proof_issued_at` |
+| Judgement | `judged_at` |
+| Quarantine record | `quarantined_at` |
+| Registry record | `effective_at` |
+| Review | `decided_at` |
+| Archive record | `archived_at` |
+| Store anchor | `anchored_at` |
+
+A decision signed by a key that was later succeeded (or expired) may stay
+valid no longer than that key's end, the 300-second hand-over and the
+300-second lifetime cap of a decision (`decision_outlives_key`). In a
+contiguous export each entry is recorded no more than 300 seconds before an
+earlier one (`recorded_at_out_of_order`), except the registry, key succession
+and archive entries retention carries forward after its checkpoint.
+
+A key succession carries three signatures: the root key's, the new key's
+(proof that the new key is held) and the outgoing key's. In the key history
+it must name a key the history never held and not the root key
+(`succession_key_reused`) and be issued no later than it takes effect
+(`succession_backdated`); in the store it must also be one of the history's
+successions (`succession_not_in_history`) and be recorded at least 60 seconds
+before it takes effect (`succession_backdated`). The genesis block is held to
+the rules of every signed record (`unknown_field`, `non_canonical_form`).
+
+Executor and observer keys verify only records after their registration and
+before their retirement, where the store placed them
+(`evidence_unknown_executor`, `evidence_executor_key_retired`). A retention
+checkpoint, and every record kind from 1.3.0 on, with a field outside its
+signature is `payload_invalid`; a justification or execution evidence only
+warns `unsigned_field`.
 
 ### An export
 
@@ -252,29 +305,41 @@ outside the NA: the anchors' signatures, chain and positions
 
 ### An audit pack
 
-`pack` runs the six check groups of `audit verify`, in order, with its
-reason codes:
+`pack` runs the checks of `audit verify`, in order, with its reason codes:
 
 1. the manifest (`manifest_missing`, `manifest_invalid`,
-   `manifest_file_missing`, `manifest_digest_mismatch`,
-   `manifest_unlisted_file`, `manifest_invalid_signature`); a pack whose
+   `manifest_unknown_file`, `manifest_file_missing`,
+   `manifest_digest_mismatch`, `manifest_unlisted_file`); a pack whose
    manifest fails is not checked further;
 2. the key history from the root key (`key_history_invalid`,
    `genesis_invalid`, `genesis_root_mismatch`, `genesis_invalid_signature`,
-   the succession reasons); a history that fails stops it;
+   the succession reasons), then the manifest's signature as received, by the
+   key valid at its `created_at` (`manifest_invalid_signature`,
+   `na_key_not_valid_at_time`, `unknown_field`, `non_canonical_form`); a
+   history that fails stops it;
 3. the anchors (the anchor reasons, `pack_end_anchor_mismatch`,
-   `pack_end_anchor_not_held`, `pack_start_not_tied`,
-   `pack_start_anchor_not_held`, and the range against the anchors held);
+   `pack_end_anchor_not_held`, `pack_start_not_tied`, `manifest_backdated`,
+   and the range against the anchors held), then each cited entry against a
+   prior pack or a held anchor (`cited_entry_mismatch`, warning
+   `cited_entry_unanchored`);
 4. the entries (`entries_invalid`, `pack_range_mismatch`,
    `cited_out_of_range`, then every export reason, with the cited records as
-   the range's predecessors and `cited_record_missing` for what neither
+   the range's predecessors, the chains a cited retention checkpoint pruned
+   continuing from its heads, and `cited_record_missing` for what neither
    holds);
-5. what the records rest on outside the store (`cited_trust_invalid`,
-   `policy_invalid_signature`, `treaty_invalid_signature`,
-   `attestation_invalid_signature`, `feed_invalid_signature`,
-   `cited_policy_missing`, `cited_policy_mismatch`,
+5. what the records rest on outside the store, each checked as received
+   (`cited_trust_invalid`, `policy_invalid_signature`,
+   `treaty_invalid_signature`, `attestation_invalid_signature`,
+   `feed_invalid_signature`, `cited_policy_missing`, `cited_policy_mismatch`,
    `cited_attestation_missing`, `cited_attestation_mismatch`);
-6. with `--changes`, the completeness check (`change_unmatched`).
+6. the report (`report_mismatch`);
+7. with `--period`, the period (`pack_period_not_covered`);
+8. with `--changes`, the completeness check (`change_unmatched`; warnings
+   `changes_outside_period`, `change_duplicate`). The period runs from the
+   start anchor (or the checkpoint the range starts after, or its first
+   entry) to the end anchor; repeated (source, event id) pairs are set aside;
+   an event-id match must agree on resource and action; the rest are paired
+   per resource and action, most pairs and then least total distance first.
 
 The library offers the same as `audit_pack::verify_audit_pack`.
 
@@ -362,9 +427,11 @@ reference's vectors (`tests/fixtures`, the `audit` suite's packs, key
 histories and exports among them) and compares each verdict and reason code
 with the reference's. `GM_VERIFY_CORPUS=<dir>` also runs the core's
 verification corpus: the `verification/` directory the core's
-`scripts/export_reference_corpus.py --suite verification` writes (115 cases
+`scripts/export_reference_corpus.py --suite verification` writes (169 cases
 in 1.5.0: one signed record of every kind, valid and in each way refused,
-exports across a key succession, key histories and packs), and checks that
+exports across a key succession, ranges with their cited entries, key
+histories, packs, changes files and the time each record is read at), and
+checks that
 the suites it copies are this crate's fixtures. `GM_VERIFY_BINARY=<path>`
 runs a release binary instead of the one cargo built:
 
