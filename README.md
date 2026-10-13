@@ -591,6 +591,44 @@ rules are in `remediation` (`remediation_plan`, `decision_plan`,
 `rfc3339`, `emergency_map`), checked by the shared conformance suite
 `remediation`.
 
+## Independent verification
+
+From Genesis Mesh 1.5.0 an auditor verifies records and evidence exports on
+its own machines, years later, with `genesis-mesh-verify`: a static Linux
+binary built from this crate's `verify` module, released with checksums and
+Sigstore bundles, and reproducible from source. It never needs a private key
+and never contacts a network. "Independent" means separate code by the same
+project: a difference from the Python reference is a bug in one of them.
+
+```sh
+genesis-mesh-verify record decision decision.json --na-key na.pub
+genesis-mesh-verify record execution evidence.json --executor-keys executor-keys.json
+genesis-mesh-verify export export.jsonl --na-key na.pub \
+    --executor-keys executor-keys.json --known-anchors anchors/ --json
+```
+
+Exit codes: 0 verified, 1 not verified, 2 usage error, 3 an input could not
+be read, 4 not available in this version (`pack`, until the audit pack format
+is final). [docs/verifier.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/docs/verifier.md)
+says what is checked, how to rebuild a release and compare digests, and how to
+read a mismatch.
+
+### In the library
+
+- `verify::verify_record(kind, record, options)` verifies one record as an
+  export verifies it, with the same reason codes: every entry kind, a policy
+  or an attestation. A decision's expiry is judged as of its own time unless
+  `VerifyRecordOptions::at` names one.
+- `VerifyDecisionOptions::as_of_record_time` judges a decision's expiry as of
+  its `decision_made_at` instead of now, so an archived decision verifies at
+  any later audit. It is off by default: a decision about to be acted on is
+  still judged as of now.
+- Store anchors, as the reference checks them: `verify::verify_store_anchors`
+  (signatures, chain, positions), `verify::check_events_against_anchors` (an
+  export tied to the anchors held at both ends), `verify::parse_anchors` and
+  `verify::export_checkpoint`; `canonical::anchor_canonical` and
+  `canonical::anchor_digest`.
+
 ## Transport and errors
 
 Construct one client and clone it for concurrent work. Clones and sub-clients share
@@ -646,15 +684,19 @@ signed. `ClientOptions` debug output redacts the seed.
 ```sh
 python scripts/check_release.py
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
 cargo test --locked --doc
-cargo doc --locked --no-deps
+cargo doc --locked --workspace --no-deps
 cargo package --locked
 ```
 
-CI tests stable Rust on Linux, Windows, and macOS plus Rust 1.85 on Linux, checks
-release metadata and packaging, and audits dependencies with `cargo audit`.
+The workspace holds the crate and `genesis-mesh-verify` (`verifier/`, not
+published to crates.io). CI tests stable Rust on Linux, Windows, and macOS plus
+Rust 1.85 on Linux, checks release metadata and packaging, and audits
+dependencies with `cargo audit`. The `Verifier` workflow builds the static
+binaries twice and compares them, checks they need no shared library, and runs
+the verifier's tests against them without a network.
 See [CONTRIBUTING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/CONTRIBUTING.md), [RELEASING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/RELEASING.md), and
 [SECURITY.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/SECURITY.md).
 

@@ -35,6 +35,11 @@ sdk-rust/
     outbox.rs      # evidence and record outboxes
     governance.rs  # governed_action, governed_action_with_break_glass, rotate_forward_then_disable, summarize_decision
     lib.rs         # public exports
+  verifier/        # genesis-mesh-verify (1.5.0): the offline verifier binary, a workspace member
+    src/           # command line only; verification is the crate's verify module
+    clippy.toml    # refuses network and signing code in the binary
+    tests/         # CLI tests and the differential harness (adapter/ reads reference vectors)
+  scripts/build_verifier.sh  # the reproducible static release build
   Cargo.toml
 ```
 
@@ -78,10 +83,14 @@ Run before committing:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
 cargo test --locked --doc
 ```
+
+`genesis-mesh-verify` never needs a private key and never contacts a network:
+keep the binary's code to the crate's offline modules (`verify`, `canonical`,
+`strict`, strict JSON); `verifier/clippy.toml` and its tests refuse the rest.
 
 Rust can be validated through Docker when native tooling is unavailable.
 Record the actual toolchain and platform used; Linux container checks do not

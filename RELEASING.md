@@ -1,6 +1,7 @@
 # Release checklist
 
-1. Update `Cargo.toml`, `VERSION`, `Cargo.lock`, the changelog, and supported
+1. Update `Cargo.toml`, `verifier/Cargo.toml` (genesis-mesh-verify ships at the
+   crate's version), `VERSION`, `Cargo.lock`, the changelog, and supported
    versions in `SECURITY.md` together. Move reviewed changes out of `Unreleased`.
 2. Run the checks in the README, including `python scripts/check_release.py`.
    Inspect `cargo package --list` for unintended files and run `cargo audit`.
@@ -13,7 +14,11 @@
    release `v<VERSION>` is tagged: `python scripts/check_release.py --publish`
    checks the tag, then `cargo publish --locked`. Tag that exact commit as
    `v<VERSION>`. The tag CI checks its version and the core tag, runs the crate
-   against that core release, and only then creates the GitHub release.
+   against that core release, and only then creates the GitHub release. The
+   `Verifier` workflow builds the static `genesis-mesh-verify` binaries for the
+   tag, signs them (Sigstore) and attaches them, their checksums and build
+   info to that release; check that a rebuild reproduces their digests
+   (docs/verifier.md).
 7. Verify the registry artifact and docs.rs build, then update installation
    instructions with the published version. Test installation in a fresh project.
 
