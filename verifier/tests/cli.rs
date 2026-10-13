@@ -446,7 +446,12 @@ fn the_frozen_pack_verifies_and_agrees_with_its_own_checks() {
     ])
     .json();
     assert_eq!(out["verified"], true);
-    assert_eq!(out["report_differences"], json!([]));
+    assert_eq!(out["check_differences"], json!([]));
+    assert!(out.get("report_differences").is_none(), "{out}");
+    assert!(
+        out["period"]["from"].is_string() && out["period"]["until"].is_string(),
+        "{out}"
+    );
     assert_eq!(out["counts"]["key_successions"], 1);
     assert_eq!(out["keys"].as_array().unwrap().len(), 2);
     // Without held anchors: the pack's integrity only, said as a warning.
@@ -615,4 +620,116 @@ fn a_key_history_verifies_from_the_root_key_held() {
     ]);
     assert_eq!(r.code, 1);
     assert_eq!(r.json()["failures"][0]["reason"], "genesis_root_mismatch");
+}
+
+/// 1.5.0 review fixes: anchors can be required, a period asked for, the
+/// cited entries checked against packs verified before, and the report a
+/// verification renders written out.
+#[test]
+fn a_pack_is_checked_against_what_the_auditor_holds() {
+    let (scratch, pack, root, anchors) = frozen_pack("options");
+    // Without anchors, --require-anchors fails (exit 1).
+    let r = run(&["pack", &pack, "--anchor", &root, "--require-anchors"]);
+    assert_eq!(r.code, 1, "{}", r.stderr);
+    assert!(r.stderr.contains("--require-anchors"));
+    // A period the pack does not cover.
+    let wide = run(&[
+        "pack",
+        &pack,
+        "--anchor",
+        &root,
+        "--known-anchors",
+        &anchors,
+        "--json",
+        "--period",
+        "2020-01-01T00:00:00Z",
+        "2030-01-01T00:00:00Z",
+    ]);
+    assert_eq!(wide.code, 1);
+    assert_eq!(
+        wide.json()["failures"][0]["reason"],
+        "pack_period_not_covered"
+    );
+    assert_eq!(wide.json()["period"]["asked_from"], "2020-01-01T00:00:00Z");
+    // A cited entry that differs from the one a prior pack holds.
+    let cited = std::fs::read_to_string(format!("{pack}/cited.jsonl")).unwrap();
+    let first: Value = serde_json::from_str(cited.lines().next().unwrap()).unwrap();
+    let position = first["entry"]["store_sequence"]
+        .as_i64()
+        .unwrap()
+        .to_string();
+    let prior = scratch.json("prior.json", &json!({ position: "0".repeat(64) }));
+    let r = run(&[
+        "pack",
+        &pack,
+        "--anchor",
+        &root,
+        "--known-anchors",
+        &anchors,
+        "--prior-entries",
+        &prior,
+        "--json",
+    ]);
+    assert_eq!(r.code, 1);
+    let reasons: Vec<Value> = r.json()["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["reason"].clone())
+        .collect();
+    assert!(
+        reasons.contains(&json!("cited_entry_mismatch")),
+        "{reasons:?}"
+    );
+    // A prior pack that does not verify is refused before anything else.
+    let (bad, bad_pack, _, _) = frozen_pack("bad-prior");
+    bad.file("pack/notes.txt", "added later");
+    let r = run(&[
+        "pack",
+        &pack,
+        "--anchor",
+        &root,
+        "--known-anchors",
+        &anchors,
+        "--prior",
+        &bad_pack,
+    ]);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("does not verify"), "{}", r.stderr);
+    // The report this verification renders.
+    let report = scratch.path().join("own-report.md");
+    let report_arg = report.to_str().unwrap().to_owned();
+    let r = run(&[
+        "pack",
+        &pack,
+        "--anchor",
+        &root,
+        "--known-anchors",
+        &anchors,
+        "--report",
+        &report_arg,
+    ]);
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    let text = std::fs::read_to_string(&report).unwrap();
+    assert!(text.contains(
+        "Verified by this verifier, from the root key and the anchors it holds: **yes**."
+    ));
+    // The pack's range, verified as an export with the entries it cites.
+    let r = run(&[
+        "export",
+        &format!("{pack}/entries.jsonl"),
+        "--cited",
+        &format!("{pack}/cited.jsonl"),
+        "--key-history",
+        &scratch.json("history.json", &json!({
+            "genesis": serde_json::from_str::<Value>(&std::fs::read_to_string(format!("{pack}/genesis.json")).unwrap()).unwrap(),
+            "successions": serde_json::from_str::<Value>(&std::fs::read_to_string(format!("{pack}/keys/na-key-history.json")).unwrap()).unwrap()["successions"],
+        })),
+        "--root-key",
+        &root,
+        "--executor-keys",
+        &format!("{pack}/keys/executor-keys.json"),
+        "--json",
+    ]);
+    assert_eq!(r.code, 0, "{}", r.stdout);
 }

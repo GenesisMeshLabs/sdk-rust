@@ -60,6 +60,13 @@ pub struct Case {
 /// A vector the binary runs, or why it does not.
 pub enum Adapted {
     Run(Case),
+    /// A case of the library alone, not of the binary's command line (a
+    /// changes file read, a record's time field): what it gave, and what the
+    /// reference expects.
+    Computed {
+        got: Value,
+        expected: Value,
+    },
     Skip(String),
 }
 
@@ -264,7 +271,56 @@ pub fn adapt_corpus(case: &Value, dir: &Path) -> Adapted {
             if has("changes.json") {
                 args.extend(["--changes".to_owned(), file("changes.json")]);
             }
+            if has("period.json") {
+                let text = std::fs::read_to_string(path.join("period.json")).unwrap_or_default();
+                let period: Value = serde_json::from_str(&text).unwrap_or_default();
+                args.extend([
+                    "--period".to_owned(),
+                    period["from"].as_str().unwrap_or_default().to_owned(),
+                    period["until"].as_str().unwrap_or_default().to_owned(),
+                ]);
+            }
+            if has("prior-entries.json") {
+                args.extend(["--prior-entries".to_owned(), file("prior-entries.json")]);
+            }
             (args, Projection::Pack)
+        }
+        // 1.5.0 review fixes: a pack's range, with the entries it cites.
+        "range" => (
+            vec![
+                "export".to_owned(),
+                file("export.jsonl"),
+                "--cited".to_owned(),
+                file("cited.jsonl"),
+                "--key-history".to_owned(),
+                file("key-history.json"),
+                "--root-key".to_owned(),
+                file("root.pub"),
+                "--executor-keys".to_owned(),
+                file("executor-keys.json"),
+                "--json".to_owned(),
+            ],
+            Projection::CorpusExport,
+        ),
+        // A changes file read (the library's reader, which `pack --changes`
+        // uses), and the time field a record read alone is placed at.
+        "changes" => {
+            let csv = has("changes.csv");
+            let name = if csv { "changes.csv" } else { "changes.json" };
+            let text = std::fs::read_to_string(path.join(name)).unwrap_or_default();
+            return Adapted::Computed {
+                got: changes_read(&text, csv),
+                expected,
+            };
+        }
+        "record-time" => {
+            let text = std::fs::read_to_string(path.join("model.json")).unwrap_or_default();
+            let model: Value = serde_json::from_str(&text).unwrap_or_default();
+            let model = model["model"].as_str().unwrap_or_default();
+            return Adapted::Computed {
+                got: json!({"field": genesis_mesh_sdk::key_history::na_record_time_field(model)}),
+                expected,
+            };
         }
         other => return Adapted::Skip(format!("no adapter for corpus command {other}")),
     };
@@ -354,11 +410,64 @@ fn pack_case(v: &Value, scratch: &Scratch) -> Adapted {
             scratch.json("changes.json", &changes),
         ]);
     }
+    if let Some(period) = input.get("period").and_then(Value::as_array) {
+        args.extend([
+            "--period".to_owned(),
+            period[0].as_str().unwrap_or_default().to_owned(),
+            period[1].as_str().unwrap_or_default().to_owned(),
+        ]);
+    }
+    if let Some(prior) = input
+        .get("prior_entries")
+        .filter(|p| p.as_object().is_some_and(|o| !o.is_empty()))
+    {
+        args.extend([
+            "--prior-entries".to_owned(),
+            scratch.json("prior.json", prior),
+        ]);
+    }
     Adapted::Run(Case {
         args,
         expected: v["expected"].clone(),
         projection: Projection::Pack,
     })
+}
+
+fn range_case(v: &Value, scratch: &Scratch) -> Adapted {
+    let input = &v["input"];
+    let (history, root) = key_history_file(input, scratch);
+    Adapted::Run(Case {
+        args: vec![
+            "export".to_owned(),
+            scratch.file("export.jsonl", input["lines"].as_str().unwrap_or_default()),
+            "--cited".to_owned(),
+            scratch.file(
+                "cited.jsonl",
+                input["cited_lines"].as_str().unwrap_or_default(),
+            ),
+            "--key-history".to_owned(),
+            history,
+            "--root-key".to_owned(),
+            root,
+            "--executor-keys".to_owned(),
+            scratch.json("keys.json", &input["executor_keys"]),
+            "--json".to_owned(),
+        ],
+        expected: v["expected"].clone(),
+        projection: Projection::CorpusExport,
+    })
+}
+
+/// A changes file as the reference's corpus reads it: refused, or the
+/// changes read.
+fn changes_read(text: &str, csv: bool) -> Value {
+    match genesis_mesh_sdk::audit_pack::parse_changes(text, csv) {
+        Err(_) => json!({"refused": true}),
+        Ok(read) => json!({
+            "refused": false,
+            "changes": read.iter().map(|c| c.to_json()).collect::<Vec<_>>(),
+        }),
+    }
 }
 
 /// A vector of a suite as a run of the binary.
@@ -368,6 +477,14 @@ pub fn adapt(suite: &str, v: &Value, scratch: &Scratch) -> Adapted {
         ("audit", "verify_export") => history_export_case(v, scratch),
         ("audit", "key_history") => key_history_case(v, scratch),
         ("audit", "pack") => pack_case(v, scratch),
+        ("audit", "verify_range") => range_case(v, scratch),
+        ("audit", "changes_file") => Adapted::Computed {
+            got: changes_read(
+                v["input"]["text"].as_str().unwrap_or_default(),
+                v["input"]["csv"] == true,
+            ),
+            expected: v["expected"].clone(),
+        },
         (_, "verify_export") => export_case(v, scratch, Projection::Export),
         ("field_registry", "export") => export_case(v, scratch, Projection::ExportFailures),
         (_, "verify_decision") => decision_case(v, scratch),
@@ -464,11 +581,19 @@ pub fn project(case: &Case, run: &Run) -> Value {
                 .flatten()
                 .map(|f| json!({"store_sequence": f["store_sequence"], "reason": f["reason"]}))
                 .collect();
+            let mut got = json!({ "failures": failures });
             if case.expected.get("verified").is_some() {
-                json!({"verified": out["verified"], "failures": failures})
-            } else {
-                json!({ "failures": failures })
+                got["verified"] = out["verified"].clone();
             }
+            if case.expected.get("warnings").is_some() {
+                got["warnings"] = json!(out["warnings"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|w| json!({"store_sequence": w["store_sequence"], "reason": w["reason"]}))
+                    .collect::<Vec<_>>());
+            }
+            got
         }
         Projection::KeyHistory => json!({
             "verified": out["verified"],
@@ -499,6 +624,9 @@ pub fn project(case: &Case, run: &Run) -> Value {
                     .flatten()
                     .map(|c| c["index"].clone())
                     .collect::<Vec<_>>());
+            }
+            if let Some(period) = out.get("period") {
+                got["period"] = json!({"from": period["from"], "until": period["until"]});
             }
             got
         }

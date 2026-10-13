@@ -47,11 +47,23 @@ export: verify a gm.evidence.event JSON Lines export.
   --partial                 the export is a deliberate slice: its ends are not
                             checked against the anchors
   --from-anchor             the export continues from a held anchor
+  --cited <file>            entries before the export that its records rest
+                            on (a pack's cited.jsonl): the export is then
+                            verified as a pack's range
 
 pack: verify an audit pack directory, as 'genesis-mesh audit verify' does.
   --anchor <key>            the root public key you hold (required)
   --known-anchors <path>    anchors you hold; without them the pack proves
                             its integrity, not that nothing was removed
+                            (warning no_held_anchors)
+  --require-anchors         fail when --known-anchors is not given
+  --prior <dir>             a pack verified before (repeatable): the entries
+                            this pack cites must equal the ones it holds
+  --prior-entries <file>    the same as JSON: each store position and the
+                            entry digest a prior pack holds there
+  --period <from> <until>   two RFC 3339 times: fail when the pack does not
+                            cover this period
+  --report <file>           write the report this verification renders
   --executor-keys <file>    executor keys you hold, for a store without
                             registry records
   --changes <file>          changes from a log outside Genesis Mesh (CSV, or
@@ -114,6 +126,7 @@ pub struct ExportArgs {
     pub from_anchor: bool,
     pub key_history: Option<PathBuf>,
     pub root_key: Option<String>,
+    pub cited: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -121,6 +134,11 @@ pub struct PackArgs {
     pub dir: PathBuf,
     pub root_key: String,
     pub known_anchors: Option<PathBuf>,
+    pub require_anchors: bool,
+    pub prior: Vec<PathBuf>,
+    pub prior_entries: Option<PathBuf>,
+    pub period: Option<(String, String)>,
+    pub report: Option<PathBuf>,
     pub executor_keys: Option<PathBuf>,
     pub changes: Option<PathBuf>,
     pub tolerance_seconds: i64,
@@ -285,6 +303,7 @@ pub fn parse(argv: &[String]) -> Result<Cli, Stop> {
                     "checkpoint",
                     "key-history",
                     "root-key",
+                    "cited",
                 ],
                 &["partial", "from-anchor"],
             )?;
@@ -299,19 +318,39 @@ pub fn parse(argv: &[String]) -> Result<Cli, Stop> {
                 from_anchor: parsed.flag("from-anchor"),
                 key_history: parsed.one("key-history")?.map(PathBuf::from),
                 root_key: parsed.one("root-key")?,
+                cited: parsed.one("cited")?.map(PathBuf::from),
             })
         }
         Some("pack") => {
+            // `--period` takes two values.
+            let mut rest: Vec<String> = Vec::new();
+            let mut period = None;
+            let mut tokens_left = tokens[1..].iter();
+            while let Some(token) = tokens_left.next() {
+                if token == "--period" {
+                    let (Some(from), Some(until)) = (tokens_left.next(), tokens_left.next()) else {
+                        return Err(Stop::Usage("--period needs two times: FROM UNTIL".into()));
+                    };
+                    if period.replace((from.clone(), until.clone())).is_some() {
+                        return Err(Stop::Usage("--period is given more than once".into()));
+                    }
+                } else {
+                    rest.push(token.clone());
+                }
+            }
             let parsed = split(
-                &tokens[1..],
+                &rest,
                 &[
                     "anchor",
                     "known-anchors",
+                    "prior",
+                    "prior-entries",
+                    "report",
                     "executor-keys",
                     "changes",
                     "tolerance-seconds",
                 ],
-                &[],
+                &["require-anchors"],
             )?;
             let usage = "pack <dir> --anchor <root key> [options]";
             let [dir] = positionals::<1>(&parsed, usage)?;
@@ -334,6 +373,11 @@ pub fn parse(argv: &[String]) -> Result<Cli, Stop> {
                 dir: dir.into(),
                 root_key,
                 known_anchors: parsed.one("known-anchors")?.map(PathBuf::from),
+                require_anchors: parsed.flag("require-anchors"),
+                prior: parsed.all("prior").into_iter().map(PathBuf::from).collect(),
+                prior_entries: parsed.one("prior-entries")?.map(PathBuf::from),
+                period,
+                report: parsed.one("report")?.map(PathBuf::from),
                 executor_keys: parsed.one("executor-keys")?.map(PathBuf::from),
                 changes: parsed.one("changes")?.map(PathBuf::from),
                 tolerance_seconds,
@@ -401,6 +445,7 @@ mod tests {
             "pack dir",
             "pack dir --anchor k --tolerance-seconds -1",
             "pack dir --anchor k --tolerance-seconds 90000",
+            "pack dir --anchor k --period 2026-01-01T00:00:00Z",
         ] {
             assert!(matches!(parse(&argv(line)), Err(Stop::Usage(_))), "{line}");
         }

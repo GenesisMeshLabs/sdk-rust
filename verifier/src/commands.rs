@@ -1,12 +1,12 @@
 //! The commands: each reads its inputs, verifies with the SDK's `verify`,
 //! `key_history` and `audit_pack` modules and prints the result.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use genesis_mesh_sdk::{
     audit_pack::{
-        differences_from_pack_checks, differences_from_report, parse_changes, verify_audit_pack,
-        VerifyPackOptions,
+        differences_from_pack_checks, pack_entry_digests, parse_changes, parse_rfc3339,
+        render_own_report, verify_audit_pack, VerifyPackOptions,
     },
     canonical::parse_timestamp,
     key_history::{verify_key_history, KeyHistoryVerification, NaKeyHistory},
@@ -214,9 +214,21 @@ fn export(args: &ExportArgs, json: bool) -> Result<u8, Stop> {
         Some(path) => input::executor_keys(path)?,
         None => Vec::new(),
     };
-    // An export that starts after a retention checkpoint continues from it.
+    // A pack's range: the entries before it that its records rest on.
+    let cited = match &args.cited {
+        Some(path) => Some(parse_export_lines(&input::text(path)?).map_err(|e| {
+            Stop::Unreadable(format!(
+                "cited entries {} are malformed: {e}",
+                path.display()
+            ))
+        })?),
+        None => None,
+    };
+    // An export that starts after a retention checkpoint continues from it
+    // (a range with cited entries: only the one given).
     let checkpoint = match &args.checkpoint {
         Some(path) => Some(input::object(path)?),
+        None if cited.is_some() => None,
         None => export_checkpoint(&events),
     };
     let anchors = match &args.known_anchors {
@@ -230,6 +242,7 @@ fn export(args: &ExportArgs, json: bool) -> Result<u8, Stop> {
     let options = VerifyEvidenceOptions {
         checkpoint,
         key_history,
+        prior: cited,
         ..VerifyEvidenceOptions::new(na_public_keys, executor_keys)
     };
     let mut result: EvidenceVerification = verify_evidence_events(&events, &options);
@@ -272,11 +285,64 @@ fn pack(args: &PackArgs, json: bool) -> Result<u8, Stop> {
     let files = input::pack_files(&args.dir)?;
     let held = match &args.known_anchors {
         Some(path) => Some(input::anchors(path)?),
-        None => None,
+        None if args.require_anchors => {
+            return Err(Stop::Failed(
+                "--require-anchors: give the anchors you hold with --known-anchors".into(),
+            ))
+        }
+        None => {
+            eprintln!(
+                "WARNING: no --known-anchors: this checks the pack's integrity, not that nothing was \
+                 removed from the store. Fetch the anchors with 'genesis-mesh evidence anchors fetch' \
+                 and keep them outside the NA."
+            );
+            None
+        }
     };
     let mut options = VerifyPackOptions::new(input::public_key(&args.root_key)?, held);
     if let Some(path) = &args.executor_keys {
         options.executor_keys = input::executor_keys(path)?;
+    }
+    if let Some((from, until)) = &args.period {
+        let time = |value: &str| {
+            parse_rfc3339(value).ok_or_else(|| {
+                Stop::Usage(format!("--period: {value:?} is not an RFC 3339 date-time"))
+            })
+        };
+        let (from, until) = (time(from)?, time(until)?);
+        if from > until {
+            return Err(Stop::Usage("--period: FROM is after UNTIL".into()));
+        }
+        options.period = Some((from, until));
+    }
+    // The entries of packs verified before: each must verify itself.
+    let mut prior: HashMap<i64, String> = HashMap::new();
+    for dir in &args.prior {
+        let prior_files = input::pack_files(dir)?;
+        let checked = verify_audit_pack(&prior_files, &options);
+        if !checked.verified {
+            return Err(Stop::Failed(format!(
+                "--prior {} does not verify: {}",
+                dir.display(),
+                checked.reasons().join(", ")
+            )));
+        }
+        prior.extend(pack_entry_digests(&prior_files).map_err(Stop::Unreadable)?);
+    }
+    if let Some(path) = &args.prior_entries {
+        let read = input::object(path)?;
+        for (position, digest) in read.as_object().into_iter().flatten() {
+            let (Ok(position), Some(digest)) = (position.parse::<i64>(), digest.as_str()) else {
+                return Err(Stop::Unreadable(format!(
+                    "cannot read {}: positions and entry digests, as strings",
+                    path.display()
+                )));
+            };
+            prior.insert(position, digest.to_owned());
+        }
+    }
+    if !prior.is_empty() {
+        options.prior_entries = Some(prior);
     }
     if let Some(path) = &args.changes {
         let csv = path
@@ -289,11 +355,17 @@ fn pack(args: &PackArgs, json: bool) -> Result<u8, Stop> {
     }
     options.tolerance_seconds = args.tolerance_seconds;
     let result = verify_audit_pack(&files, &options);
-    let mut differences = differences_from_pack_checks(&result, &files);
-    differences.extend(differences_from_report(&result, &files));
+    let differences = differences_from_pack_checks(&result, &files);
+    if let Some(path) = &args.report {
+        let text = render_own_report(&files, &result).map_err(|e| {
+            Stop::Unreadable(format!("--report: the pack cannot be rendered ({e})"))
+        })?;
+        std::fs::write(path, text)
+            .map_err(|e| Stop::Unreadable(format!("cannot write {}: {e}", path.display())))?;
+    }
     if json {
         let mut out = result.to_json();
-        out["report_differences"] = Value::Array(differences);
+        out["check_differences"] = Value::Array(differences);
         print_json(&out);
     } else {
         print!("{}", report::pack(&result, &differences));

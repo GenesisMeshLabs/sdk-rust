@@ -43,6 +43,15 @@ fn run_suite(suite: &Value, tally: &mut Tally) {
 fn check(id: &str, adapted: Adapted, tally: &mut Tally) {
     let case: Case = match adapted {
         Adapted::Run(case) => case,
+        Adapted::Computed { got, expected } => {
+            tally.ran += 1;
+            if got != expected {
+                tally
+                    .failed
+                    .push(format!("{id}:\n  expected {expected}\n  got      {got}"));
+            }
+            return;
+        }
         Adapted::Skip(why) => {
             tally.skipped.push(format!("{id}: {why}"));
             return;
@@ -99,7 +108,7 @@ fn the_binary_gives_the_reference_verdicts_on_the_shared_vectors() {
     // are the SDK's own tests (tests/anchors.rs, tests/audit.rs).
     assert_eq!(
         tally.ran,
-        10 + 6 + 41 + 31 + 8 + (14 + 4 + 11),
+        10 + 6 + 41 + 31 + 8 + (19 + 13 + 22 + 2 + 13),
         "{:#?}",
         tally.skipped
     );

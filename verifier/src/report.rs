@@ -85,6 +85,10 @@ pub fn pack(result: &PackVerification, differences: &[Value]) -> String {
             len("unmatched_records")
         );
     }
+    if let Some(period) = &result.period {
+        let at = |key: &str| period.get(key).and_then(Value::as_str).unwrap_or_default();
+        let _ = writeln!(out, "Period     : {} to {}", at("from"), at("until"));
+    }
     let verdict = if result.verified {
         "VERIFIED"
     } else {
@@ -103,8 +107,39 @@ pub fn pack(result: &PackVerification, differences: &[Value]) -> String {
         );
         let _ = writeln!(out, "  - {}", line.trim_end());
     }
-    for w in &result.warnings {
-        let _ = writeln!(out, "Warning    : {} {}", w.reason, w.detail);
+    let unanchored = result
+        .warnings
+        .iter()
+        .filter(|w| w.reason == "cited_entry_unanchored")
+        .count();
+    for w in result
+        .warnings
+        .iter()
+        .filter(|w| w.reason != "cited_entry_unanchored")
+    {
+        let at = w
+            .store_sequence
+            .map_or_else(|| "None".to_owned(), |s| s.to_string());
+        let line = format!(
+            "{} #{at}: {} {}",
+            w.file.as_deref().unwrap_or("-"),
+            w.reason,
+            w.detail
+        );
+        let _ = writeln!(out, "  ~ {}", line.trim_end());
+    }
+    if unanchored > 0 {
+        let _ = writeln!(
+            out,
+            "  ~ {unanchored} cited entries are covered by no prior pack and no held anchor              (cited_entry_unanchored): their signatures verify, their place in the store is not proven"
+        );
+    }
+    for d in &result.report_differences {
+        let _ = writeln!(
+            out,
+            "  ! report.md line {}: pack {}, rendered {}",
+            d["line"], d["pack"], d["verifier"]
+        );
     }
     for d in differences {
         let _ = writeln!(

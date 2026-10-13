@@ -36,6 +36,10 @@ pub enum Stop {
     Unreadable(String),
     /// Not available in this version.
     Unsupported(String),
+    /// Not verified before the verification could run (exit 1): a pack
+    /// given with `--prior` does not verify, or `--require-anchors` without
+    /// anchors.
+    Failed(String),
 }
 
 impl Stop {
@@ -44,12 +48,13 @@ impl Stop {
             Stop::Usage(_) => EXIT_USAGE,
             Stop::Unreadable(_) => EXIT_UNREADABLE,
             Stop::Unsupported(_) => EXIT_UNSUPPORTED,
+            Stop::Failed(_) => EXIT_FAILED,
         }
     }
 
     fn message(&self) -> &str {
         match self {
-            Stop::Usage(m) | Stop::Unreadable(m) | Stop::Unsupported(m) => m,
+            Stop::Usage(m) | Stop::Unreadable(m) | Stop::Unsupported(m) | Stop::Failed(m) => m,
         }
     }
 }
