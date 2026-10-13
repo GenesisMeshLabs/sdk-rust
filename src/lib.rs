@@ -3,6 +3,7 @@
 
 mod agreement;
 mod attestation;
+pub mod audit_pack;
 mod auth;
 mod boundary;
 pub mod canonical;
@@ -16,6 +17,7 @@ mod evidence_store;
 mod execution;
 mod governance;
 mod health;
+pub mod key_history;
 mod out_of_band;
 mod outbox;
 mod policy;

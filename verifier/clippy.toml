@@ -1,0 +1,20 @@
+# genesis-mesh-verify never contacts a network and never needs a private key
+# (docs/verifier.md). clippy -D warnings refuses any use of these in the
+# binary; the SDK's own clippy run is unaffected.
+disallowed-types = [
+    { path = "std::net::TcpStream", reason = "the verifier never contacts a network" },
+    { path = "std::net::TcpListener", reason = "the verifier never contacts a network" },
+    { path = "std::net::UdpSocket", reason = "the verifier never contacts a network" },
+    { path = "genesis_mesh_sdk::GenesisMeshClient", reason = "the verifier never contacts a network" },
+    { path = "genesis_mesh_sdk::HttpTransport", reason = "the verifier never contacts a network" },
+    { path = "genesis_mesh_sdk::ClientOptions", reason = "the verifier never contacts a network" },
+    { path = "genesis_mesh_sdk::ExecutionRecorder", reason = "the verifier never signs" },
+    { path = "genesis_mesh_sdk::ObservationRecorder", reason = "the verifier never signs" },
+]
+disallowed-methods = [
+    { path = "genesis_mesh_sdk::load_signing_key", reason = "the verifier never needs a private key" },
+    { path = "genesis_mesh_sdk::sign_canonical", reason = "the verifier never signs" },
+    { path = "genesis_mesh_sdk::public_key_from_seed", reason = "the verifier never needs a private key" },
+    { path = "genesis_mesh_sdk::build_admin_headers", reason = "the verifier never sends admin requests" },
+    { path = "genesis_mesh_sdk::build_admin_headers_at", reason = "the verifier never sends admin requests" },
+]

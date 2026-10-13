@@ -179,6 +179,76 @@ pub fn payload_digest(payload: &Value) -> Result<String> {
     canonical_digest(payload)
 }
 
+/// The signed form of a record of a registry root as received, as every
+/// verifier rebuilds it (the reference's `received_canonical`, 1.5.0): its
+/// `canonical_fields` when the registry lists them, otherwise every field but
+/// its signature field, a field it leaves out when absent (`omit_when_none`)
+/// left out when `null`. Nothing unknown is dropped: a signature over a field
+/// this crate does not know still verifies, and is then refused by name.
+pub fn received_canonical(model: &str, record: &Value) -> Result<String> {
+    let spec = crate::strict::model_spec(model);
+    let Some(object) = record.as_object() else {
+        return canonical_json(record);
+    };
+    let listed = |rule: &str, key: &str| {
+        spec[rule]
+            .as_array()
+            .is_some_and(|keys| keys.iter().any(|k| k.as_str() == Some(key)))
+    };
+    let body: Map<String, Value> = match spec["canonical_fields"].as_array() {
+        Some(fields) => fields
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|k| (k.to_owned(), object.get(k).cloned().unwrap_or(Value::Null)))
+            .collect(),
+        None => object
+            .iter()
+            .filter(|(k, v)| {
+                spec["signature_field"].as_str() != Some(k.as_str())
+                    && !(v.is_null() && listed("omit_when_none", k))
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
+    canonical_json(&Value::Object(body))
+}
+
+/// `KeySuccessionRecord.to_canonical_json()` (1.5.0): what the root key and
+/// the outgoing NA key both sign, every field but `signatures`, an absent
+/// `previous_succession_digest` left out.
+pub fn key_succession_canonical(record: &Value) -> Result<String> {
+    received_canonical("KeySuccessionRecord", record)
+}
+
+/// `KeySuccessionRecord.digest()`: the next succession links to it.
+pub fn key_succession_digest(record: &Value) -> Result<String> {
+    Ok(crate::auth::sha256_hex(
+        key_succession_canonical(record)?.as_bytes(),
+    ))
+}
+
+/// A store anchor's signed fields (1.5.0, as the reference signs them since
+/// 1.2.0): every field but `signature`, an absent previous anchor digest left
+/// out, and `anchored_at` in the form Pydantic writes it.
+fn anchor_fields(anchor: &Value) -> Result<Value> {
+    let mut fields = without(anchor, &["signature"], &["previous_anchor_digest"]);
+    if let Some(at) = fields.get("anchored_at").and_then(Value::as_str) {
+        let written = python_timestamp(parse_timestamp(at)?);
+        fields["anchored_at"] = Value::String(written);
+    }
+    Ok(fields)
+}
+
+/// `StoreAnchor.to_canonical_json()`: the body the NA signs.
+pub fn anchor_canonical(anchor: &Value) -> Result<String> {
+    canonical_json(&anchor_fields(anchor)?)
+}
+
+/// `StoreAnchor.digest()`: the next anchor links to it.
+pub fn anchor_digest(anchor: &Value) -> Result<String> {
+    canonical_digest(&anchor_fields(anchor)?)
+}
+
 /// A UTC timestamp in the form Pydantic re-serialises unchanged: microsecond
 /// precision, `Z` suffix, fraction omitted when zero. Any other form would
 /// come back changed from the NA and break a signature over it.
@@ -283,6 +353,25 @@ mod tests {
             out_of_band_canonical(&record).unwrap(),
             r#"{"nested":{"x":null}}"#
         );
+    }
+
+    #[test]
+    fn signs_an_anchor_in_the_form_pydantic_writes() {
+        let anchor = json!({
+            "anchor_sequence": 1, "sovereign_id": "s", "store_sequence": 3,
+            "entry_digest": "d", "anchored_at": "2026-10-01T09:56:14.500+00:00",
+            "previous_anchor_digest": null, "issued_by": "na", "signature": {"sig": "x"},
+        });
+        assert_eq!(
+            anchor_canonical(&anchor).unwrap(),
+            r#"{"anchor_sequence":1,"anchored_at":"2026-10-01T09:56:14.500000Z","entry_digest":"d","issued_by":"na","sovereign_id":"s","store_sequence":3}"#
+        );
+        let mut next = anchor.clone();
+        next["previous_anchor_digest"] = json!("p");
+        assert!(anchor_canonical(&next)
+            .unwrap()
+            .contains(r#""previous_anchor_digest":"p""#));
+        assert!(anchor_canonical(&json!({"anchored_at": "late"})).is_err());
     }
 
     #[test]

@@ -591,6 +591,66 @@ rules are in `remediation` (`remediation_plan`, `decision_plan`,
 `rfc3339`, `emergency_map`), checked by the shared conformance suite
 `remediation`.
 
+## Independent verification
+
+From Genesis Mesh 1.5.0 an auditor verifies records, evidence exports and
+audit packs on its own machines, years later, with `genesis-mesh-verify`: a
+static Linux binary built from this crate's `verify`, `key_history` and
+`audit_pack` modules, released with checksums and Sigstore bundles, and
+reproducible from source. It never needs a private key and never contacts a
+network. "Independent" means separate code by the same project: a difference
+from the Python reference is a bug in one of them.
+
+```sh
+genesis-mesh-verify pack pack-2026 --anchor root.pub --known-anchors /audit/anchors
+genesis-mesh-verify export export.jsonl --key-history key-history.json --root-key root.pub \
+    --executor-keys executor-keys.json --known-anchors /audit/anchors --json
+genesis-mesh-verify record decision decision.json --key-history key-history.json --root-key root.pub
+genesis-mesh-verify key-history key-history.json --root-key root.pub
+```
+
+Exit codes: 0 verified, 1 not verified, 2 usage error, 3 an input could not
+be read. [docs/verifier.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/docs/verifier.md)
+says what is checked, how to rebuild a release and compare digests, and how to
+read a mismatch.
+
+### In the library
+
+- **Key succession** (`key_history`): `verify_key_history` verifies a genesis
+  block and its `KeySuccessionRecord`s (each signed by the root key, the new
+  key and the outgoing key) from the root key held, in the
+  reference's order and with its reason codes, and gives the `NaKeyHistory`:
+  which NA key is valid when (`NaKey::accepts`, with the 300-second
+  hand-over). `NaKeys` is either keys valid at every time or the history.
+- **NA signatures at the record's time**: `VerifyEvidenceOptions::key_history`,
+  `VerifyDecisionOptions::key_history` and `VerifyRecordOptions::key_history`
+  accept an NA signature only by the key valid at the record's own time
+  (`na_key_not_valid_at_time` for another key of the history), and
+  `verify_store_anchors` takes `NaKeys`. Without a history every key given is
+  valid at every time, as before.
+- **Decisions as of their own time**: `VerifyDecisionOptions::at_record_time`
+  judges a decision as of its `decision_made_at` instead of now, so an
+  archived decision verifies at any later audit. It is off by default: a
+  decision about to be acted on is still judged as of now.
+- **Audit packs** (`audit_pack`): `verify_audit_pack` checks a pack as
+  `genesis-mesh audit verify` does, `render_report` renders its `report.md`
+  byte for byte, and `differences_from_pack_checks` compares the result with
+  the pack's own `checks.json`; `parse_changes` and `check_completeness` are
+  the completeness check.
+  `VerifyEvidenceOptions::prior` verifies a range with a pack's cited records
+  as its predecessors (`cited_record_missing`).
+- **New entry kinds**: `key_succession` and `archive` entries verify in an
+  export (counted in `key_successions` and `archives`).
+- `verify::verify_record(kind, record, options)` verifies one record as an
+  export verifies it, with the same reason codes: every entry kind, a policy
+  or an attestation.
+- Store anchors, as the reference checks them: `verify::verify_store_anchors`
+  (signatures, chain, positions), `verify::check_events_against_anchors` (an
+  export tied to the anchors held at both ends), `verify::parse_anchors` and
+  `verify::export_checkpoint`; `canonical::anchor_canonical`,
+  `canonical::anchor_digest`, `canonical::received_canonical` and
+  `canonical::key_succession_canonical`.
+
 ## Transport and errors
 
 Construct one client and clone it for concurrent work. Clones and sub-clients share
@@ -646,15 +706,19 @@ signed. `ClientOptions` debug output redacts the seed.
 ```sh
 python scripts/check_release.py
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
 cargo test --locked --doc
-cargo doc --locked --no-deps
+cargo doc --locked --workspace --no-deps
 cargo package --locked
 ```
 
-CI tests stable Rust on Linux, Windows, and macOS plus Rust 1.85 on Linux, checks
-release metadata and packaging, and audits dependencies with `cargo audit`.
+The workspace holds the crate and `genesis-mesh-verify` (`verifier/`, not
+published to crates.io). CI tests stable Rust on Linux, Windows, and macOS plus
+Rust 1.85 on Linux, checks release metadata and packaging, and audits
+dependencies with `cargo audit`. The `Verifier` workflow builds the static
+binaries twice and compares them, checks they need no shared library, and runs
+the verifier's tests against them without a network.
 See [CONTRIBUTING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/CONTRIBUTING.md), [RELEASING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/RELEASING.md), and
 [SECURITY.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/SECURITY.md).
 

@@ -12,6 +12,11 @@ categories = ["api-bindings", "authentication"]
 include = ["src/**", "examples/**", "tests/**", "scripts/check_release.py", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "CHANGELOG.md", "CONTRIBUTING.md", "RELEASING.md", "AGENT.md", "SECURITY.md", "VERSION"]
 resolver = "3"
 
+# The independent verifier, genesis-mesh-verify (1.5.0): a binary built on this
+# crate's offline modules, never published to crates.io (docs/verifier.md).
+[workspace]
+members = ["verifier"]
+
 [dependencies]
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

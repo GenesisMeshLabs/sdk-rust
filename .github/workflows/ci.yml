@@ -6,7 +6,6 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -33,7 +32,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ matrix.rust }}
-      - run: cargo test --locked --all-targets
+      # The SDK and genesis-mesh-verify (verifier/).
+      - run: cargo test --locked --workspace --all-targets
       - run: cargo test --locked --doc
 
   sdk-e2e:
@@ -64,7 +64,7 @@ jobs:
           path: core
       - name: The signing vectors are the core's
         run: |
-          for suite in admin_auth field_registry canonical out_of_band; do
+          for suite in admin_auth field_registry canonical out_of_band remediation audit; do
             if [ -f "core/conformance/vectors/$suite.json" ]; then
               cmp "core/conformance/vectors/$suite.json" "tests/fixtures/$suite.json"
             else
@@ -78,6 +78,25 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -e ./core
+      # 1.5.0: the frozen audit pack is the core's, byte for byte.
+      - name: The frozen audit pack is the core's
+        run: |
+          if [ -d core/conformance/fixtures/audit-pack-1.5.0 ]; then
+            diff -r core/conformance/fixtures/audit-pack-1.5.0 tests/fixtures/audit-pack-1.5.0
+          else
+            echo "::notice::The core revision has no frozen 1.5.0 pack yet; skipped."
+          fi
+      # genesis-mesh-verify against the core's verification corpus, generated
+      # from the same core revision; every case must have an adapter.
+      - name: genesis-mesh-verify against the reference corpus
+        run: |
+          if [ -f core/scripts/export_reference_corpus.py ]; then
+            python core/scripts/export_reference_corpus.py --suite verification --out "$RUNNER_TEMP/corpus"
+            export GM_VERIFY_CORPUS="$RUNNER_TEMP/corpus/verification" GM_VERIFY_CORPUS_STRICT=1
+            cargo test --locked -p genesis-mesh-verify --test differential -- --nocapture
+          else
+            echo "::notice::The core revision has no verification corpus yet; skipped."
+          fi
       - name: Governed-action lifecycle against a live NA
         run: cargo test --locked --test live_na -- --nocapture
         env:
@@ -97,8 +116,9 @@ jobs:
           python-version: "3.12"
       - run: python scripts/check_release.py
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo doc --locked --no-deps
+      # verifier/clippy.toml refuses network and signing code in genesis-mesh-verify.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo doc --locked --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
       - run: cargo package --locked
@@ -170,7 +190,8 @@ jobs:
           fi
           awk -v v="$version" '/^## /{ if (p) exit; if (index($0, "[" v "]") || index($0, "## " v " ")) p = 1; next } p' CHANGELOG.md > release-notes.md
           [ -s release-notes.md ] || echo "Coordinated Genesis Mesh $tag release." > release-notes.md
-          gh release create "$tag" --title "$tag" --notes-file release-notes.md --verify-tag
+          # The Verifier workflow may create it meanwhile, to attach its binaries.
+          gh release create "$tag" --title "$tag" --notes-file release-notes.md --verify-tag \n            || gh release view "$tag" > /dev/null
 
   changelog:
     name: Changelog fragments
