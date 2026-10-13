@@ -224,6 +224,61 @@ fn anchors_case(v: &Value, scratch: &Scratch) -> Adapted {
     })
 }
 
+/// Whether supplied keys say where the store placed them. Only the library
+/// takes such keys (the binary sets placement aside, as the reference's
+/// `--executor-keys` does): a case with them is the library's.
+fn placed_keys(keys: &Value) -> bool {
+    keys.as_array().into_iter().flatten().any(|k| {
+        [
+            "registered_sequence",
+            "retired_sequence",
+            "registered_at_time",
+            "retired_at_time",
+        ]
+        .iter()
+        .any(|f| k.get(*f).is_some_and(|v| !v.is_null()))
+    })
+}
+
+/// An export verified by the library, with the key history from the root
+/// key and keys as given (placed), read back as the corpus expects it.
+fn library_export(
+    lines: &str,
+    history: &Value,
+    root: &str,
+    keys: &Value,
+    expected: Value,
+) -> Adapted {
+    use genesis_mesh_sdk::{key_history::verify_key_history, verify};
+    let events = verify::parse_export_lines(lines).unwrap_or_default();
+    let successions = history["successions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let options = verify::VerifyEvidenceOptions {
+        key_history: verify_key_history(&history["genesis"], &successions, Some(root)).history,
+        ..verify::VerifyEvidenceOptions::new(
+            Vec::new(),
+            keys.as_array().cloned().unwrap_or_default(),
+        )
+    };
+    let result = verify::verify_evidence_events(&events, &options);
+    let list = |items: &[verify::VerificationFailure]| -> Value {
+        json!(items
+            .iter()
+            .map(|f| json!({"store_sequence": f.store_sequence, "reason": f.reason}))
+            .collect::<Vec<_>>())
+    };
+    let mut got = json!({ "failures": list(&result.failures) });
+    if expected.get("verified").is_some() {
+        got["verified"] = json!(result.verified);
+    }
+    if expected.get("warnings").is_some() {
+        got["warnings"] = list(&result.warnings);
+    }
+    Adapted::Computed { got, expected }
+}
+
 /// A case of the core's verification corpus (`corpus.json`, 1.5.0) as a run
 /// of the binary: `export` (a one-entry or whole export with the key
 /// history), `key-history` and `pack`, each in the directory it names.
@@ -232,7 +287,22 @@ pub fn adapt_corpus(case: &Value, dir: &Path) -> Adapted {
     let file = |name: &str| path.join(name).to_str().unwrap_or_default().to_owned();
     let has = |name: &str| path.join(name).exists();
     let expected = case["expected"].clone();
+    let read = |name: &str| -> Value {
+        serde_json::from_str(&std::fs::read_to_string(path.join(name)).unwrap_or_default())
+            .unwrap_or_default()
+    };
     let (args, projection) = match case["command"].as_str().unwrap_or_default() {
+        "export" if placed_keys(&read("executor-keys.json")["executor_keys"]) => {
+            let lines = std::fs::read_to_string(path.join("export.jsonl")).unwrap_or_default();
+            let root = std::fs::read_to_string(path.join("root.pub")).unwrap_or_default();
+            return library_export(
+                &lines,
+                &read("key-history.json"),
+                root.trim(),
+                &read("executor-keys.json")["executor_keys"],
+                expected,
+            );
+        }
         "export" => (
             vec![
                 "export".to_owned(),
@@ -344,6 +414,15 @@ fn key_history_file(input: &Value, scratch: &Scratch) -> (String, String) {
 
 fn history_export_case(v: &Value, scratch: &Scratch) -> Adapted {
     let input = &v["input"];
+    if placed_keys(&input["executor_keys"]) {
+        return library_export(
+            input["lines"].as_str().unwrap_or_default(),
+            &json!({"genesis": input["genesis"], "successions": input["successions"]}),
+            input["root_public_key"].as_str().unwrap_or_default(),
+            &input["executor_keys"],
+            v["expected"].clone(),
+        );
+    }
     let (history, root) = key_history_file(input, scratch);
     Adapted::Run(Case {
         args: vec![

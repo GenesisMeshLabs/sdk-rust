@@ -150,7 +150,9 @@ The checks, reason codes and JSON of `genesis-mesh audit verify` (the core's
   it verified;
 - `--executor-keys <file>`: executor keys you hold, for a store without
   registry records (the pack's own `keys/executor-keys.json` is never
-  trusted, and a key the pack's registry records place wins);
+  trusted, and a key the pack's registry records place wins). A key supplied
+  this way is not placed in the store: only registry records the NA signed
+  say when a key was registered and retired;
 - `--changes <file>`: changes from a log outside Genesis Mesh (CSV with a
   header row, or JSON; times in strict RFC 3339, fields strings or null),
   matched against the pack (`change_unmatched`; warnings
@@ -282,7 +284,8 @@ before it takes effect (`succession_backdated`). The genesis block is held to
 the rules of every signed record (`unknown_field`, `non_canonical_form`).
 
 Executor and observer keys verify only records after their registration and
-before their retirement, where the store placed them
+before their retirement, where the registry records the NA signed placed them
+(in a pack; a key given with `--executor-keys` is not placed)
 (`evidence_unknown_executor`, `evidence_executor_key_retired`). A retention
 checkpoint, and every record kind from 1.3.0 on, with a field outside its
 signature is `payload_invalid`; a justification or execution evidence only

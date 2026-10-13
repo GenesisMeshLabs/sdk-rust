@@ -48,8 +48,9 @@
   order within 300 seconds (`recorded_at_out_of_order`); key succession
   entries must be the history's (`succession_not_in_history`) and recorded
   60 seconds ahead (`succession_backdated`). Executor and observer keys are
-  placed where the store registered and retired them
-  (`evidence_unknown_executor`, `evidence_executor_key_retired`), and a record
+  placed where the NA-signed registry records registered and retired them
+  (`evidence_unknown_executor`, `evidence_executor_key_retired`; a key given
+  with `--executor-keys` is not placed), and a record
   read alone is placed at its own time (`key_history::NA_RECORD_TIME_FIELDS`).
 - **Audit packs.** `audit_pack::verify_audit_pack` checks a pack offline as
   the reference does, its check groups in order with their reason codes
@@ -57,8 +58,9 @@
   `cited_entry_mismatch`, `report_mismatch`, `pack_period_not_covered`, and
   the warnings `cited_entry_unanchored`, `changes_outside_period`,
   `change_duplicate`); `render_report` renders `report.md` byte for byte;
-  `check_completeness` matches a pack against a log of changes kept
-  elsewhere (strict RFC 3339 times, duplicates set aside, the best overall
+  a report cell writes a number with an integral value as an integer
+  (`1.0` is `1`), as every SDK renders it; `check_completeness` matches a
+  pack against a log of changes kept elsewhere (strict RFC 3339 times, duplicates set aside, the best overall
   pairing).
 - **Store anchors, as the reference checks them.**
   `verify::verify_store_anchors`, `verify::check_events_against_anchors`,

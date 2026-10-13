@@ -12,6 +12,15 @@ use genesis_mesh_sdk::{
 
 use crate::Stop;
 
+/// Where a key is placed in the store: only registry records the NA signed
+/// say so, never a key supplied on the command line.
+const PLACEMENT_FIELDS: [&str; 4] = [
+    "registered_sequence",
+    "retired_sequence",
+    "registered_at_time",
+    "retired_at_time",
+];
+
 /// The file names `genesis-mesh evidence anchors fetch` writes.
 const ANCHOR_FILE_PREFIX: &str = "anchor-";
 
@@ -70,7 +79,11 @@ pub fn public_keys(values: &[String]) -> Result<Vec<String>, Stop> {
 
 /// Registered keys from `GET /admin/evidence/executor-keys`: the response,
 /// or its `executor_keys` list. Each names `key_id`, `public_key` and
-/// `executor_sovereign_id`.
+/// `executor_sovereign_id`. A key supplied this way is not placed in the
+/// store: any placement it carries (`registered_sequence`,
+/// `retired_sequence`, `registered_at_time`, `retired_at_time`) is set aside,
+/// as the reference's `--executor-keys` reads it; only the registry records
+/// the NA signed place a key.
 pub fn executor_keys(path: &Path) -> Result<Vec<Value>, Stop> {
     let value = json(path)?;
     let rows = match value {
@@ -80,6 +93,14 @@ pub fn executor_keys(path: &Path) -> Result<Vec<Value>, Stop> {
     let Value::Array(rows) = rows else {
         return Err(unreadable(path, "not a list of executor keys"));
     };
+    let mut rows = rows;
+    for row in &mut rows {
+        if let Some(fields) = row.as_object_mut() {
+            for key in PLACEMENT_FIELDS {
+                fields.remove(key);
+            }
+        }
+    }
     for row in &rows {
         let named = |key: &str| row.get(key).is_some_and(Value::is_string);
         if !(named("key_id") && named("public_key") && named("executor_sovereign_id")) {

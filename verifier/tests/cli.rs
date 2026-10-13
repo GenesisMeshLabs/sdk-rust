@@ -733,3 +733,39 @@ fn a_pack_is_checked_against_what_the_auditor_holds() {
     ]);
     assert_eq!(r.code, 0, "{}", r.stdout);
 }
+
+/// Keys supplied with --executor-keys are not placed in the store, as the
+/// reference reads them: placement comes only from registry records the NA
+/// signed in a pack (the audit suite's export-key-retired, through the CLI).
+#[test]
+fn a_supplied_key_is_not_placed() {
+    let suite = fixture("audit");
+    let v = suite["vectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "export-key-retired")
+        .unwrap();
+    let input = &v["input"];
+    assert!(v["expected"]["failures"]
+        .to_string()
+        .contains("evidence_executor_key_retired"));
+    let scratch = Scratch::new("supplied-keys");
+    let history = json!({"genesis": input["genesis"], "successions": input["successions"]});
+    let r = run(&[
+        "export",
+        &scratch.file("export.jsonl", input["lines"].as_str().unwrap()),
+        "--key-history",
+        &scratch.json("history.json", &history),
+        "--root-key",
+        input["root_public_key"].as_str().unwrap(),
+        "--executor-keys",
+        &scratch.json("keys.json", &input["executor_keys"]),
+        "--json",
+    ]);
+    assert!(
+        !r.stdout.contains("evidence_executor_key_retired"),
+        "{}",
+        r.stdout
+    );
+}
