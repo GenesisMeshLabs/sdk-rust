@@ -1,7 +1,7 @@
 [package]
 name = "genesis-mesh-verify"
 # The SDK's version: scripts/check_release.py checks that they agree.
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
