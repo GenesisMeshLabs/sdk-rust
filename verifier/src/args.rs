@@ -1,0 +1,344 @@
+//! The command line: `genesis-mesh-verify [--json] <command> ...`.
+
+use std::path::PathBuf;
+
+use genesis_mesh_sdk::verify::RECORD_KINDS;
+
+use crate::Stop;
+
+pub const USAGE: &str = "\
+genesis-mesh-verify: verify Genesis Mesh records and evidence exports offline.
+
+It never contacts a network and never needs a private key. Every key is a
+base64 Ed25519 public key, given inline or as a file ('#' lines ignored).
+
+Usage:
+  genesis-mesh-verify record <kind> <file> [options]
+  genesis-mesh-verify export <file> [options]
+  genesis-mesh-verify pack <dir> --anchor <key> --known-anchors <path>
+  genesis-mesh-verify --help | --version
+
+record: verify one signed record (a JSON file) as an export verifies it.
+  <kind>                    decision, justification, execution, checkpoint,
+                            observation, break-glass, judgement, quarantine,
+                            registry, remediation, review, policy, attestation
+  --na-key <key>            an NA public key (repeatable)
+  --executor-keys <file>    JSON from GET /admin/evidence/executor-keys
+  --at <time>               judge a decision's expiry at this RFC 3339 time
+                            (default: as of the decision's own time)
+  --freshness-key <key>     a decision's freshness proof issuer (repeatable)
+  --expect-policy <file>    a decision must bind this policy (repeatable)
+  --expect-attestation <file>
+                            a decision must bind this attestation
+
+export: verify a gm.evidence.event JSON Lines export.
+  --na-key <key>            an NA public key (repeatable)
+  --executor-keys <file>    JSON from GET /admin/evidence/executor-keys
+  --known-anchors <path>    anchors you hold: a directory from 'genesis-mesh
+                            evidence anchors fetch', or a JSON file
+  --checkpoint <file>       the retention checkpoint the export continues from
+                            (default: the one the export holds, if any)
+  --partial                 the export is a deliberate slice: its ends are not
+                            checked against the anchors
+  --from-anchor             the export continues from a held anchor
+
+pack: verify an audit pack (not available yet).
+
+Global options:
+  --json                    print the result as JSON
+  -h, --help                print this help
+  -V, --version             print the version
+
+Exit codes: 0 verified, 1 not verified, 2 usage error, 3 an input could not
+be read, 4 not available in this version.
+";
+
+/// What to run.
+#[derive(Debug)]
+pub enum Command {
+    Help,
+    Version,
+    Record(RecordArgs),
+    Export(ExportArgs),
+    Pack(PackArgs),
+}
+
+/// The command and the output form.
+#[derive(Debug)]
+pub struct Cli {
+    pub json: bool,
+    pub command: Command,
+}
+
+#[derive(Debug)]
+pub struct RecordArgs {
+    pub kind: String,
+    pub file: PathBuf,
+    pub na_keys: Vec<String>,
+    pub executor_keys: Option<PathBuf>,
+    pub at: Option<String>,
+    pub freshness_keys: Vec<String>,
+    pub expect_policies: Vec<PathBuf>,
+    pub expect_attestation: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct ExportArgs {
+    pub file: PathBuf,
+    pub na_keys: Vec<String>,
+    pub executor_keys: Option<PathBuf>,
+    pub known_anchors: Option<PathBuf>,
+    pub checkpoint: Option<PathBuf>,
+    pub partial: bool,
+    pub from_anchor: bool,
+}
+
+#[derive(Debug)]
+pub struct PackArgs {
+    pub dir: PathBuf,
+    pub anchors: Vec<String>,
+    pub known_anchors: Option<PathBuf>,
+}
+
+/// Options of one command: the positionals, then each option's values in
+/// order, then the flags given.
+struct Parsed {
+    positionals: Vec<String>,
+    values: Vec<(&'static str, String)>,
+    flags: Vec<&'static str>,
+}
+
+impl Parsed {
+    fn all(&self, name: &str) -> Vec<String> {
+        self.values
+            .iter()
+            .filter(|(n, _)| *n == name)
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    fn one(&self, name: &str) -> Result<Option<String>, Stop> {
+        let mut all = self.all(name);
+        if all.len() > 1 {
+            return Err(Stop::Usage(format!("--{name} is given more than once")));
+        }
+        Ok(all.pop())
+    }
+
+    fn flag(&self, name: &str) -> bool {
+        self.flags.contains(&name)
+    }
+}
+
+/// Split a command's arguments into positionals, options with a value
+/// (`--name value` or `--name=value`) and flags; `--` ends the options.
+fn split(
+    tokens: &[String],
+    with_value: &[&'static str],
+    flags: &[&'static str],
+) -> Result<Parsed, Stop> {
+    let mut parsed = Parsed {
+        positionals: Vec::new(),
+        values: Vec::new(),
+        flags: Vec::new(),
+    };
+    let mut rest = tokens.iter();
+    let mut options_ended = false;
+    while let Some(token) = rest.next() {
+        if options_ended || !token.starts_with("--") || token == "-" {
+            parsed.positionals.push(token.clone());
+            continue;
+        }
+        if token == "--" {
+            options_ended = true;
+            continue;
+        }
+        let (name, inline) = match token[2..].split_once('=') {
+            Some((name, value)) => (name, Some(value.to_owned())),
+            None => (&token[2..], None),
+        };
+        if let Some(known) = with_value.iter().find(|n| **n == name) {
+            let value = match inline {
+                Some(value) => value,
+                None => rest
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| Stop::Usage(format!("--{name} needs a value")))?,
+            };
+            parsed.values.push((known, value));
+        } else if let Some(known) = flags.iter().find(|n| **n == name) {
+            if inline.is_some() {
+                return Err(Stop::Usage(format!("--{name} takes no value")));
+            }
+            parsed.flags.push(known);
+        } else {
+            return Err(Stop::Usage(format!("unknown option --{name}")));
+        }
+    }
+    Ok(parsed)
+}
+
+fn positionals<const N: usize>(parsed: &Parsed, usage: &str) -> Result<[String; N], Stop> {
+    <[String; N]>::try_from(parsed.positionals.clone())
+        .map_err(|_| Stop::Usage(format!("usage: genesis-mesh-verify {usage}")))
+}
+
+/// A record kind as the SDK names it: `checkpoint` is a retention
+/// checkpoint, and a hyphen reads as an underscore.
+pub fn record_kind(kind: &str) -> Result<String, Stop> {
+    let kind = kind.to_ascii_lowercase().replace('-', "_");
+    let kind = match kind.as_str() {
+        "checkpoint" => "retention_checkpoint".to_owned(),
+        _ => kind,
+    };
+    if RECORD_KINDS.contains(&kind.as_str()) {
+        Ok(kind)
+    } else {
+        Err(Stop::Usage(format!(
+            "unknown record kind {kind:?}; one of: {}",
+            RECORD_KINDS.join(", ")
+        )))
+    }
+}
+
+/// Parse the command line (without the program name).
+pub fn parse(argv: &[String]) -> Result<Cli, Stop> {
+    let json = argv.iter().any(|a| a == "--json");
+    let tokens: Vec<String> = argv.iter().filter(|a| *a != "--json").cloned().collect();
+    let first = tokens.first().map(String::as_str);
+    let command = match first {
+        None | Some("-h" | "--help" | "help") => Command::Help,
+        Some("-V" | "--version") => Command::Version,
+        Some(_) if tokens.iter().any(|a| a == "-h" || a == "--help") => Command::Help,
+        Some("record") => {
+            let parsed = split(
+                &tokens[1..],
+                &[
+                    "na-key",
+                    "executor-keys",
+                    "at",
+                    "freshness-key",
+                    "expect-policy",
+                    "expect-attestation",
+                ],
+                &[],
+            )?;
+            let [kind, file] = positionals::<2>(&parsed, "record <kind> <file> [options]")?;
+            Command::Record(RecordArgs {
+                kind: record_kind(&kind)?,
+                file: file.into(),
+                na_keys: parsed.all("na-key"),
+                executor_keys: parsed.one("executor-keys")?.map(PathBuf::from),
+                at: parsed.one("at")?,
+                freshness_keys: parsed.all("freshness-key"),
+                expect_policies: parsed
+                    .all("expect-policy")
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect(),
+                expect_attestation: parsed.one("expect-attestation")?.map(PathBuf::from),
+            })
+        }
+        Some("export") => {
+            let parsed = split(
+                &tokens[1..],
+                &["na-key", "executor-keys", "known-anchors", "checkpoint"],
+                &["partial", "from-anchor"],
+            )?;
+            let [file] = positionals::<1>(&parsed, "export <file> [options]")?;
+            Command::Export(ExportArgs {
+                file: file.into(),
+                na_keys: parsed.all("na-key"),
+                executor_keys: parsed.one("executor-keys")?.map(PathBuf::from),
+                known_anchors: parsed.one("known-anchors")?.map(PathBuf::from),
+                checkpoint: parsed.one("checkpoint")?.map(PathBuf::from),
+                partial: parsed.flag("partial"),
+                from_anchor: parsed.flag("from-anchor"),
+            })
+        }
+        Some("pack") => {
+            let parsed = split(&tokens[1..], &["anchor", "known-anchors"], &[])?;
+            let [dir] =
+                positionals::<1>(&parsed, "pack <dir> --anchor <key> --known-anchors <path>")?;
+            Command::Pack(PackArgs {
+                dir: dir.into(),
+                anchors: parsed.all("anchor"),
+                known_anchors: parsed.one("known-anchors")?.map(PathBuf::from),
+            })
+        }
+        Some(other) => {
+            return Err(Stop::Usage(format!(
+                "unknown command {other:?}; one of: record, export, pack"
+            )))
+        }
+    };
+    Ok(Cli { json, command })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn reads_options_in_either_form_and_in_any_position() {
+        let cli = parse(&argv(
+            "record --na-key=a execution r.json --json --na-key b --at 2026-01-01T00:00:00Z",
+        ))
+        .unwrap();
+        assert!(cli.json);
+        let Command::Record(args) = cli.command else {
+            panic!("not a record command");
+        };
+        assert_eq!(args.kind, "execution");
+        assert_eq!(args.file, PathBuf::from("r.json"));
+        assert_eq!(args.na_keys, ["a", "b"]);
+        assert_eq!(args.at.as_deref(), Some("2026-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn names_kinds_as_the_sdk_does() {
+        assert_eq!(record_kind("checkpoint").unwrap(), "retention_checkpoint");
+        assert_eq!(record_kind("Break-Glass").unwrap(), "break_glass");
+        assert!(matches!(record_kind("anchor"), Err(Stop::Usage(_))));
+    }
+
+    #[test]
+    fn refuses_what_it_does_not_know() {
+        for line in [
+            "record execution",
+            "record execution a.json b.json",
+            "export e.jsonl --nope",
+            "export e.jsonl --partial=yes",
+            "export e.jsonl --checkpoint",
+            "export e.jsonl --checkpoint a --checkpoint b",
+            "verify e.jsonl",
+        ] {
+            assert!(matches!(parse(&argv(line)), Err(Stop::Usage(_))), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_double_dash_ends_the_options() {
+        let Command::Export(args) = parse(&argv("export -- --odd-name")).unwrap().command else {
+            panic!("not an export command");
+        };
+        assert_eq!(args.file, PathBuf::from("--odd-name"));
+    }
+
+    #[test]
+    fn help_and_version_win() {
+        assert!(matches!(parse(&[]).unwrap().command, Command::Help));
+        assert!(matches!(
+            parse(&argv("export --help")).unwrap().command,
+            Command::Help
+        ));
+        assert!(matches!(
+            parse(&argv("--version")).unwrap().command,
+            Command::Version
+        ));
+    }
+}

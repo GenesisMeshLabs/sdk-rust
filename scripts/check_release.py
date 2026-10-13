@@ -29,6 +29,11 @@ assert heading.search((root / "CHANGELOG.md").read_text(encoding="utf-8")), (
 lock = tomllib.loads((root / "Cargo.lock").read_text())
 package = next(p for p in lock["package"] if p["name"] == manifest["package"]["name"])
 assert package["version"] == version, "Cargo.lock version differs"
+# genesis-mesh-verify (verifier/) is released with the crate, at its version.
+verifier = tomllib.loads((root / "verifier" / "Cargo.toml").read_text())
+assert verifier["package"]["version"] == version, "verifier/Cargo.toml and VERSION differ"
+locked_verifier = next(p for p in lock["package"] if p["name"] == verifier["package"]["name"])
+assert locked_verifier["version"] == version, "Cargo.lock verifier version differs"
 tag_build = os.environ.get("GITHUB_REF_TYPE") == "tag"
 if tag_build:
     assert os.environ["GITHUB_REF_NAME"] == f"v{version}", "Release tag and VERSION differ"

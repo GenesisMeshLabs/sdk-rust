@@ -1,0 +1,21 @@
+[package]
+name = "genesis-mesh-verify"
+# The SDK's version: scripts/check_release.py checks that they agree.
+version = "1.4.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Independent offline verifier for Genesis Mesh records and evidence exports."
+repository = "https://github.com/GenesisMeshLabs/sdk-rust"
+publish = false
+
+[[bin]]
+name = "genesis-mesh-verify"
+path = "src/main.rs"
+
+# Only the SDK's offline modules are used (verify, canonical, strict JSON);
+# clippy.toml refuses its HTTP clients, network sockets and signing keys here.
+[dependencies]
+base64 = "0.23"
+genesis-mesh-sdk = { path = ".." }
+serde_json = { version = "1", features = ["float_roundtrip"] }

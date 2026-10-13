@@ -272,6 +272,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "genesis-mesh-verify"
+version = "1.4.0"
+dependencies = [
+ "base64 0.23.1",
+ "genesis-mesh-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
