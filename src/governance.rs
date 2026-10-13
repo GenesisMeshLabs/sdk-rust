@@ -319,6 +319,7 @@ fn check_decision(decision: &Value, params: &GovernedActionParams, context_id: &
             now: Some(Utc::now()),
             expected_policies: Some(params.verify.expected_policies.clone()),
             expected_attestation: params.verify.expected_attestation.clone(),
+            as_of_record_time: false,
         },
     );
     if !check.accepted {

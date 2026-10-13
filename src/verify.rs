@@ -4,6 +4,11 @@
 //! * [`verify_boundary_decision`]: `trust/context/decisions.py` `verify_boundary_decision`
 //! * [`verify_evidence_events`]: `trust/evidence_store.py` `verify_evidence_events`
 //! * the review checks (1.4.0): `trust/remediation.py`
+//! * [`verify_store_anchors`], [`check_events_against_anchors`] and
+//!   [`export_checkpoint`] (1.5.0): `trust/evidence_store.py`
+//!
+//! [`verify_record`] (1.5.0) verifies one record as an export verifies it.
+//! The `genesis-mesh-verify` binary is built on this module.
 //!
 //! No network access; every key is supplied by the caller.
 
@@ -23,10 +28,10 @@ use crate::strict::{
 use crate::{
     auth::verify_canonical,
     canonical::{
-        attestation_digest, checkpoint_canonical, decision_canonical, entry_digest,
-        execution_canonical, execution_digest, freshness_proof_canonical, justification_canonical,
-        micros, out_of_band_canonical, parse_timestamp, payload_digest, policy_canonical,
-        policy_digest, policy_set_digest,
+        anchor_canonical, anchor_digest, attestation_digest, checkpoint_canonical,
+        decision_canonical, entry_digest, execution_canonical, execution_digest,
+        freshness_proof_canonical, justification_canonical, micros, out_of_band_canonical,
+        parse_timestamp, payload_digest, policy_canonical, policy_digest, policy_set_digest,
     },
     errors::{GenesisMeshError, Result},
     evidence_store::ResourceHead,
@@ -920,6 +925,11 @@ pub struct VerifyDecisionOptions {
     pub expected_policies: Option<Vec<Value>>,
     /// The decision must bind this attestation: id, subject, issuer and digest.
     pub expected_attestation: Option<Value>,
+    /// Judge expiry as of the decision's own time, `decision_made_at`, not
+    /// as of `now` (1.5.0), so an archived decision still verifies when it is
+    /// audited years later; `now` is then ignored. Off by default: a decision
+    /// about to be acted on is judged as of now.
+    pub as_of_record_time: bool,
 }
 
 /// Outcome of [`verify_boundary_decision`]. `accepted` means the decision is
@@ -960,7 +970,11 @@ pub fn verify_boundary_decision(
     if decision.get("signature").is_none_or(Value::is_null) {
         return reject("missing_signature");
     }
-    let now = options.now.unwrap_or_else(Utc::now).timestamp_micros();
+    let now = if options.as_of_record_time {
+        micros(str_field(decision, "decision_made_at").unwrap_or_default()).unwrap_or_default()
+    } else {
+        options.now.unwrap_or_else(Utc::now).timestamp_micros()
+    };
     let valid_until = micros(str_field(decision, "decision_valid_until").unwrap_or_default());
     if valid_until.is_ok_and(|until| now > until) {
         return reject("decision_expired");
@@ -1426,6 +1440,38 @@ fn out_of_band_signed(
     })
 }
 
+/// Whether a record of an export kind other than a decision is signed as its
+/// kind requires, the same check for an export entry and for a single record
+/// (1.5.0): a justification or retention checkpoint by the NA, execution
+/// evidence by an executor key of its sovereign, and a Stage 2 or Stage 3
+/// record by the key its kind allows.
+fn record_signed(
+    kind: &str,
+    payload: &Value,
+    options: &VerifyEvidenceOptions,
+    executor_keys: &HashMap<&str, &Value>,
+) -> bool {
+    match kind {
+        "justification" => verify_justification_signature(payload, &options.na_public_keys),
+        "retention_checkpoint" => verify_retention_checkpoint(payload, &options.na_public_keys),
+        // v1.3.0: only an executor key signs execution evidence.
+        "execution" => payload
+            .get("signature")
+            .and_then(|sig| str_field(sig, "key_id"))
+            .and_then(|id| executor_keys.get(id))
+            .is_some_and(|key| {
+                str_field(key, "executor_sovereign_id")
+                    == str_field(payload, "executor_sovereign_id")
+                    && key_role(key) == "executor"
+                    && verify_execution_signature(
+                        payload,
+                        str_field(key, "public_key").unwrap_or_default(),
+                    )
+            }),
+        other => out_of_band_signed(other, payload, options, executor_keys),
+    }
+}
+
 /// Whether an export payload of a known kind is well formed.
 fn valid_payload(kind: &str, payload: &Value) -> bool {
     match kind {
@@ -1552,6 +1598,21 @@ fn envelope_mismatches(kind: &str, entry: &Value, payload: &Value) -> Vec<&'stat
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// v1.3.1: whether a retention checkpoint removed as many entries as
+/// positions after `start` (the checkpoint before it, or 0).
+fn checkpoint_count_problem(checkpoint: &Value, start: i64) -> Option<String> {
+    let through = checkpoint["removed_through_sequence"]
+        .as_i64()
+        .unwrap_or_default();
+    (checkpoint["removed_count"].as_i64() != Some(through - start)).then(|| {
+        format!(
+            "removed {} of {} entries after #{start} through #{through}",
+            checkpoint["removed_count"],
+            through - start
+        )
+    })
 }
 
 fn fail(result: &mut EvidenceVerification, seq: Option<i64>, reason: &str, detail: &str) {
@@ -1845,7 +1906,7 @@ pub fn verify_evidence_events<'a>(
             "justification" => {
                 signature(
                     &mut result,
-                    verify_justification_signature(payload, &options.na_public_keys),
+                    record_signed(kind, payload, options, &executor_keys),
                     "JustificationProof",
                     payload,
                     "justification",
@@ -1853,20 +1914,7 @@ pub fn verify_evidence_events<'a>(
             }
             "execution" => {
                 let ev = payload;
-                let key = ev
-                    .get("signature")
-                    .and_then(|sig| str_field(sig, "key_id"))
-                    .and_then(|id| executor_keys.get(id));
-                // v1.3.0: only an executor key signs execution evidence.
-                let signed = key.is_some_and(|key| {
-                    str_field(key, "executor_sovereign_id")
-                        == str_field(ev, "executor_sovereign_id")
-                        && key_role(key) == "executor"
-                        && verify_execution_signature(
-                            ev,
-                            str_field(key, "public_key").unwrap_or_default(),
-                        )
-                });
+                let signed = record_signed(kind, ev, options, &executor_keys);
                 signature(&mut result, signed, "ExecutionEvidence", ev, "execution");
                 result.executions += 1;
                 let decision_id = str_field(ev, "decision_id").unwrap_or_default().to_owned();
@@ -1945,7 +1993,7 @@ pub fn verify_evidence_events<'a>(
             "retention_checkpoint" => {
                 signature(
                     &mut result,
-                    verify_retention_checkpoint(payload, &options.na_public_keys),
+                    record_signed(kind, payload, options, &executor_keys),
                     "RetentionCheckpoint",
                     payload,
                     "retention_checkpoint",
@@ -1960,19 +2008,10 @@ pub fn verify_evidence_events<'a>(
                     None => Some(0),
                     Some(previous) => checkpoints.get(previous).copied(),
                 };
-                if let Some(start) = start {
-                    if payload["removed_count"].as_i64() != Some(through - start) {
-                        fail(
-                            &mut result,
-                            s,
-                            "retention_count_mismatch",
-                            &format!(
-                                "removed {} of {} entries after #{start} through #{through}",
-                                payload["removed_count"],
-                                through - start
-                            ),
-                        );
-                    }
+                if let Some(problem) =
+                    start.and_then(|start| checkpoint_count_problem(payload, start))
+                {
+                    fail(&mut result, s, "retention_count_mismatch", &problem);
                 }
                 checkpoints.insert(record_id, through);
             }
@@ -2343,5 +2382,583 @@ impl Stage3 {
             failures.push(("review_waiver_after_remediation", subject_id.to_owned()));
         }
         failures
+    }
+}
+
+// ── Single records (1.5.0) ────────────────────────────────────────────────────
+
+/// The kinds [`verify_record`] verifies: each entry kind of an evidence
+/// export, and the policies and attestations a decision binds.
+pub const RECORD_KINDS: [&str; 13] = [
+    "decision",
+    "justification",
+    "execution",
+    "retention_checkpoint",
+    "observation",
+    "break_glass",
+    "judgement",
+    "quarantine",
+    "registry",
+    "remediation",
+    "review",
+    "policy",
+    "attestation",
+];
+
+/// What a single record is verified against.
+#[derive(Debug, Clone, Default)]
+pub struct VerifyRecordOptions {
+    /// The NA's keys: they sign decisions, justifications, retention
+    /// checkpoints, judgement, quarantine, registry and review records,
+    /// policies and attestations.
+    pub na_public_keys: Vec<String>,
+    /// Registered keys as `GET /admin/evidence/executor-keys` lists them
+    /// (`key_id`, `public_key`, `executor_sovereign_id`, `role`): they sign
+    /// execution evidence, break-glass and remediation records (executor
+    /// keys) and observations (observer keys).
+    pub executor_keys: Vec<Value>,
+    /// Judge a decision's expiry as of this time. `None`, the default: as of
+    /// the decision's own time (`decision_made_at`).
+    pub at: Option<DateTime<Utc>>,
+    /// A decision only: as [`VerifyDecisionOptions::freshness_proof_issuer_keys`].
+    pub freshness_proof_issuer_keys: Vec<String>,
+    /// A decision only: as [`VerifyDecisionOptions::expected_policies`].
+    pub expected_policies: Option<Vec<Value>>,
+    /// A decision only: as [`VerifyDecisionOptions::expected_attestation`].
+    pub expected_attestation: Option<Value>,
+}
+
+/// Outcome of [`verify_record`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordVerification {
+    /// The kind the record was verified as.
+    pub kind: String,
+    /// The record's id, when it has one.
+    pub record_id: Option<String>,
+    /// The record is authentic, well formed and in the form the reference
+    /// writes.
+    pub verified: bool,
+    /// The first failure's reason code; for a verified record `verified`,
+    /// or for a decision the reference's reason (`authorized`,
+    /// `unauthorized_...`).
+    pub reason: String,
+    /// Whether a decision authorizes its action; absent for other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized: Option<bool>,
+    /// Every failure, in order (`store_sequence` is always absent).
+    pub failures: Vec<VerificationFailure>,
+    /// Findings that do not fail verification, such as `unsigned_field`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<VerificationFailure>,
+}
+
+impl RecordVerification {
+    fn fail(&mut self, reason: &str, detail: &str) {
+        if self.verified {
+            self.reason = reason.to_owned();
+        }
+        self.verified = false;
+        self.failures.push(VerificationFailure {
+            store_sequence: None,
+            reason: reason.to_owned(),
+            detail: detail.to_owned(),
+        });
+    }
+}
+
+/// The model an export entry kind other than a decision holds.
+fn payload_model(kind: &str) -> Option<&'static str> {
+    match kind {
+        "justification" => Some("JustificationProof"),
+        "execution" => Some("ExecutionEvidence"),
+        "retention_checkpoint" => Some("RetentionCheckpoint"),
+        other => out_of_band_model(other),
+    }
+}
+
+/// Verify one signed record offline, as [`verify_evidence_events`] verifies
+/// it as an entry of an export, with the same reason codes in the same
+/// order: `unknown_field`, `payload_invalid`, `invalid_signature`,
+/// `non_canonical_form`, and the checks a record carries in itself
+/// (`quarantine_digest_mismatch`, `retention_count_mismatch` for a first
+/// checkpoint, `review_approval_invalid`, `review_same_holder`). The checks
+/// that need the rest of the store (chains, subjects, matches) are an
+/// export's. A decision is verified by [`verify_boundary_decision`], its
+/// expiry as of its own time unless [`VerifyRecordOptions::at`] says
+/// otherwise; a policy or an attestation by its signature and fields.
+pub fn verify_record(
+    kind: &str,
+    record: &Value,
+    options: &VerifyRecordOptions,
+) -> RecordVerification {
+    let mut out = RecordVerification {
+        kind: kind.to_owned(),
+        record_id: None,
+        verified: true,
+        reason: "verified".to_owned(),
+        authorized: None,
+        failures: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let keys = &options.na_public_keys;
+    match kind {
+        "decision" => {
+            let check = verify_boundary_decision(
+                record,
+                &VerifyDecisionOptions {
+                    operator_public_keys: keys.clone(),
+                    freshness_proof_issuer_keys: options.freshness_proof_issuer_keys.clone(),
+                    now: options.at,
+                    expected_policies: options.expected_policies.clone(),
+                    expected_attestation: options.expected_attestation.clone(),
+                    as_of_record_time: options.at.is_none(),
+                },
+            );
+            out.record_id = check.decision_id;
+            out.authorized = Some(check.authorized);
+            if check.accepted {
+                out.reason = check.reason;
+            } else {
+                out.fail(&check.reason, "");
+            }
+        }
+        "policy" | "attestation" => {
+            let (model, id, signed) = if kind == "policy" {
+                let signed = signed_by(policy_canonical(record), record.get("signature"), keys);
+                ("BoundaryPolicy", "policy_id", signed)
+            } else {
+                let canonical = crate::canonical::attestation_canonical(record);
+                let signed = any_signed(canonical, record.get("signatures"), keys);
+                ("MembershipAttestation", "attestation_id", signed)
+            };
+            out.record_id = str_field(record, id).map(str::to_owned);
+            let unknown = unknown_fields(model, record);
+            if !record.is_object() {
+                out.fail("payload_invalid", "");
+            } else if signed && !unknown.is_empty() {
+                out.fail("unknown_field", &unknown.join(", "));
+            } else if !signed {
+                out.fail("invalid_signature", kind);
+            }
+        }
+        _ => {
+            let Some(model) = payload_model(kind) else {
+                out.fail("unknown_entry_kind", kind);
+                return out;
+            };
+            let evidence = VerifyEvidenceOptions::new(keys.clone(), options.executor_keys.clone());
+            let executor_keys: HashMap<&str, &Value> = evidence
+                .executor_keys
+                .iter()
+                .filter_map(|k| Some((str_field(k, "key_id")?, k)))
+                .collect();
+            out.record_id = Some(record_id_of(kind, record)).filter(|id| !id.is_empty());
+            let checked = check_payload_fields(kind, record, &evidence, &executor_keys);
+            if !checked.signed.is_empty() {
+                out.fail("unknown_field", &checked.signed.join(", "));
+                return out;
+            }
+            if !checked.unsigned.is_empty() {
+                out.warnings.push(VerificationFailure {
+                    store_sequence: None,
+                    reason: "unsigned_field".to_owned(),
+                    detail: checked.unsigned.join(", "),
+                });
+                if out_of_band_model(kind).is_some() {
+                    out.fail("payload_invalid", &checked.unsigned.join(", "));
+                    return out;
+                }
+            }
+            let payload = &checked.payload;
+            if !valid_payload(kind, payload) {
+                out.fail("payload_invalid", "");
+                return out;
+            }
+            if !record_signed(kind, payload, &evidence, &executor_keys) {
+                out.fail("invalid_signature", kind);
+            } else if !non_canonical_fields(model, payload).is_empty() {
+                out.fail("non_canonical_form", kind);
+            }
+            match kind {
+                "retention_checkpoint"
+                    if str_field(payload, "previous_checkpoint_id").is_none() =>
+                {
+                    if let Some(problem) = checkpoint_count_problem(payload, 0) {
+                        out.fail("retention_count_mismatch", &problem);
+                    }
+                }
+                "quarantine" => {
+                    if payload_digest(&payload["record"]).ok().as_deref()
+                        != str_field(payload, "record_digest")
+                    {
+                        out.fail("quarantine_digest_mismatch", "");
+                    }
+                }
+                "review" => {
+                    if let Some(problem) = review_approval_problem(payload, keys) {
+                        out.fail("review_approval_invalid", &problem);
+                    }
+                    if review_holder_problem(&ReviewHolders::of(payload)).is_some() {
+                        let decider = str_field(payload, "decided_by").unwrap_or_default();
+                        out.fail("review_same_holder", decider);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+// ── Store anchors (1.5.0; the reference's since 1.2.0) ────────────────────────
+
+validator!(
+    valid_anchor,
+    shape(
+        vec![
+            ("anchor_sequence", positive()),
+            ("sovereign_id", string()),
+            ("store_sequence", positive()),
+            ("entry_digest", string()),
+            ("anchored_at", utc_timestamp()),
+            ("previous_anchor_digest", absent(string())),
+            ("issued_by", string()),
+            ("signature", optional(signature())),
+        ],
+        true
+    )
+);
+
+/// Anchors from a JSON file as the reference reads held anchors
+/// (`genesis-mesh evidence verify-export --known-anchors <file>`): a JSON
+/// array, an object with `anchors`, one anchor, or JSON Lines, in strict
+/// JSON. Each must be a `StoreAnchor` ([`check_anchors`]). Returned in
+/// `anchor_sequence` order.
+pub fn parse_anchors(text: &str) -> Result<Vec<Value>> {
+    let json_space = |c: char| matches!(c, ' ' | '\t' | '\r' | '\n');
+    let text = text.trim_matches(json_space);
+    let data = if text.starts_with('[') || text.starts_with('{') {
+        match crate::strict_json::parse_strict_json(text) {
+            Ok(value) => value,
+            Err(GenesisMeshError::StrictJson { reason, .. }) if reason == "invalid_json" => {
+                let lines = text
+                    .split('\n')
+                    .filter(|line| !line.trim_matches(json_space).is_empty())
+                    .map(crate::strict_json::parse_strict_json)
+                    .collect::<Result<Vec<Value>>>()?;
+                Value::Array(lines)
+            }
+            Err(other) => return Err(other),
+        }
+    } else {
+        Value::Array(Vec::new())
+    };
+    let raw = match data {
+        Value::Object(ref map) => map
+            .get("anchors")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(vec![data.clone()])),
+        other => other,
+    };
+    let Value::Array(raw) = raw else {
+        return Err(GenesisMeshError::Verification(
+            "anchors must be a list".into(),
+        ));
+    };
+    check_anchors(raw)
+}
+
+/// Check that each value is a `StoreAnchor` (exactly its fields, positions
+/// from 1, `anchored_at` in UTC) and order them by `anchor_sequence`, as the
+/// reference reads held anchors.
+pub fn check_anchors(anchors: Vec<Value>) -> Result<Vec<Value>> {
+    if let Some(bad) = anchors.iter().find(|a| !valid_anchor(Some(a))) {
+        let at = bad.get("anchor_sequence").cloned().unwrap_or(Value::Null);
+        return Err(GenesisMeshError::Verification(format!(
+            "not a store anchor (anchor_sequence {at})"
+        )));
+    }
+    let mut anchors = anchors;
+    anchors.sort_by_key(|a| a["anchor_sequence"].as_i64());
+    Ok(anchors)
+}
+
+/// One problem found in a run of anchors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorFailure {
+    /// The anchor's position.
+    pub anchor_sequence: Option<i64>,
+    /// Reason code, identical to the Python reference.
+    pub reason: String,
+    /// Extra context.
+    pub detail: String,
+}
+
+/// Outcome of [`verify_store_anchors`] (the reference's `AnchorVerification`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorVerification {
+    /// No failures.
+    pub verified: bool,
+    /// Anchors checked.
+    pub checked_anchors: u64,
+    /// The first anchor's position.
+    pub first_anchor_sequence: Option<i64>,
+    /// The last anchor's position.
+    pub last_anchor_sequence: Option<i64>,
+    /// The highest store position the anchors name.
+    pub anchored_through_sequence: Option<i64>,
+    /// Every failure, in order.
+    pub failures: Vec<AnchorFailure>,
+}
+
+/// Verify a run of anchors ordered by `anchor_sequence`, as the reference's
+/// `verify_store_anchors`: each signed by one of the NA keys
+/// (`anchor_invalid_signature`; `None` skips signatures), of `sovereign_id`
+/// when given (`anchor_sovereign_mismatch`), positions without gaps
+/// (`anchor_sequence_gap`), each naming the digest of the one before and the
+/// first at position 1 naming none (`anchor_chain_break`), store positions
+/// and times increasing (`anchor_not_increasing`). The run need not start at
+/// 1: an auditor may hold only recent anchors.
+pub fn verify_store_anchors(
+    anchors: &[Value],
+    na_public_keys: Option<&[String]>,
+    sovereign_id: Option<&str>,
+) -> AnchorVerification {
+    let mut result = AnchorVerification {
+        verified: true,
+        checked_anchors: 0,
+        first_anchor_sequence: None,
+        last_anchor_sequence: None,
+        anchored_through_sequence: None,
+        failures: Vec::new(),
+    };
+    let fail = |result: &mut AnchorVerification, n: i64, reason: &str, detail: &str| {
+        result.verified = false;
+        result.failures.push(AnchorFailure {
+            anchor_sequence: Some(n),
+            reason: reason.to_owned(),
+            detail: detail.to_owned(),
+        });
+    };
+    let at = |a: &Value| micros(str_field(a, "anchored_at").unwrap_or_default()).ok();
+    let mut prev: Option<&Value> = None;
+    for anchor in anchors {
+        let n = anchor["anchor_sequence"].as_i64().unwrap_or_default();
+        let store_sequence = anchor["store_sequence"].as_i64().unwrap_or_default();
+        result.checked_anchors += 1;
+        result.first_anchor_sequence.get_or_insert(n);
+        result.last_anchor_sequence = Some(n);
+        if let Some(keys) = na_public_keys {
+            if !signed_by(anchor_canonical(anchor), anchor.get("signature"), keys) {
+                fail(&mut result, n, "anchor_invalid_signature", "");
+            }
+        }
+        if let Some(sovereign) = sovereign_id {
+            let named = str_field(anchor, "sovereign_id").unwrap_or_default();
+            if named != sovereign {
+                fail(&mut result, n, "anchor_sovereign_mismatch", named);
+            }
+        }
+        let previous_digest = str_field(anchor, "previous_anchor_digest");
+        match prev {
+            None => {
+                if n == 1 && previous_digest.is_some() {
+                    fail(
+                        &mut result,
+                        n,
+                        "anchor_chain_break",
+                        "the first anchor names a previous anchor",
+                    );
+                }
+            }
+            Some(prev) => {
+                let prev_n = prev["anchor_sequence"].as_i64().unwrap_or_default();
+                if n != prev_n + 1 {
+                    let detail = format!("after {prev_n}");
+                    fail(&mut result, n, "anchor_sequence_gap", &detail);
+                } else if previous_digest != anchor_digest(prev).ok().as_deref() {
+                    fail(&mut result, n, "anchor_chain_break", "");
+                }
+                if store_sequence <= prev["store_sequence"].as_i64().unwrap_or_default()
+                    || at(anchor) < at(prev)
+                {
+                    fail(&mut result, n, "anchor_not_increasing", "");
+                }
+            }
+        }
+        let through = result.anchored_through_sequence.unwrap_or_default();
+        result.anchored_through_sequence = Some(through.max(store_sequence));
+        prev = Some(anchor);
+    }
+    result
+}
+
+/// The retention checkpoint in a run that explains where the run starts at
+/// `first`: one that removed every entry before it and names its link.
+fn starting_checkpoint<'a>(events: &[&'a Value], first: &Value) -> Option<&'a Value> {
+    let entry = &first["entry"];
+    let first_sequence = entry["store_sequence"].as_i64()?;
+    events.iter().find_map(|event| {
+        let payload = &event["payload"];
+        (str_field(&event["entry"], "entry_kind") == Some("retention_checkpoint")
+            && valid_checkpoint(Some(payload))
+            && unknown_fields("RetentionCheckpoint", payload).is_empty()
+            && payload["removed_through_sequence"].as_i64() == Some(first_sequence - 1)
+            && str_field(payload, "last_removed_entry_digest")
+                == str_field(entry, "prev_entry_digest"))
+        .then_some(payload)
+    })
+}
+
+/// The retention checkpoint in an export that explains where it starts, or
+/// `None` (the reference's `export_checkpoint`): an export of a store after
+/// retention starts right after what was removed, and its chains continue
+/// from the checkpoint's resource and observation positions, so pass it as
+/// [`VerifyEvidenceOptions::checkpoint`]. The checkpoint is itself an entry
+/// of the export, verified with the rest.
+pub fn export_checkpoint(events: &[Value]) -> Option<Value> {
+    let first = events
+        .iter()
+        .min_by_key(|e| e["entry"]["store_sequence"].as_i64())?;
+    let all: Vec<&Value> = events.iter().collect();
+    starting_checkpoint(&all, first).cloned()
+}
+
+/// How an export lines up with the anchors held (the reference's
+/// `anchors` summary).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorCoverage {
+    /// Anchors held.
+    pub anchors_checked: u64,
+    /// Anchors whose entry the export holds as anchored.
+    pub anchors_matched: u64,
+    /// Anchors before the export's first entry.
+    pub anchors_before_export: u64,
+    /// Anchors after the export's last entry.
+    pub anchors_after_export: u64,
+    /// The export starts at entry 1, right after a checkpoint it holds, or
+    /// (with `from_anchor`) right after a held anchor.
+    pub linked_start: bool,
+    /// The highest position an anchor matched.
+    pub anchored_through_sequence: Option<i64>,
+    /// Entries after that position.
+    pub unanchored_entries: u64,
+}
+
+/// Check a contiguous export against anchors held out of band, as the
+/// reference's `check_events_against_anchors`, adding failures to `result`:
+///
+/// * each anchor inside the run names its entry's digest as received
+///   (`anchor_mismatch`, `anchor_entry_missing`); entries are hash-linked, so
+///   a match covers every earlier entry of the run;
+/// * the run is tied at its start: entry 1, right after a retention
+///   checkpoint it holds or, with `from_anchor`, right after a held anchor
+///   its first entry links to (`export_not_linked_to_anchors`; an anchor
+///   right before the run that its first entry does not link to is
+///   `anchor_mismatch`);
+/// * no anchor follows its last entry (`export_ends_before_anchor`).
+///
+/// `partial` accepts a deliberate slice and skips both ends.
+pub fn check_events_against_anchors(
+    events: &[Value],
+    anchors: &[Value],
+    result: &mut EvidenceVerification,
+    partial: bool,
+    from_anchor: bool,
+) -> AnchorCoverage {
+    let sequence = |e: &Value| e["entry"]["store_sequence"].as_i64().unwrap_or_default();
+    let by_sequence: HashMap<i64, &Value> = events.iter().map(|e| (sequence(e), e)).collect();
+    let mut ordered: Vec<&Value> = events.iter().collect();
+    ordered.sort_by_key(|e| sequence(e));
+    let first = ordered.first().copied();
+    let first_seq = first.map(sequence);
+    let last_seq = ordered.last().map(|e| sequence(e));
+    let (mut matched, mut before, mut beyond) = (0u64, 0u64, 0u64);
+    let mut anchored_through: Option<i64> = None;
+    let mut linked_start = first.is_some_and(|first| {
+        first_seq == Some(1) || starting_checkpoint(&ordered, first).is_some()
+    });
+    let mut after_anchor: Option<i64> = None;
+    for anchor in anchors {
+        let seq = anchor["store_sequence"].as_i64().unwrap_or_default();
+        let number = anchor["anchor_sequence"].as_i64().unwrap_or_default();
+        let anchored = str_field(anchor, "entry_digest");
+        let (Some(first), Some(first_seq), Some(last_seq)) = (first, first_seq, last_seq) else {
+            beyond += 1;
+            continue;
+        };
+        if seq > last_seq {
+            beyond += 1;
+            continue;
+        }
+        if seq == first_seq - 1 {
+            if str_field(&first["entry"], "prev_entry_digest") == anchored {
+                after_anchor = Some(number);
+                linked_start = linked_start || from_anchor;
+                matched += 1;
+                anchored_through = Some(anchored_through.unwrap_or_default().max(seq));
+            } else {
+                let detail = format!("the run does not continue from anchor {number}");
+                fail(result, Some(first_seq), "anchor_mismatch", &detail);
+            }
+            continue;
+        }
+        if seq < first_seq {
+            before += 1;
+            continue;
+        }
+        let detail = format!("anchor {number}");
+        match by_sequence.get(&seq) {
+            None => fail(result, Some(seq), "anchor_entry_missing", &detail),
+            Some(event) => {
+                let received = entry_digest(&event["entry"]).ok();
+                if str_field(event, "entry_digest") != anchored || received.as_deref() != anchored {
+                    fail(result, Some(seq), "anchor_mismatch", &detail);
+                } else {
+                    matched += 1;
+                    anchored_through = Some(anchored_through.unwrap_or_default().max(seq));
+                }
+            }
+        }
+    }
+    // A held anchor commits to every entry before the one it names, so a run
+    // not tied at its start leaves entries the anchors prove exist
+    // unaccounted for.
+    if let (false, Some(first_seq), false, false) =
+        (anchors.is_empty(), first_seq, linked_start, partial)
+    {
+        let why = match after_anchor {
+            Some(n) => format!(
+                "the export starts right after held anchor {n}, which proves the entries before \
+                 it existed, not that they are kept: export from entry 1 (with the retention \
+                 checkpoint that removed entries, if any), or verify it as an export since that \
+                 anchor (--from-anchor)"
+            ),
+            None => format!(
+                "the export starts at entry {first_seq} and holds neither entry 1 nor the \
+                 retention checkpoint that removed the entries before it ({before} held \
+                 anchor(s) before it): export from entry 1, or include that checkpoint's entry"
+            ),
+        };
+        fail(
+            result,
+            Some(first_seq),
+            "export_not_linked_to_anchors",
+            &why,
+        );
+    }
+    if beyond > 0 && !partial {
+        let detail = format!("{beyond} anchor(s) after the last entry");
+        fail(result, last_seq, "export_ends_before_anchor", &detail);
+    }
+    let floor = anchored_through.unwrap_or_default();
+    AnchorCoverage {
+        anchors_checked: anchors.len() as u64,
+        anchors_matched: matched,
+        anchors_before_export: before,
+        anchors_after_export: beyond,
+        linked_start,
+        anchored_through_sequence: anchored_through,
+        unanchored_entries: by_sequence.keys().filter(|&&s| s > floor).count() as u64,
     }
 }

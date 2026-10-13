@@ -179,6 +179,28 @@ pub fn payload_digest(payload: &Value) -> Result<String> {
     canonical_digest(payload)
 }
 
+/// A store anchor's signed fields (1.5.0, as the reference signs them since
+/// 1.2.0): every field but `signature`, an absent previous anchor digest left
+/// out, and `anchored_at` in the form Pydantic writes it.
+fn anchor_fields(anchor: &Value) -> Result<Value> {
+    let mut fields = without(anchor, &["signature"], &["previous_anchor_digest"]);
+    if let Some(at) = fields.get("anchored_at").and_then(Value::as_str) {
+        let written = python_timestamp(parse_timestamp(at)?);
+        fields["anchored_at"] = Value::String(written);
+    }
+    Ok(fields)
+}
+
+/// `StoreAnchor.to_canonical_json()`: the body the NA signs.
+pub fn anchor_canonical(anchor: &Value) -> Result<String> {
+    canonical_json(&anchor_fields(anchor)?)
+}
+
+/// `StoreAnchor.digest()`: the next anchor links to it.
+pub fn anchor_digest(anchor: &Value) -> Result<String> {
+    canonical_digest(&anchor_fields(anchor)?)
+}
+
 /// A UTC timestamp in the form Pydantic re-serialises unchanged: microsecond
 /// precision, `Z` suffix, fraction omitted when zero. Any other form would
 /// come back changed from the NA and break a signature over it.
@@ -283,6 +305,25 @@ mod tests {
             out_of_band_canonical(&record).unwrap(),
             r#"{"nested":{"x":null}}"#
         );
+    }
+
+    #[test]
+    fn signs_an_anchor_in_the_form_pydantic_writes() {
+        let anchor = json!({
+            "anchor_sequence": 1, "sovereign_id": "s", "store_sequence": 3,
+            "entry_digest": "d", "anchored_at": "2026-10-01T09:56:14.500+00:00",
+            "previous_anchor_digest": null, "issued_by": "na", "signature": {"sig": "x"},
+        });
+        assert_eq!(
+            anchor_canonical(&anchor).unwrap(),
+            r#"{"anchor_sequence":1,"anchored_at":"2026-10-01T09:56:14.500000Z","entry_digest":"d","issued_by":"na","sovereign_id":"s","store_sequence":3}"#
+        );
+        let mut next = anchor.clone();
+        next["previous_anchor_digest"] = json!("p");
+        assert!(anchor_canonical(&next)
+            .unwrap()
+            .contains(r#""previous_anchor_digest":"p""#));
+        assert!(anchor_canonical(&json!({"anchored_at": "late"})).is_err());
     }
 
     #[test]

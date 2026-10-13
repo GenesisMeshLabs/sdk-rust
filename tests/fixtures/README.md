@@ -14,3 +14,10 @@ the Python core: an attestation, a boundary policy, allowed and denied decisions
 with justification proofs, execution evidence on one resource chain, a retention
 checkpoint, a JSON Lines export of the store and the NA's own verification of it.
 Its keys are test keys generated for the fixture.
+
+`anchors.json` (1.5.0) holds store anchors over that export, signed with the public
+test seed `bytes(range(32))`, and the reference's answers: `verify_store_anchors` for
+runs of anchors, and the whole `genesis-mesh evidence verify-export --known-anchors
+--format json` output for exports checked against them. Regenerate it with
+`python scripts/generate_anchor_vectors.py` (the core installed); the core's
+verification corpus supersedes it once that covers anchors.
