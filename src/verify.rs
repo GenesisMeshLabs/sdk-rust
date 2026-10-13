@@ -21,7 +21,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::key_history::{succession_form_refusal, succession_signed_by, NaKeyHistory, NaKeys};
+use crate::key_history::{
+    succession_form_refusal, succession_signed_by, NaKeyHistory, NaKeys,
+    SUCCESSION_MIN_LEAD_SECONDS,
+};
 use crate::strict::{
     is_known_entry_kind, non_canonical_fields, prefixed_unknown_fields, unknown_fields,
     without_unknown_fields,
@@ -1035,13 +1038,27 @@ pub fn verify_boundary_decision(
         Some(history) => NaKeys::History(history.clone()),
         None => NaKeys::Any(options.operator_public_keys.clone()),
     };
-    if !decision_signed(decision, &keys.at(Some(made_at))) {
+    let valid_then = keys.at(Some(made_at));
+    let Some(signer) = valid_then
+        .iter()
+        .find(|k| decision_signed(decision, std::slice::from_ref(k)))
+    else {
         // v1.5.0: signed by a key of the history, but not the one valid then.
         return reject(if decision_signed(decision, &keys.not_at(made_at)) {
             "na_key_not_valid_at_time"
         } else {
             "invalid_signature"
         });
+    };
+    // 1.5.0 review fixes: a key with an end vouches for a decision only as
+    // long as the longest lifetime the NA issues past that end.
+    let until =
+        micros(str_field(decision, "decision_valid_until").unwrap_or_default()).unwrap_or_default();
+    if keys
+        .history()
+        .is_some_and(|history| history.decision_outlives_key(signer, until))
+    {
+        return reject("decision_outlives_key");
     }
     // v1.2.0: an authentic decision with a signed field this crate does not
     // know, or expected inputs it cannot read, is refused by name.
@@ -1872,6 +1889,10 @@ pub fn verify_evidence_events<'a>(
     let run: Vec<&Value> = events.into_iter().collect();
     let mut cited_result = EvidenceVerification::empty();
     let mut merged = !pack;
+    // 1.5.0 review fixes: the latest recorded_at so far in the run, and
+    // whether the entries just visited are a block retention carried forward.
+    let mut clock: Option<i64> = None;
+    let mut carrying = false;
     let visits = cited
         .iter()
         .map(|e| (*e, true))
@@ -1898,6 +1919,36 @@ pub fn verify_evidence_events<'a>(
         let entry = &event["entry"];
         let seq = entry["store_sequence"].as_i64().unwrap_or_default();
         let s = Some(seq);
+        let recorded = micros(str_field(entry, "recorded_at").unwrap_or_default()).ok();
+        // 1.5.0 review fixes: in a contiguous run, an entry is recorded no
+        // more than the tolerance before an earlier one (entries retention
+        // carried forward keep their first time); an NA-signed entry's key
+        // must also be valid at the latest earlier time.
+        let mut not_before: Option<i64> = None;
+        if options.contiguous && chained {
+            let kind = str_field(entry, "entry_kind").unwrap_or_default();
+            let adjacent = prev
+                .as_ref()
+                .and_then(|p| p["store_sequence"].as_i64())
+                .is_some_and(|p| seq == p + 1);
+            let after_checkpoint = prev
+                .as_ref()
+                .is_some_and(|p| str_field(p, "entry_kind") == Some("retention_checkpoint"));
+            carrying = CARRIED_KINDS.contains(&kind) && adjacent && (after_checkpoint || carrying);
+            if !carrying {
+                let at = recorded.unwrap_or_default();
+                if clock.is_some_and(|clock| at < clock - RECORD_TIME_TOLERANCE_MICROS) {
+                    let detail = format!(
+                        "recorded at {}, after an entry recorded at {}",
+                        iso_time(at),
+                        iso_time(clock.unwrap_or_default())
+                    );
+                    fail(result, s, "recorded_at_out_of_order", &detail);
+                }
+                not_before = clock;
+                clock = Some(clock.map_or(at, |clock| clock.max(at)));
+            }
+        }
         if entry_digest(entry).ok().as_deref() != str_field(event, "entry_digest") {
             fail(result, s, "entry_digest_mismatch", "");
         }
@@ -1948,10 +1999,20 @@ pub fn verify_evidence_events<'a>(
         prev = Some(entry.clone());
 
         let kind = str_field(entry, "entry_kind").unwrap_or_default();
-        // v1.5.0: NA signatures by the key valid at the entry's time.
-        let recorded = micros(str_field(entry, "recorded_at").unwrap_or_default()).ok();
-        let na_now = na.at(recorded);
-        let na_other = recorded.map(|at| na.not_at(at)).unwrap_or_default();
+        // v1.5.0: NA signatures by the key valid at the entry's time (1.5.0
+        // review fixes: and at the latest earlier time).
+        let mut na_now = na.at(recorded);
+        if let (Some(before), Some(at)) = (not_before, recorded) {
+            if before > at {
+                let later = na.at(Some(before));
+                na_now.retain(|k| later.contains(k));
+            }
+        }
+        let na_other: Vec<String> = na_all
+            .iter()
+            .filter(|k| !na_now.contains(k))
+            .cloned()
+            .collect();
         if !is_known_entry_kind(kind) {
             // v1.2.0: a kind from a later release; its envelope still chains.
             fail(result, s, "unknown_entry_kind", kind);
@@ -1960,6 +2021,7 @@ pub fn verify_evidence_events<'a>(
         let mut signers = na_all.clone();
         if kind == "key_succession" {
             signers.extend(na.history().and_then(|h| h.root_public_key.clone()));
+            signers.extend(str_field(&event["payload"], "new_public_key").map(str::to_owned));
         }
         let checked = check_payload_fields(kind, &event["payload"], &signers, &executor_keys);
         if !checked.signed.is_empty() {
@@ -2007,6 +2069,21 @@ pub fn verify_evidence_events<'a>(
             let by_other = !signed && record_signed(kind, record, &na_other, &executor_keys);
             (signed, by_other)
         };
+        // 1.5.0 review fixes: a registered key verifies only records after it
+        // was registered and before it was retired, where the store placed it.
+        let placed = |result: &mut EvidenceVerification, kind: &str, record: &Value| -> bool {
+            let Some(key) = signing_key(kind, record, &executor_keys) else {
+                return true;
+            };
+            match placement_problem(key, seq, recorded.unwrap_or_default()) {
+                None => true,
+                Some(reason) => {
+                    let id = str_field(key, "key_id").unwrap_or("-");
+                    fail(result, s, reason, &format!("{kind} signed by {id}"));
+                    false
+                }
+            }
+        };
         if !valid_payload(kind, payload) {
             fail(result, s, "payload_invalid", "");
             continue;
@@ -2043,6 +2120,21 @@ pub fn verify_evidence_events<'a>(
                     decision,
                     "decision",
                 );
+                // 1.5.0 review fixes: valid longer than its key may vouch for.
+                if signed && non_canonical_fields("BoundaryDecision", decision).is_empty() {
+                    let signer = na_now
+                        .iter()
+                        .find(|k| verify_decision_signature(decision, std::slice::from_ref(k)));
+                    let until =
+                        micros(str_field(decision, "decision_valid_until").unwrap_or_default())
+                            .unwrap_or_default();
+                    if let (Some(signer), Some(history)) = (signer, na.history()) {
+                        if history.decision_outlives_key(signer, until) {
+                            let id = str_field(decision, "decision_id").unwrap_or_default();
+                            fail(result, s, "decision_outlives_key", id);
+                        }
+                    }
+                }
                 result.decisions += 1;
                 let id = str_field(decision, "decision_id")
                     .unwrap_or_default()
@@ -2074,13 +2166,15 @@ pub fn verify_evidence_events<'a>(
             }
             "execution" => {
                 let ev = payload;
-                signature(
-                    result,
-                    signed_now(kind, ev),
-                    "ExecutionEvidence",
-                    ev,
-                    "execution",
-                );
+                if placed(result, kind, ev) {
+                    signature(
+                        result,
+                        signed_now(kind, ev),
+                        "ExecutionEvidence",
+                        ev,
+                        "execution",
+                    );
+                }
                 result.executions += 1;
                 let decision_id = str_field(ev, "decision_id").unwrap_or_default().to_owned();
                 let decision = decisions.get(&decision_id);
@@ -2168,6 +2262,7 @@ pub fn verify_evidence_events<'a>(
                 }
             }
             "retention_checkpoint" => {
+                let failed_before = result.failures.len();
                 signature(
                     result,
                     signed_now(kind, payload),
@@ -2175,6 +2270,31 @@ pub fn verify_evidence_events<'a>(
                     payload,
                     "retention_checkpoint",
                 );
+                // 1.5.0 review fixes: the chains an authentic checkpoint
+                // removed continue from its heads.
+                if result.failures.len() == failed_before {
+                    let heads: BTreeMap<String, ResourceHead> =
+                        serde_json::from_value(payload["resource_heads"].clone())
+                            .unwrap_or_default();
+                    for (resource, head) in heads {
+                        let behind = resource_heads
+                            .get(&resource)
+                            .is_none_or(|held| held.resource_sequence < head.resource_sequence);
+                        if behind {
+                            resource_heads.insert(resource, head);
+                        }
+                    }
+                    for (resource, position) in payload["observation_heads"]
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                    {
+                        let position = position.as_i64().unwrap_or_default();
+                        if observation_heads.get(resource).copied().unwrap_or(0) < position {
+                            observation_heads.insert(resource.clone(), position);
+                        }
+                    }
+                }
                 // v1.3.1: a checkpoint removed as many entries as positions,
                 // counted from the checkpoint before it when the run holds
                 // that one, or from entry 1 when there is none.
@@ -2194,8 +2314,10 @@ pub fn verify_evidence_events<'a>(
             }
             "observation" | "break_glass" => {
                 let observation = kind == "observation";
-                let signed = signed_now(kind, payload);
-                signature(result, signed, model_of(kind), payload, kind);
+                if placed(result, kind, payload) {
+                    let signed = signed_now(kind, payload);
+                    signature(result, signed, model_of(kind), payload, kind);
+                }
                 let resource = str_field(payload, "resource_id")
                     .unwrap_or_default()
                     .to_owned();
@@ -2339,8 +2461,10 @@ pub fn verify_evidence_events<'a>(
                 }
             }
             "remediation" => {
-                let signed = signed_now(kind, payload);
-                signature(result, signed, model_of(kind), payload, kind);
+                if placed(result, kind, payload) {
+                    let signed = signed_now(kind, payload);
+                    signature(result, signed, model_of(kind), payload, kind);
+                }
                 result.remediations += 1;
                 not_decisions.insert(record_id);
                 // A run from its start: entry 1, or right after the checkpoint.
@@ -2365,7 +2489,6 @@ pub fn verify_evidence_events<'a>(
             // successions and the root key signed it.
             "key_succession" => {
                 result.key_successions += 1;
-                let root = na.history().and_then(|h| h.root_public_key.clone());
                 let id = str_field(payload, "succession_id").unwrap_or_default();
                 let previous = str_field(payload, "previous_public_key").unwrap_or_default();
                 if let Some(refusal) = succession_form_refusal(payload, &signers) {
@@ -2379,16 +2502,8 @@ pub fn verify_evidence_events<'a>(
                     || !succession_signed_by(payload, &[previous.to_owned()])
                 {
                     fail(result, s, "invalid_signature", kind);
-                } else if let Some(root) = root {
-                    let digest = key_succession_digest(payload).unwrap_or_default();
-                    if !succession_signed_by(payload, &[root]) {
-                        fail(result, s, "succession_invalid_root_signature", id);
-                    } else if na
-                        .history()
-                        .is_some_and(|h| !h.succession_digests.contains(&digest))
-                    {
-                        fail(result, s, "succession_not_in_history", id);
-                    }
+                } else if let Some(reason) = succession_entry_problem(payload, &na, recorded) {
+                    fail(result, s, reason, id);
                 }
             }
             "archive" => {
@@ -2403,6 +2518,131 @@ pub fn verify_evidence_events<'a>(
         merge_cited(&mut main, &mut cited_result);
     }
     main
+}
+
+/// What a key succession entry signed by its outgoing key still lacks (1.5.0;
+/// review fixes in the order of the reference): the root key's signature
+/// (given the key history), the new key's (`succession_invalid_new_key_signature`),
+/// its place in the history (`succession_not_in_history`), and a lead of
+/// [`SUCCESSION_MIN_LEAD_SECONDS`] after the time the store recorded it, or
+/// issued no later than it takes effect (`succession_backdated`).
+fn succession_entry_problem(
+    payload: &Value,
+    na: &NaKeys,
+    recorded: Option<i64>,
+) -> Option<&'static str> {
+    let root = na.history().and_then(|h| h.root_public_key.clone());
+    if let Some(root) = &root {
+        if !succession_signed_by(payload, std::slice::from_ref(root)) {
+            return Some("succession_invalid_root_signature");
+        }
+    }
+    let new_key = str_field(payload, "new_public_key")
+        .unwrap_or_default()
+        .to_owned();
+    if !succession_signed_by(payload, &[new_key]) {
+        return Some("succession_invalid_new_key_signature");
+    }
+    let digest = key_succession_digest(payload).unwrap_or_default();
+    if root.is_some()
+        && na
+            .history()
+            .is_some_and(|h| !h.succession_digests.contains(&digest))
+    {
+        return Some("succession_not_in_history");
+    }
+    let time = |key: &str| micros(str_field(payload, key).unwrap_or_default()).unwrap_or_default();
+    let effective = time("effective_at");
+    let lead = SUCCESSION_MIN_LEAD_SECONDS * 1_000_000;
+    if time("issued_at") > effective || recorded.is_some_and(|at| at + lead > effective) {
+        return Some("succession_backdated");
+    }
+    None
+}
+
+/// 1.5.0 review fixes: the kinds retention appends again after its
+/// checkpoint, each with the time it was first recorded.
+pub const CARRIED_KINDS: [&str; 3] = ["registry", "key_succession", "archive"];
+
+/// How far, in microseconds, an entry's `recorded_at` may fall behind an
+/// earlier entry's in store order (clock skew between NA instances).
+const RECORD_TIME_TOLERANCE_MICROS: i64 = 300 * 1_000_000;
+
+/// The store positions of the entries retention carried forward: entries of
+/// [`CARRIED_KINDS`] in an unbroken run of positions right after a retention
+/// checkpoint entry (1.5.0 review fixes).
+pub fn carried_sequences(events: &[&Value]) -> HashSet<i64> {
+    let mut sorted: Vec<&&Value> = events.iter().collect();
+    sorted.sort_by_key(|e| e["entry"]["store_sequence"].as_i64());
+    let mut out = HashSet::new();
+    let mut previous: Option<&Value> = None;
+    let mut carrying = false;
+    for event in sorted {
+        let entry = &event["entry"];
+        let seq = entry["store_sequence"].as_i64().unwrap_or_default();
+        let adjacent = previous.is_some_and(|p| p["store_sequence"].as_i64() == Some(seq - 1));
+        let after_checkpoint =
+            previous.is_some_and(|p| str_field(p, "entry_kind") == Some("retention_checkpoint"));
+        let kind = str_field(entry, "entry_kind").unwrap_or_default();
+        carrying = CARRIED_KINDS.contains(&kind) && adjacent && (after_checkpoint || carrying);
+        if carrying {
+            out.insert(seq);
+        }
+        previous = Some(entry);
+    }
+    out
+}
+
+fn iso_time(at: i64) -> String {
+    DateTime::from_timestamp_micros(at)
+        .map(crate::canonical::python_timestamp)
+        .unwrap_or_default()
+}
+
+/// The registered key a key-signed record names, when it belongs to the
+/// record's sovereign and has the role its kind needs.
+fn signing_key<'a>(
+    kind: &str,
+    record: &Value,
+    executor_keys: &HashMap<&str, &'a Value>,
+) -> Option<&'a Value> {
+    let (role, sovereign) = match kind {
+        "observation" => ("observer", "observer_sovereign_id"),
+        "execution" | "break_glass" | "remediation" => ("executor", "executor_sovereign_id"),
+        _ => return None,
+    };
+    record
+        .get("signature")
+        .and_then(|sig| str_field(sig, "key_id"))
+        .and_then(|id| executor_keys.get(id).copied())
+        .filter(|key| {
+            str_field(key, "executor_sovereign_id") == str_field(record, sovereign)
+                && key_role(key) == role
+        })
+}
+
+/// Why a record at this store position and time (microseconds) may not
+/// carry this key's signature, or `None` (1.5.0 review fixes): a key placed
+/// in the store (`registered_sequence` or `registered_at_time`, and
+/// `retired_sequence` or `retired_at_time`) verifies only records after its
+/// registration and before its retirement (`evidence_unknown_executor`,
+/// `evidence_executor_key_retired`). A key with no place is not placed.
+pub fn placement_problem(key: &Value, store_sequence: i64, at: i64) -> Option<&'static str> {
+    let sequence = |field: &str| key[field].as_i64();
+    let time = |field: &str| str_field(key, field).and_then(|s| micros(s).ok());
+    let (registered_seq, registered_at) =
+        (sequence("registered_sequence"), time("registered_at_time"));
+    if registered_seq.is_none() && registered_at.is_none() {
+        return None;
+    }
+    let registered = registered_seq.is_some_and(|r| r < store_sequence)
+        || registered_at.is_some_and(|r| r <= at);
+    if !registered {
+        return Some("evidence_unknown_executor");
+    }
+    let retired = sequence("retired_sequence").is_some_and(|r| r < store_sequence)
+        || time("retired_at_time").is_some_and(|r| r <= at);
+    retired.then_some("evidence_executor_key_retired")
 }
 
 /// An audit pack's cited records' failures and warnings, folded into the
@@ -2673,15 +2913,17 @@ pub struct VerifyRecordOptions {
     pub key_history: Option<NaKeyHistory>,
 }
 
-/// The time an NA-signed record read on its own is signed at (1.5.0), in
-/// microseconds, when the reference names one.
+/// The time an NA-signed record read on its own is placed at in the key
+/// history (1.5.0 review fixes: the reference's `NA_RECORD_TIME_FIELDS`), in
+/// microseconds.
 fn own_time(kind: &str, record: &Value) -> Option<i64> {
-    let field = match kind {
-        "retention_checkpoint" => "created_at",
-        "policy" | "attestation" => "issued_at",
-        "decision" => "decision_made_at",
-        _ => return None,
+    let model = match kind {
+        "decision" => "BoundaryDecision",
+        "policy" => "BoundaryPolicy",
+        "attestation" => "MembershipAttestation",
+        other => payload_model(other)?,
     };
+    let field = crate::key_history::na_record_time_field(model)?;
     micros(str_field(record, field)?).ok()
 }
 
@@ -2903,10 +3145,10 @@ pub fn verify_record(
 /// key history, the root key's signature (`succession_invalid_root_signature`)
 /// and its place in the history (`succession_not_in_history`).
 fn succession_alone(payload: &Value, na: &NaKeys) -> Option<&'static str> {
-    let root = na.history().and_then(|h| h.root_public_key.clone());
     let all = na.all();
     let mut signers = all.clone();
-    signers.extend(root.clone());
+    signers.extend(na.history().and_then(|h| h.root_public_key.clone()));
+    signers.extend(str_field(payload, "new_public_key").map(str::to_owned));
     if let Some(refusal) = succession_form_refusal(payload, &signers) {
         return Some(if refusal == "unknown_field" {
             "invalid_signature"
@@ -2919,14 +3161,8 @@ fn succession_alone(payload: &Value, na: &NaKeys) -> Option<&'static str> {
     {
         return Some("invalid_signature");
     }
-    let root = root?;
-    if !succession_signed_by(payload, &[root]) {
-        return Some("succession_invalid_root_signature");
-    }
-    let digest = key_succession_digest(payload).unwrap_or_default();
-    na.history()
-        .filter(|h| !h.succession_digests.contains(&digest))
-        .map(|_| "succession_not_in_history")
+    // Read alone it has no store time: its lead is not checked.
+    succession_entry_problem(payload, na, None)
 }
 
 // ── Store anchors (1.5.0; the reference's since 1.2.0) ────────────────────────

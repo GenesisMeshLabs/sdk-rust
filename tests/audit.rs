@@ -8,10 +8,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use sha2::Digest;
 
 use genesis_mesh_sdk::{
-    audit_pack::{check_completeness, parse_changes, verify_audit_pack, VerifyPackOptions},
+    audit_pack::{
+        check_completeness, parse_changes, registry_keys, report_cell, verify_audit_pack, Change,
+        VerifyPackOptions,
+    },
     canonical::{parse_timestamp, received_canonical},
     json,
-    key_history::{verify_key_history, NaKeyHistory, NaKeys},
+    key_history::{na_record_time_field, verify_key_history, NaKeyHistory, NaKeys},
     parse_strict_json,
     verify::{
         check_anchors, parse_export_lines, verify_boundary_decision, verify_evidence_events,
@@ -40,8 +43,30 @@ fn at(value: &Value) -> i64 {
         .timestamp_micros()
 }
 
-fn changes(rows: &Value) -> Vec<genesis_mesh_sdk::audit_pack::Change> {
-    parse_changes(&rows.to_string(), false).unwrap()
+/// Changes built from the vector's rows, as the reference's `changes_of`
+/// builds them (not read from a file).
+fn changes(rows: &Value) -> Vec<Change> {
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(i, c)| Change {
+            index: i + 1,
+            resource_id: c["resource_id"].as_str().unwrap().to_owned(),
+            action: c["action"].as_str().unwrap().to_owned(),
+            changed_at: at(&c["changed_at"]),
+            source: c["source"].as_str().map(str::to_owned),
+            source_event_id: c["source_event_id"].as_str().map(str::to_owned),
+            actor: c["actor"].as_str().map(str::to_owned),
+        })
+        .collect()
+}
+
+fn failures(list: &[genesis_mesh_sdk::verify::VerificationFailure]) -> Value {
+    json!(list
+        .iter()
+        .map(|f| json!({"store_sequence": f.store_sequence, "reason": f.reason}))
+        .collect::<Vec<_>>())
 }
 
 fn sorted_set(items: impl IntoIterator<Item = String>) -> Value {
@@ -90,10 +115,46 @@ fn evaluate(v: &Value) -> Value {
                 )
             };
             let result = verify_evidence_events(&events, &options);
-            json!({"failures": result.failures.iter()
-                .map(|f| json!({"store_sequence": f.store_sequence, "reason": f.reason}))
-                .collect::<Vec<_>>()})
+            json!({"failures": failures(&result.failures), "warnings": failures(&result.warnings)})
         }
+        "verify_range" => {
+            let events = parse_export_lines(input["lines"].as_str().unwrap()).unwrap();
+            let cited = parse_export_lines(input["cited_lines"].as_str().unwrap()).unwrap();
+            let options = VerifyEvidenceOptions {
+                key_history: Some(history(input)),
+                prior: Some(cited),
+                ..VerifyEvidenceOptions::new(
+                    Vec::new(),
+                    input["executor_keys"].as_array().unwrap().clone(),
+                )
+            };
+            json!({"failures": failures(&verify_evidence_events(&events, &options).failures)})
+        }
+        "registry_keys" => {
+            let events = parse_export_lines(input["lines"].as_str().unwrap()).unwrap();
+            let all: Vec<&Value> = events.iter().collect();
+            let mut placed = registry_keys(&all, &NaKeys::History(history(input)));
+            placed.sort_by(|a, b| a["key_id"].as_str().cmp(&b["key_id"].as_str()));
+            json!({"keys": placed.iter().map(|k| json!({
+                "key_id": k["key_id"], "public_key": k["public_key"], "role": k["role"],
+                "registered_sequence": k["registered_sequence"],
+                "registered_at": k["registered_at_time"],
+                "retired_sequence": k["retired_sequence"], "retired_at": k["retired_at_time"],
+            })).collect::<Vec<_>>()})
+        }
+        "report_cell" => json!({"cells": input["values"].as_array().unwrap().iter()
+            .map(report_cell).collect::<Vec<_>>()}),
+        "changes_file" => match parse_changes(
+            input["text"].as_str().unwrap(),
+            input["csv"].as_bool().unwrap(),
+        ) {
+            Err(_) => json!({"refused": true}),
+            Ok(read) => json!({
+                "refused": false,
+                "changes": read.iter().map(Change::to_json).collect::<Vec<_>>(),
+            }),
+        },
+        "record_time" => json!({"field": na_record_time_field(v["model"].as_str().unwrap())}),
         "verify_anchors" => {
             let anchors = check_anchors(input["anchors"].as_array().unwrap().clone()).unwrap();
             let keys = NaKeys::History(history(input));
@@ -134,6 +195,19 @@ fn evaluate(v: &Value) -> Value {
             let mut options =
                 VerifyPackOptions::new(input["root_public_key"].as_str().unwrap(), held);
             options.changes = input.get("changes").filter(|c| !c.is_null()).map(changes);
+            if let Some(period) = input.get("period").and_then(Value::as_array) {
+                options.period = Some((at(&period[0]), at(&period[1])));
+            }
+            if let Some(prior) = input.get("prior_entries").and_then(Value::as_object) {
+                if !prior.is_empty() {
+                    options.prior_entries = Some(
+                        prior
+                            .iter()
+                            .map(|(k, v)| (k.parse().unwrap(), v.as_str().unwrap().to_owned()))
+                            .collect(),
+                    );
+                }
+            }
             let result = verify_audit_pack(&files, &options);
             let mut out = json!({
                 "verified": result.verified,
@@ -147,6 +221,9 @@ fn evaluate(v: &Value) -> Value {
                     .iter()
                     .map(|c| c["index"].clone())
                     .collect::<Vec<_>>());
+            }
+            if let Some(period) = &result.period {
+                out["period"] = json!({"from": period["from"], "until": period["until"]});
             }
             out
         }
@@ -180,6 +257,7 @@ fn evaluate(v: &Value) -> Value {
                     .collect::<Vec<_>>(),
                 "unmatched_changes": indices("unmatched_changes"),
                 "outside_period": indices("outside_period"),
+                "duplicate_changes": indices("duplicate_changes"),
                 "unmatched_records": report["unmatched_records"].as_array().unwrap().iter()
                     .map(|r| r["record_id"].clone())
                     .collect::<Vec<_>>(),
@@ -209,5 +287,5 @@ fn every_vector_gives_the_reference_outcome() {
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
-    assert_eq!(vectors.len(), 44);
+    assert_eq!(vectors.len(), 105);
 }

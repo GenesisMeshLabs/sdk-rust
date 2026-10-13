@@ -10,11 +10,11 @@
 
 ### Fixed
 
-- **A retention checkpoint with a field outside its signature is refused.**
-  An export entry holding one is `payload_invalid`, as the reference refuses
-  it (its checkpoint model forbids unknown fields); this crate warned
-  `unsigned_field` and verified the rest. Justifications and execution
-  evidence keep the warning.
+- **A record with a field outside its signature is refused.** A retention
+  checkpoint, and every record kind from 1.3.0 on, holding one is
+  `payload_invalid`, as the reference refuses it; this crate warned
+  `unsigned_field` for a checkpoint and verified the rest. Justifications and
+  execution evidence keep the warning.
 
 ### Upgrading
 

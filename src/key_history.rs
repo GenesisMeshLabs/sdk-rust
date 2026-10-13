@@ -4,8 +4,9 @@
 //! (`trust/key_succession.py`, `models/key_succession.py`), with its reason
 //! codes.
 //!
-//! A `KeySuccessionRecord` names the NA's next key, signed by the root key (kept offline) and by the
-//! outgoing NA key. Keys inside the records prove nothing alone: the history
+//! A `KeySuccessionRecord` names the NA's next key, signed by the root key
+//! (kept offline), by the new key (proof that it is held) and by the outgoing
+//! NA key. Keys inside the records prove nothing alone: the history
 //! is accepted only from the root key down, and nothing after the first
 //! refused record is accepted.
 //!
@@ -33,7 +34,7 @@ use crate::{
         key_succession_canonical, key_succession_digest, micros, parse_timestamp, python_timestamp,
         received_canonical,
     },
-    strict::{non_canonical_fields, unknown_fields},
+    strict::{non_canonical_fields, unknown_fields, without_unknown_fields},
 };
 
 /// How long after a succession takes effect the outgoing key is still
@@ -42,6 +43,44 @@ use crate::{
 pub const SUCCESSION_HANDOVER_SECONDS: i64 = 300;
 
 const HANDOVER_MICROS: i64 = SUCCESSION_HANDOVER_SECONDS * 1_000_000;
+
+/// A succession takes effect at least this long, in seconds, after the store
+/// records it (1.5.0 review fixes; `succession_backdated` otherwise).
+pub const SUCCESSION_MIN_LEAD_SECONDS: i64 = 60;
+
+/// The longest lifetime of a decision the NA issues, in seconds (1.5.0
+/// review fixes): a decision signed by a key with an end stays valid no
+/// longer than that end, the hand-over and this lifetime
+/// (`decision_outlives_key`).
+pub const MAX_DECISION_LIFETIME_SECONDS: i64 = 300;
+
+/// The time an NA-signed record read on its own (outside the store) is
+/// placed at in the key history, by model: the reference's
+/// `NA_RECORD_TIME_FIELDS` (1.5.0 review fixes). In the store every entry is
+/// placed at its `recorded_at`.
+pub const NA_RECORD_TIME_FIELDS: [(&str, &str); 13] = [
+    ("ArchiveRecord", "archived_at"),
+    ("AuditPackManifest", "created_at"),
+    ("BoundaryDecision", "decision_made_at"),
+    ("BoundaryPolicy", "issued_at"),
+    ("JudgementRecord", "judged_at"),
+    ("JustificationProof", "proof_issued_at"),
+    ("MembershipAttestation", "issued_at"),
+    ("QuarantineRecord", "quarantined_at"),
+    ("RecognitionTreaty", "issued_at"),
+    ("RegistryRecord", "effective_at"),
+    ("RetentionCheckpoint", "created_at"),
+    ("ReviewRecord", "decided_at"),
+    ("StoreAnchor", "anchored_at"),
+];
+
+/// The field an NA-signed record of `model` is placed at when read alone.
+pub fn na_record_time_field(model: &str) -> Option<&'static str> {
+    NA_RECORD_TIME_FIELDS
+        .iter()
+        .find(|(m, _)| *m == model)
+        .map(|(_, field)| *field)
+}
 
 /// One key of the NA's history and the times it is valid at (microseconds
 /// since the epoch).
@@ -126,6 +165,28 @@ impl NaKeyHistory {
             .filter(|k| k.accepts(at))
             .map(|k| k.public_key.clone())
             .collect()
+    }
+
+    /// The key of the history with this public key.
+    pub fn key_for(&self, public_key: &str) -> Option<&NaKey> {
+        self.keys.iter().find(|k| k.public_key == public_key)
+    }
+
+    /// True when a decision signed by `public_key` stays valid
+    /// (`valid_until`, microseconds) past what that key may vouch for (1.5.0
+    /// review fixes): the key's end (its succession, or its enforced
+    /// `valid_to`), the hand-over and [`MAX_DECISION_LIFETIME_SECONDS`].
+    pub fn decision_outlives_key(&self, public_key: &str, valid_until: i64) -> bool {
+        let Some(key) = self.key_for(public_key) else {
+            return false;
+        };
+        let ends = [
+            key.succeeded_at,
+            key.valid_to.filter(|_| key.valid_to_enforced),
+        ];
+        ends.into_iter().flatten().min().is_some_and(|end| {
+            valid_until > end + HANDOVER_MICROS + MAX_DECISION_LIFETIME_SECONDS * 1_000_000
+        })
     }
 
     /// The key the NA signs with at `at` (`None` in a gap after an enforced
@@ -314,8 +375,11 @@ pub fn succession_form_refusal(raw: &Value, keys: &[String]) -> Option<&'static 
 
 /// Why a genesis block is refused, or `None`, in the reference's order:
 /// `genesis_invalid`, `genesis_root_mismatch` (it does not name the root key
-/// held; without one, its own is used), `genesis_invalid_signature` (no
-/// signature by that key over the block as received).
+/// held; without one, its own is used), then (1.5.0 review fixes) a field
+/// this crate does not know or a form the reference does not write, signed
+/// by that key (`unknown_field`, `non_canonical_form`), and
+/// `genesis_invalid_signature` (no signature by that key over the block as
+/// received).
 pub fn genesis_refusal(raw: &Value, root_public_key: Option<&str>) -> Option<&'static str> {
     if !raw.is_object() || !valid_genesis(raw) {
         return Some("genesis_invalid");
@@ -325,10 +389,20 @@ pub fn genesis_refusal(raw: &Value, root_public_key: Option<&str>) -> Option<&'s
     if named != root {
         return Some("genesis_root_mismatch");
     }
-    if !genesis_signed_by(raw, root) {
-        return Some("genesis_invalid_signature");
+    // 1.5.0 review fixes: the trust anchor of the history is held to the
+    // rules of every signed root: a field this crate does not know, or a form
+    // the reference does not write, is refused by name when the root key
+    // signed it.
+    let model = "GenesisBlock";
+    let unknown = !unknown_fields(model, raw).is_empty();
+    let signed = genesis_signed_by(raw, root);
+    if signed && unknown {
+        return Some("unknown_field");
     }
-    None
+    if signed && !non_canonical_fields(model, raw).is_empty() {
+        return Some("non_canonical_form");
+    }
+    (!signed).then_some("genesis_invalid_signature")
 }
 
 /// What one succession must continue: the key it succeeds, the previous
@@ -348,27 +422,31 @@ pub struct SuccessionContext<'a> {
 }
 
 /// Why one succession is refused, or `None`, in the reference's order:
-/// `payload_invalid`, then its form (`invalid_signature`, `unknown_field`,
-/// `non_canonical_form`), `succession_sovereign_mismatch`,
-/// `succession_chain_break`, `succession_key_reused`,
+/// `payload_invalid` (its unknown fields set aside), then its form
+/// (`unknown_field` when one of its signers signed it, otherwise
+/// `invalid_signature`; `non_canonical_form`),
+/// `succession_sovereign_mismatch`, `succession_chain_break`,
+/// `succession_key_reused` (a key the history held, or the root key),
+/// `succession_backdated` (issued after it takes effect),
 /// `succession_not_increasing`, `succession_after_expiry`,
 /// `succession_invalid_root_signature`,
-/// `succession_invalid_previous_signature`. The second value is true when
+/// `succession_invalid_new_key_signature` (the new key's proof of
+/// possession), `succession_invalid_previous_signature`. The second value is true when
 /// the record read as a `KeySuccessionRecord` (its `key_sequence` names the
 /// failure).
 pub fn succession_refusal(raw: &Value, at: &SuccessionContext<'_>) -> (Option<&'static str>, bool) {
-    if !raw.is_object() {
+    // 1. It parses, its unknown fields set aside.
+    if !raw.is_object() || !valid_succession(&without_unknown_fields("KeySuccessionRecord", raw)) {
         return (Some("payload_invalid"), false);
     }
-    let signers = [
+    // 2. No unknown field (signed by one of its signers: `unknown_field`),
+    //    the canonical form.
+    let mut signers = vec![
         at.root_public_key.to_owned(),
         at.previous.public_key.clone(),
     ];
-    if !unknown_fields("KeySuccessionRecord", raw).is_empty() {
-        return (succession_form_refusal(raw, &signers), false);
-    }
-    if !valid_succession(raw) {
-        return (Some("payload_invalid"), false);
+    if valid_public_key(&raw["new_public_key"]) {
+        signers.extend(raw["new_public_key"].as_str().map(str::to_owned));
     }
     if let Some(form) = succession_form_refusal(raw, &signers) {
         return (Some(form), true);
@@ -384,11 +462,18 @@ pub fn succession_refusal(raw: &Value, at: &SuccessionContext<'_>) -> (Option<&'
     {
         return (Some("succession_chain_break"), true);
     }
+    // A key the history held, or the root key, is no new key.
     let new_key = field("new_public_key").unwrap_or_default();
-    if !valid_public_key(&raw["new_public_key"]) || at.held_keys.iter().any(|k| k == new_key) {
+    if !valid_public_key(&raw["new_public_key"])
+        || at.held_keys.iter().any(|k| k == new_key)
+        || new_key == at.root_public_key
+    {
         return (Some("succession_key_reused"), true);
     }
     let effective = time("effective_at");
+    if time("issued_at") > effective {
+        return (Some("succession_backdated"), true);
+    }
     if at.previous.valid_from.is_some_and(|from| effective <= from)
         || time("new_valid_to") <= effective
     {
@@ -399,6 +484,10 @@ pub fn succession_refusal(raw: &Value, at: &SuccessionContext<'_>) -> (Option<&'
     }
     if !succession_signed_by(raw, &[at.root_public_key.to_owned()]) {
         return (Some("succession_invalid_root_signature"), true);
+    }
+    // 1.5.0 review fixes: the new key's own signature proves it is held.
+    if !succession_signed_by(raw, &[new_key.to_owned()]) {
+        return (Some("succession_invalid_new_key_signature"), true);
     }
     if !succession_signed_by(raw, std::slice::from_ref(&at.previous.public_key)) {
         return (Some("succession_invalid_previous_signature"), true);

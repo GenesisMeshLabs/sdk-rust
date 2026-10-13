@@ -1,5 +1,5 @@
-//! Audit packs (1.5.0): offline verification and the completeness check, a
-//! direct port of the Python reference's `audit verify`
+//! Audit packs (1.5.0): offline verification, the completeness check and
+//! the report, a direct port of the Python reference's `audit verify`
 //! (`workflows/audit_pack.py`), with its reason codes. The normative page is
 //! the core's `docs/reference/audit-pack-format.md`.
 //!
@@ -9,23 +9,34 @@
 //! from material the verifier holds itself, the root public key and its
 //! copies of the anchors, in this order:
 //!
-//! 1. the manifest (`manifest_*`); a pack whose manifest fails is not checked
-//!    further;
+//! 1. the manifest (`manifest_*`, `manifest_unknown_file`); a pack whose
+//!    manifest fails is not checked further;
 //! 2. the key history from the root key down (`genesis_*`, the succession
-//!    reasons, `key_history_invalid`); a history that fails stops it;
+//!    reasons, `key_history_invalid`), then the manifest's signature as
+//!    received, by the NA key valid at its `created_at`; a history that
+//!    fails stops it;
 //! 3. the anchors (the anchor reasons, `pack_end_anchor_mismatch`,
-//!    `pack_end_anchor_not_held`, `pack_start_not_tied`,
-//!    `pack_start_anchor_not_held`, and the range against the held anchors);
+//!    `pack_end_anchor_not_held`, `pack_start_not_tied`, `manifest_backdated`,
+//!    the range against the held anchors), and each cited entry against a
+//!    prior pack or a held anchor (`cited_entry_mismatch`, warning
+//!    `cited_entry_unanchored`);
 //! 4. the entries (`entries_invalid`, `pack_range_mismatch`,
 //!    `cited_out_of_range`, then every export reason with the cited records
-//!    as predecessors, `cited_record_missing` among them);
-//! 5. what the records rest on outside the store (`cited_trust_invalid`, the
-//!    `*_invalid_signature` reasons, `cited_policy_*`, `cited_attestation_*`);
-//! 6. with a changes file, the completeness check (`change_unmatched`).
+//!    as predecessors, `cited_record_missing` among them), executor and
+//!    observer keys placed by the registry records the NA signed;
+//! 5. what the records rest on outside the store, checked as received
+//!    (`cited_trust_invalid`, the `*_invalid_signature` reasons,
+//!    `cited_policy_*`, `cited_attestation_*`);
+//! 6. the report: `report.md` is what [`render_report`] writes from the pack's
+//!    files (`report_mismatch`);
+//! 7. the period: with one asked for, the pack covers it
+//!    (`pack_period_not_covered`);
+//! 8. with a changes file, the completeness check (`change_unmatched`;
+//!    warnings `changes_outside_period`, `change_duplicate`).
 //!
 //! No network and no private key: every key comes from the caller.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -34,20 +45,20 @@ use sha2::{Digest, Sha256};
 use crate::{
     auth::{canonical_json, verify_canonical},
     canonical::{
-        attestation_canonical, entry_digest, micros, out_of_band_canonical, parse_timestamp,
-        policy_canonical, policy_digest, policy_set_digest, python_timestamp, received_canonical,
+        entry_digest, micros, parse_timestamp, policy_digest, policy_set_digest, python_timestamp,
+        received_canonical,
     },
     key_history::{verify_key_history, NaKeyHistory, NaKeys},
-    strict::unknown_fields,
+    strict::{non_canonical_fields, unknown_fields},
     strict_json::parse_strict_json,
     verify::{
-        check_anchors, check_events_against_anchors, parse_export_lines, reads_as, signed_by,
-        verify_boundary_decision, verify_evidence_events, verify_store_anchors, AnchorCoverage,
-        EvidenceVerification, VerifyDecisionOptions, VerifyEvidenceOptions,
+        carried_sequences, check_anchors, check_events_against_anchors, parse_export_lines,
+        reads_as, verify_boundary_decision, verify_evidence_events, verify_store_anchors,
+        AnchorCoverage, EvidenceVerification, VerifyDecisionOptions, VerifyEvidenceOptions,
     },
 };
 
-/// The pack format and version this module reads.
+/// The pack format this module reads.
 pub const PACK_FORMAT: &str = "gm.audit.pack";
 /// The signed manifest.
 pub const MANIFEST_FILE: &str = "manifest.json";
@@ -69,6 +80,8 @@ pub const ENTRIES_FILE: &str = "entries.jsonl";
 pub const CITED_FILE: &str = "cited.jsonl";
 /// The policy versions the records were made under.
 pub const POLICIES_FILE: &str = "policies.jsonl";
+/// The NA's remediation states and notices at pack time (not signed).
+pub const STATES_FILE: &str = "states.json";
 /// The attestations the records name.
 pub const ATTESTATIONS_FILE: &str = "trust/attestations.jsonl";
 /// The treaties for those attestations' issuers.
@@ -77,7 +90,7 @@ pub const TREATIES_FILE: &str = "trust/treaties.jsonl";
 pub const FEEDS_FILE: &str = "trust/feeds.jsonl";
 
 /// Every file of a pack but the manifest (format version 1).
-pub const PACK_FILES: [&str; 12] = [
+pub const PACK_FILES: [&str; 13] = [
     ANCHORS_FILE,
     CHECKS_FILE,
     CITED_FILE,
@@ -87,6 +100,7 @@ pub const PACK_FILES: [&str; 12] = [
     KEY_HISTORY_FILE,
     POLICIES_FILE,
     REPORT_FILE,
+    STATES_FILE,
     ATTESTATIONS_FILE,
     FEEDS_FILE,
     TREATIES_FILE,
@@ -128,6 +142,12 @@ pub struct PackVerification {
     pub keys: Vec<Value>,
     /// The completeness check, with a changes file.
     pub completeness: Option<Value>,
+    /// The period the pack covers (`from`, `until`), and the one it was
+    /// asked for when it names one.
+    pub period: Option<Map<String, Value>>,
+    /// The lines where `report.md` differs from the report the pack renders
+    /// to (`line`, `pack`, `verifier`).
+    pub report_differences: Vec<Value>,
 }
 
 impl PackVerification {
@@ -160,13 +180,12 @@ impl PackVerification {
     /// The failure reason codes, sorted and once each: what two verifiers
     /// compare.
     pub fn reasons(&self) -> Vec<String> {
-        let set: std::collections::BTreeSet<&str> =
-            self.failures.iter().map(|f| f.reason.as_str()).collect();
+        let set: BTreeSet<&str> = self.failures.iter().map(|f| f.reason.as_str()).collect();
         set.into_iter().map(str::to_owned).collect()
     }
 
     /// The reference's JSON form (`audit verify --format json`, without
-    /// `report_differences`).
+    /// `check_differences`).
     pub fn to_json(&self) -> Value {
         let mut out = json!({
             "verified": self.verified,
@@ -178,6 +197,12 @@ impl PackVerification {
         });
         if let Some(anchors) = &self.anchors {
             out["anchors"] = serde_json::to_value(anchors).unwrap_or_default();
+        }
+        if let Some(period) = &self.period {
+            out["period"] = Value::Object(period.clone());
+        }
+        if !self.report_differences.is_empty() {
+            out["report_differences"] = Value::Array(self.report_differences.clone());
         }
         if let Some(completeness) = &self.completeness {
             out["completeness"] = completeness.clone();
@@ -197,7 +222,7 @@ pub struct VerifyPackOptions {
     /// (`no_held_anchors`).
     pub held_anchors: Option<Vec<Value>>,
     /// Executor and observer keys the verifier supplies, for a store without
-    /// registry records (as `GET /admin/evidence/executor-keys` lists them).
+    /// registry records; a key the pack's registry records place wins.
     pub executor_keys: Vec<Value>,
     /// Changes from a log outside Genesis Mesh, for the completeness check.
     pub changes: Option<Vec<Change>>,
@@ -206,6 +231,12 @@ pub struct VerifyPackOptions {
     /// False verifies the files before a manifest exists (the NA writing
     /// `checks.json`).
     pub check_manifest: bool,
+    /// A period the pack must cover (microseconds, from and until):
+    /// `pack_period_not_covered` otherwise.
+    pub period: Option<(i64, i64)>,
+    /// The entries of packs verified before ([`pack_entry_digests`]): the
+    /// entries this pack cites must equal them (`cited_entry_mismatch`).
+    pub prior_entries: Option<HashMap<i64, String>>,
 }
 
 impl VerifyPackOptions {
@@ -218,6 +249,8 @@ impl VerifyPackOptions {
             changes: None,
             tolerance_seconds: DEFAULT_TOLERANCE_SECONDS,
             check_manifest: true,
+            period: None,
+            prior_entries: None,
         }
     }
 }
@@ -252,9 +285,9 @@ fn read_events(data: &[u8]) -> Result<Vec<Value>, String> {
     parse_export_lines(text).map_err(|e| e.to_string())
 }
 
-/// A pack JSON file's bytes: canonical JSON (keys sorted, no whitespace,
-/// characters outside ASCII written as themselves) and an LF.
-pub fn pack_json_bytes(value: &Value) -> Vec<u8> {
+/// Canonical JSON with characters outside ASCII written as themselves, as a
+/// pack's files hold it (`json.dumps(..., ensure_ascii=False)`).
+fn pack_json(value: &Value) -> String {
     fn write(value: &Value, out: &mut String) {
         match value {
             Value::Object(map) => {
@@ -287,6 +320,13 @@ pub fn pack_json_bytes(value: &Value) -> Vec<u8> {
     }
     let mut out = String::new();
     write(value, &mut out);
+    out
+}
+
+/// A pack JSON file's bytes: canonical JSON (keys sorted, no whitespace,
+/// characters outside ASCII written as themselves) and an LF.
+pub fn pack_json_bytes(value: &Value) -> Vec<u8> {
+    let mut out = pack_json(value);
     out.push('\n');
     out.into_bytes()
 }
@@ -301,19 +341,116 @@ fn seq_of(event: &Value) -> i64 {
         .unwrap_or_default()
 }
 
-/// A time as Python's `datetime.isoformat()` writes a UTC one.
-fn isoformat(at: i64) -> String {
+/// A UTC time as the reference writes it (`Z`, microseconds when not zero).
+fn iso(at: i64) -> String {
     chrono::DateTime::from_timestamp_micros(at)
         .map(python_timestamp)
-        .map(|s| match s.strip_suffix('Z') {
-            Some(rest) => format!("{rest}+00:00"),
-            None => s,
-        })
         .unwrap_or_default()
+}
+
+/// A UTC time as Python's `datetime.isoformat()` writes it (`+00:00`).
+fn isoformat(at: i64) -> String {
+    let z = iso(at);
+    match z.strip_suffix('Z') {
+        Some(rest) => format!("{rest}+00:00"),
+        None => z,
+    }
 }
 
 fn time_of(value: &Value, key: &str) -> Option<i64> {
     micros(field(value, key)?).ok()
+}
+
+/// The entries a pack holds, by store position: their digests as received
+/// (what [`VerifyPackOptions::prior_entries`] takes from packs verified
+/// before).
+pub fn pack_entry_digests(
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<HashMap<i64, String>, String> {
+    let entries = read_events(files.get(ENTRIES_FILE).ok_or("entries.jsonl is missing")?)?;
+    Ok(entries
+        .iter()
+        .map(|e| (seq_of(e), entry_digest(&e["entry"]).unwrap_or_default()))
+        .collect())
+}
+
+// ── Signatures as received ───────────────────────────────────────────────────
+
+/// The signature values a record of a registry root carries.
+fn signature_values<'a>(model: &str, raw: &'a Value) -> Vec<&'a str> {
+    let spec = crate::strict::model_spec(model);
+    match spec["signature_field"].as_str() {
+        Some("signatures") => raw["signatures"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| field(s, "sig"))
+            .collect(),
+        Some(name) => field(&raw[name], "sig").into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Whether a signature on `raw` verifies, over its signed form as received,
+/// with one of `keys`.
+fn signed_as_received(model: &str, raw: &Value, keys: &[String]) -> bool {
+    let Ok(body) = received_canonical(model, raw) else {
+        return false;
+    };
+    signature_values(model, raw)
+        .into_iter()
+        .any(|sig| verify_canonical(&body, sig, keys))
+}
+
+/// The form a signed record its signer signed must still pass: no unknown
+/// field, the form the reference writes.
+fn form_refusal(model: &str, raw: &Value) -> Option<&'static str> {
+    if !unknown_fields(model, raw).is_empty() {
+        Some("unknown_field")
+    } else if !non_canonical_fields(model, raw).is_empty() {
+        Some("non_canonical_form")
+    } else {
+        None
+    }
+}
+
+/// `None` when a signature on `raw` verifies, over the record as received,
+/// with the NA key valid at `at`; else why not: `unknown_field` or
+/// `non_canonical_form` for a record its signer signed in another form,
+/// `na_key_not_valid_at_time` for one signed by another key of the history,
+/// `invalid_signature` otherwise (the reference's
+/// `received_signature_reason`).
+pub fn received_signature_reason(
+    model: &str,
+    raw: &Value,
+    keys: &NaKeys,
+    at: Option<i64>,
+) -> Option<&'static str> {
+    if !raw.is_object() {
+        return Some("invalid_signature");
+    }
+    let valid = keys.at(at);
+    if signed_as_received(model, raw, &valid) {
+        return form_refusal(model, raw);
+    }
+    let others: Vec<String> = keys
+        .all()
+        .into_iter()
+        .filter(|k| !valid.contains(k))
+        .collect();
+    if !others.is_empty() && signed_as_received(model, raw, &others) {
+        return Some("na_key_not_valid_at_time");
+    }
+    Some("invalid_signature")
+}
+
+/// As [`received_signature_reason`], for keys with no time (a treaty's
+/// subject keys).
+fn received_by(model: &str, raw: &Value, keys: &[String]) -> Option<&'static str> {
+    if !raw.is_object() || !signed_as_received(model, raw, keys) {
+        return Some("invalid_signature");
+    }
+    form_refusal(model, raw)
 }
 
 // ── The manifest ─────────────────────────────────────────────────────────────
@@ -354,6 +491,8 @@ fn valid_manifest(m: &Value) -> bool {
         && at_least(&m["through_sequence"], 1)
         && optional("start_anchor_sequence", &|v| at_least(v, 1))
         && at_least(&m["end_anchor_sequence"], 1)
+        && optional("period_from", &utc)
+        && optional("period_until", &utc)
         && m["files"].as_array().is_some_and(|files| {
             files.iter().all(|f| {
                 text(&f["path"], 1, 256) && text(&f["sha256"], 64, 64) && at_least(&f["bytes"], 0)
@@ -366,8 +505,8 @@ fn valid_manifest(m: &Value) -> bool {
 }
 
 /// The bytes the reference writes for a manifest it reads: its fields (the
-/// defaults filled), absent optional fields left out, `created_at` as
-/// Pydantic writes it.
+/// defaults filled), absent optional fields left out, times as Pydantic
+/// writes them.
 fn manifest_bytes(m: &Value) -> Option<Vec<u8>> {
     let mut wire = m.as_object()?.clone();
     wire.retain(|_, v| !v.is_null());
@@ -376,11 +515,12 @@ fn manifest_bytes(m: &Value) -> Option<Vec<u8>> {
             return None;
         }
     }
-    let created = parse_timestamp(field(m, "created_at")?).ok()?;
-    wire.insert(
-        "created_at".into(),
-        Value::String(python_timestamp(created)),
-    );
+    for key in ["created_at", "period_from", "period_until"] {
+        if let Some(at) = field(m, key) {
+            let at = parse_timestamp(at).ok()?;
+            wire.insert(key.into(), Value::String(python_timestamp(at)));
+        }
+    }
     Some(pack_json_bytes(&Value::Object(wire)))
 }
 
@@ -432,6 +572,12 @@ fn check_manifest(
         }
     }
     for (path, item) in &listed {
+        if !PACK_FILES.contains(&path.as_str()) {
+            // A pack holds the files of its format and nothing else.
+            let detail = format!("{path} is not a file of the format");
+            result.fail(m, None, "manifest_unknown_file", &detail);
+            continue;
+        }
         match files.get(path) {
             None => result.fail(Some(path), None, "manifest_file_missing", ""),
             Some(data) => {
@@ -451,63 +597,79 @@ fn check_manifest(
     Some(manifest)
 }
 
-/// `None` when the signature verifies with the NA key valid at `at`, else
-/// the reason (`na_key_not_valid_at_time` for another key of the history).
-fn signed_at(
-    verifies: &dyn Fn(&[String]) -> bool,
-    keys: &NaKeys,
-    at: Option<i64>,
-) -> Option<&'static str> {
-    let at = at?;
-    if verifies(&keys.at(Some(at))) {
-        return None;
-    }
-    Some(if verifies(&keys.not_at(at)) {
-        "na_key_not_valid_at_time"
-    } else {
-        "invalid_signature"
-    })
-}
-
 /// Executor and observer keys from the registry records the NA signed (by
-/// the key valid at the entry's time), in store order.
-fn registry_keys(events: &[&Value], keys: &NaKeys) -> Vec<Value> {
-    let mut sorted: Vec<&&Value> = events.iter().collect();
-    sorted.sort_by_key(|e| seq_of(e));
-    let mut out: BTreeMap<String, Value> = BTreeMap::new();
-    for event in sorted {
+/// the key valid at the entry's time), each placed where the store
+/// registered and retired it: by store position, or, for a record backfilled
+/// at an upgrade (`reconstructed`) or carried past retention, by its
+/// `effective_at` (`registered_sequence`, `registered_at_time`,
+/// `retired_sequence`, `retired_at_time`). The reference's `_registry_keys`.
+pub fn registry_keys(events: &[&Value], keys: &NaKeys) -> Vec<Value> {
+    let mut ordered: Vec<&Value> = events.to_vec();
+    ordered.sort_by_key(|e| seq_of(e));
+    let carried = carried_sequences(&ordered);
+    let mut placed: Vec<Value> = Vec::new();
+    for event in ordered {
         let record = &event["payload"];
         if field(&event["entry"], "entry_kind") != Some("registry")
             || !reads_as("RegistryRecord", record)
         {
             continue;
         }
-        let verifies =
-            |k: &[String]| signed_by(out_of_band_canonical(record), record.get("signature"), k);
         let at = time_of(&event["entry"], "recorded_at");
-        if record["signature"].is_null() || signed_at(&verifies, keys, at).is_some() {
+        if received_signature_reason("RegistryRecord", record, keys, at).is_some() {
             continue;
         }
+        let seq = seq_of(event);
+        let by_time = record["reconstructed"] == true || carried.contains(&seq);
+        let effective = field(record, "effective_at")
+            .and_then(|s| parse_timestamp(s).ok())
+            .map(python_timestamp);
         let named = |key: &str| field(record, key).filter(|v| !v.is_empty());
-        if let (Some("executor_key_registered"), Some(key_id), Some(public_key), Some(sovereign)) = (
-            field(record, "event"),
-            named("key_id"),
-            named("public_key"),
-            named("executor_sovereign_id"),
-        ) {
-            out.insert(
-                key_id.to_owned(),
-                json!({
+        let key_id = named("key_id");
+        let position = placed.iter().position(|k| field(k, "key_id") == key_id);
+        match (field(record, "event"), key_id) {
+            (Some("executor_key_registered"), Some(key_id)) => {
+                let (Some(public_key), Some(sovereign)) =
+                    (named("public_key"), named("executor_sovereign_id"))
+                else {
+                    continue;
+                };
+                if position.is_some_and(|i| field(&placed[i], "public_key") == Some(public_key)) {
+                    continue; // registered again: the first registration places it
+                }
+                let key = json!({
                     "key_id": key_id,
                     "public_key": public_key,
                     "executor_sovereign_id": sovereign,
                     "role": field(record, "key_role").unwrap_or("executor"),
                     "resource_prefix": record.get("resource_prefix").cloned().unwrap_or(Value::Null),
-                }),
-            );
+                    "registered_sequence": if by_time { Value::Null } else { json!(seq) },
+                    "registered_at_time": if by_time { json!(effective) } else { Value::Null },
+                    "retired_sequence": null,
+                    "retired_at_time": null,
+                });
+                match position {
+                    Some(i) => placed[i] = key,
+                    None => placed.push(key),
+                }
+            }
+            (Some("executor_key_retired"), Some(_)) => {
+                if let Some(i) = position {
+                    let held = &mut placed[i];
+                    if held["retired_sequence"].is_null() && held["retired_at_time"].is_null() {
+                        held["retired"] = json!(true);
+                        if by_time {
+                            held["retired_at_time"] = json!(effective);
+                        } else {
+                            held["retired_sequence"] = json!(seq);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    out.into_values().collect()
+    placed
 }
 
 fn file_of(seq: Option<i64>, from_sequence: i64) -> &'static str {
@@ -593,13 +755,10 @@ pub fn verify_audit_pack(
                 "names another sovereign",
             );
         }
-        let verifies = |k: &[String]| signed_by(out_of_band_canonical(m), m.get("signature"), k);
-        let refusal = if m["signature"].is_null() {
-            Some("invalid_signature")
-        } else {
-            signed_at(&verifies, &keys, time_of(m, "created_at"))
-        };
-        if let Some(reason) = refusal {
+        // Over the manifest as received, not a form with its defaults filled in.
+        if let Some(reason) =
+            received_signature_reason("AuditPackManifest", m, &keys, time_of(m, "created_at"))
+        {
             let reason = if reason == "invalid_signature" {
                 "manifest_invalid_signature"
             } else {
@@ -647,17 +806,13 @@ pub fn verify_audit_pack(
         .as_ref()
         .and_then(|m| m["through_sequence"].as_i64())
         .unwrap_or(last);
-    let recorded = |e: &Value| {
-        time_of(&e["entry"], "recorded_at")
-            .map(isoformat)
-            .unwrap_or_default()
-    };
+    let recorded = |e: &Value| time_of(&e["entry"], "recorded_at");
     result.range = json!({
         "from_sequence": first,
         "through_sequence": last,
         "entries": entries.len(),
-        "first_recorded_at": recorded(first_event),
-        "last_recorded_at": recorded(last_event),
+        "first_recorded_at": recorded(first_event).map(isoformat).unwrap_or_default(),
+        "last_recorded_at": recorded(last_event).map(isoformat).unwrap_or_default(),
     })
     .as_object()
     .cloned()
@@ -686,10 +841,8 @@ pub fn verify_audit_pack(
         let detail = format!("anchor {}", failure.anchor_sequence.unwrap_or_default());
         result.fail(Some(ANCHORS_FILE), None, &failure.reason, &detail);
     }
-    let by_sequence: HashMap<i64, &Value> = pack_anchors
-        .iter()
-        .map(|a| (a["anchor_sequence"].as_i64().unwrap_or_default(), a))
-        .collect();
+    let number = |a: &Value| a["anchor_sequence"].as_i64().unwrap_or_default();
+    let by_sequence: HashMap<i64, &Value> = pack_anchors.iter().map(|a| (number(a), a)).collect();
     let anchor_at =
         |m: &Value, key: &str| m[key].as_i64().and_then(|n| by_sequence.get(&n).copied());
     let end = match &manifest {
@@ -712,9 +865,13 @@ pub fn verify_audit_pack(
     let start_named = manifest
         .as_ref()
         .is_some_and(|m| m["start_anchor_sequence"].as_i64().is_some());
-    let start_anchor = manifest
-        .as_ref()
-        .and_then(|m| anchor_at(m, "start_anchor_sequence"));
+    let start_anchor = match &manifest {
+        Some(m) => anchor_at(m, "start_anchor_sequence"),
+        None => pack_anchors
+            .iter()
+            .rev()
+            .find(|a| a["store_sequence"].as_i64() == Some(first - 1)),
+    };
     let first_prev = field(&first_event["entry"], "prev_entry_digest");
     if start_named
         && start_anchor.is_none_or(|a| {
@@ -729,6 +886,19 @@ pub fn verify_audit_pack(
             "pack_start_not_tied",
             detail,
         );
+    }
+    if let Some(m) = &manifest {
+        // The NA writes a pack after its end anchor and its last entry.
+        let latest = recorded(last_event)
+            .into_iter()
+            .chain(end.and_then(|end| time_of(end, "anchored_at")))
+            .max()
+            .unwrap_or_default();
+        let created = time_of(m, "created_at").unwrap_or_default();
+        if created < latest {
+            let detail = format!("created at {}, before {}", iso(created), iso(latest));
+            result.fail(Some(MANIFEST_FILE), None, "manifest_backdated", &detail);
+        }
     }
 
     // The start checkpoint: one (in the range or cited) that removed the
@@ -753,6 +923,8 @@ pub fn verify_audit_pack(
         );
     }
 
+    let held = options.held_anchors.as_deref().unwrap_or_default();
+    let held_by: HashMap<i64, &Value> = held.iter().map(|a| (number(a), a)).collect();
     match &options.held_anchors {
         None => result.warn(
             None,
@@ -766,57 +938,81 @@ pub fn verify_audit_pack(
                 let detail = format!("held anchor {}", failure.anchor_sequence.unwrap_or_default());
                 result.fail(Some("known-anchors"), None, &failure.reason, &detail);
             }
-            let held_by: HashMap<i64, &Value> = held
-                .iter()
-                .map(|a| (a["anchor_sequence"].as_i64().unwrap_or_default(), a))
-                .collect();
             for anchor in &pack_anchors {
-                let n = anchor["anchor_sequence"].as_i64().unwrap_or_default();
+                let n = number(anchor);
                 if held_by.get(&n).is_some_and(|mine| anchor_wire(mine) != anchor_wire(anchor)) {
                     let detail = format!("anchor {n} differs from the one held");
                     result.fail(Some(ANCHORS_FILE), anchor["store_sequence"].as_i64(), "anchor_mismatch", &detail);
                 }
             }
-            let number = |a: &Value| a["anchor_sequence"].as_i64().unwrap_or_default();
             if let Some(end) = end.filter(|end| !held_by.contains_key(&number(end))) {
                 let detail = format!("anchor {} is not among the anchors held", number(end));
                 result.fail(Some(ANCHORS_FILE), Some(last), "pack_end_anchor_not_held", &detail);
-            }
-            if let Some(start) = start_anchor.filter(|start| {
-                !held_by.contains_key(&number(start)) && start_checkpoint.is_none() && first != 1
-            }) {
-                let detail = format!("anchor {} is not among the anchors held", number(start));
-                result.fail(Some(ANCHORS_FILE), Some(first), "pack_start_anchor_not_held", &detail);
             }
             let inside: Vec<Value> = held
                 .iter()
                 .filter(|a| a["store_sequence"].as_i64().is_some_and(|s| s <= last))
                 .cloned()
                 .collect();
-            let mut tied_result = EvidenceVerification::empty();
-            let coverage = check_events_against_anchors(&entries, &inside, &mut tied_result, false, true);
-            for f in tied_result.failures {
+            let mut tied = EvidenceVerification::empty();
+            let coverage = check_events_against_anchors(&entries, &inside, &mut tied, false, true);
+            for f in tied.failures {
                 result.fail(Some(ENTRIES_FILE), f.store_sequence, &f.reason, &f.detail);
             }
             result.anchors = Some(coverage);
         }
     }
 
-    // 4. Executor keys: from registry records the NA signed, then keys
-    // supplied out of band.
+    // A cited entry is checked against what the verifier holds at its
+    // position: an entry of a pack verified before, or an anchor naming that
+    // very entry. Neither: a warning.
+    let held_at: HashMap<i64, &Value> = held
+        .iter()
+        .map(|a| (a["store_sequence"].as_i64().unwrap_or_default(), a))
+        .collect();
+    for event in &cited {
+        let seq = seq_of(event);
+        let digest = entry_digest(&event["entry"]).unwrap_or_default();
+        let known = options.prior_entries.as_ref().and_then(|p| p.get(&seq));
+        let anchor = held_at.get(&seq);
+        if known.is_some_and(|k| *k != digest) {
+            let detail = "differs from the entry a prior pack holds";
+            result.fail(Some(CITED_FILE), Some(seq), "cited_entry_mismatch", detail);
+        } else if let Some(anchor) =
+            anchor.filter(|a| field(a, "entry_digest") != Some(digest.as_str()))
+        {
+            let detail = format!("differs from held anchor {}", number(anchor));
+            result.fail(Some(CITED_FILE), Some(seq), "cited_entry_mismatch", &detail);
+        } else if known.is_none() && anchor.is_none() {
+            let detail = "signed, but neither a prior pack nor a held anchor covers this entry";
+            result.warn(
+                Some(CITED_FILE),
+                Some(seq),
+                "cited_entry_unanchored",
+                detail,
+            );
+        }
+    }
+
+    // 4. Executor keys: keys supplied out of band, then the registry records
+    // the NA signed, which win.
     let all: Vec<&Value> = cited.iter().chain(entries.iter()).collect();
-    let mut executor_keys = registry_keys(&all, &keys);
-    let supplied: HashSet<&str> = options
+    let registered = registry_keys(&all, &keys);
+    let mut executor_keys: Vec<Value> = options
         .executor_keys
         .iter()
-        .filter_map(|k| field(k, "key_id"))
+        .filter(|k| {
+            !registered
+                .iter()
+                .any(|r| field(r, "key_id") == field(k, "key_id"))
+        })
+        .cloned()
         .collect();
-    executor_keys.retain(|k| !field(k, "key_id").is_some_and(|id| supplied.contains(id)));
-    executor_keys.extend(options.executor_keys.iter().cloned());
+    executor_keys.extend(registered);
     let verification = verify_evidence_events(
         &entries,
         &VerifyEvidenceOptions {
-            checkpoint: start_checkpoint,
+            checkpoint: start_checkpoint.clone(),
             key_history: Some(history.clone()),
             prior: Some(cited.clone()),
             ..VerifyEvidenceOptions::new(Vec::new(), executor_keys)
@@ -843,18 +1039,60 @@ pub fn verify_audit_pack(
     // 5. What the records cite outside the store.
     check_cited_trust(files, &entries, &cited, &history, &keys, &mut result);
 
-    // 6. Completeness.
+    // 6. The report renders from the pack's own files.
+    if let Some(m) = &manifest {
+        check_report(files, m, &entries, &mut result);
+    }
+
+    // 7. The period the pack covers: from its start anchor (or the retention
+    // checkpoint it starts after, or its first entry) to its end anchor.
+    let covered_from = start_anchor
+        .and_then(|a| time_of(a, "anchored_at"))
+        .or_else(|| {
+            start_checkpoint
+                .as_ref()
+                .and_then(|cp| time_of(cp, "created_at"))
+        })
+        .or_else(|| recorded(first_event))
+        .unwrap_or_default();
+    let covered_until = end
+        .and_then(|end| time_of(end, "anchored_at"))
+        .or_else(|| recorded(last_event))
+        .unwrap_or_default();
+    let mut period = Map::new();
+    period.insert("from".into(), json!(iso(covered_from)));
+    period.insert("until".into(), json!(iso(covered_until)));
+    if let Some(m) = &manifest {
+        for (key, name) in [
+            ("period_from", "requested_from"),
+            ("period_until", "requested_until"),
+        ] {
+            if let Some(at) = time_of(m, key) {
+                period.insert(name.into(), json!(iso(at)));
+            }
+        }
+    }
+    if let Some((wanted_from, wanted_until)) = options.period {
+        period.insert("asked_from".into(), json!(iso(wanted_from)));
+        period.insert("asked_until".into(), json!(iso(wanted_until)));
+        if wanted_from < covered_from || wanted_until > covered_until {
+            let detail = format!(
+                "the pack covers {} to {}",
+                iso(covered_from),
+                iso(covered_until)
+            );
+            result.fail(None, None, "pack_period_not_covered", &detail);
+        }
+    }
+    result.period = Some(period);
+
+    // 8. Completeness.
     if let Some(changes) = &options.changes {
-        let start = time_of(&first_event["entry"], "recorded_at").unwrap_or_default();
-        let stop = end
-            .and_then(|end| time_of(end, "anchored_at"))
-            .or_else(|| time_of(&last_event["entry"], "recorded_at"))
-            .unwrap_or_default();
         let report = check_completeness(
             changes,
             &entries,
             &cited,
-            (start, stop),
+            (covered_from, covered_until),
             options.tolerance_seconds,
         );
         for item in report["unmatched_changes"].as_array().into_iter().flatten() {
@@ -868,6 +1106,24 @@ pub fn verify_audit_pack(
                 text("changed_at")
             );
             result.fail(Some("changes"), None, "change_unmatched", &detail);
+        }
+        let outside = report["outside_period"].as_array().map_or(0, Vec::len);
+        if outside > 0 {
+            let detail = format!(
+                "{outside} change(s) dated outside the period the pack covers ({} to {})",
+                iso(covered_from),
+                iso(covered_until)
+            );
+            result.warn(Some("changes"), None, "changes_outside_period", &detail);
+        }
+        for item in report["duplicate_changes"].as_array().into_iter().flatten() {
+            let detail = format!(
+                "change {} repeats {} {}",
+                item["index"],
+                item["source"].as_str().unwrap_or("None"),
+                item["source_event_id"].as_str().unwrap_or("None")
+            );
+            result.warn(Some("changes"), None, "change_duplicate", &detail);
         }
         result.completeness = Some(report);
     }
@@ -884,6 +1140,104 @@ fn counts_of(verification: &EvidenceVerification) -> BTreeMap<String, u64> {
         .flatten()
         .filter_map(|(k, v)| Some((k, v.as_u64()?)))
         .collect()
+}
+
+fn check_report(
+    files: &BTreeMap<String, Vec<u8>>,
+    manifest: &Value,
+    entries: &[Value],
+    result: &mut PackVerification,
+) {
+    let read = (|| {
+        let checks = read_json(files.get(CHECKS_FILE).ok_or("checks.json is missing")?)?;
+        let states = read_json(files.get(STATES_FILE).ok_or("states.json is missing")?)?;
+        let claimed = files.get(REPORT_FILE).ok_or("report.md is missing")?;
+        let claimed = String::from_utf8(claimed.clone()).map_err(|e| e.to_string())?;
+        Ok::<_, String>((checks, states, claimed))
+    })();
+    let (checks, states, claimed) = match read {
+        Ok(read) => read,
+        Err(e) => {
+            let detail = format!(
+                "cannot be rendered: {}",
+                e.chars().take(160).collect::<String>()
+            );
+            result.fail(Some(REPORT_FILE), None, "report_mismatch", &detail);
+            return;
+        }
+    };
+    if !checks.is_object() || !states.is_object() {
+        let detail = "checks.json and states.json are JSON objects";
+        result.fail(Some(REPORT_FILE), None, "report_mismatch", detail);
+        return;
+    }
+    let or_empty = |v: &Value| if truthy(v) { v.clone() } else { json!({}) };
+    let expected = render_report(
+        &report_header(manifest),
+        entries,
+        &checks,
+        &or_empty(&states["states"]),
+        &or_empty(&states["notices"]),
+    );
+    if expected == claimed {
+        return;
+    }
+    let ours: Vec<&str> = expected.split('\n').collect();
+    let theirs: Vec<&str> = claimed.split('\n').collect();
+    for i in 0..ours.len().max(theirs.len()) {
+        let (mine, pack) = (ours.get(i), theirs.get(i));
+        if mine != pack {
+            result
+                .report_differences
+                .push(json!({"line": i + 1, "pack": pack, "verifier": mine}));
+        }
+    }
+    let detail = format!(
+        "{} line(s) differ from the report the pack renders to",
+        result.report_differences.len()
+    );
+    result.fail(Some(REPORT_FILE), None, "report_mismatch", &detail);
+}
+
+/// Whether the shapes of the trust files read as their models.
+fn trust_shapes(
+    policies: &[Value],
+    attestations: &[Value],
+    treaties: &[Value],
+    feeds: &[Value],
+) -> bool {
+    let shaped = |items: &[Value], fields: &[&str], time: &str| {
+        items.iter().all(|item| {
+            item.is_object()
+                && fields.iter().all(|f| item[*f].is_string())
+                && field(item, time).is_some_and(|s| parse_timestamp(s).is_ok())
+        })
+    };
+    let lists = |items: &[Value]| {
+        items
+            .iter()
+            .all(|i| i.get("signatures").is_none_or(Value::is_array))
+    };
+    shaped(policies, &["policy_id"], "issued_at")
+        && policies.iter().all(|p| p["version"].is_i64())
+        && shaped(
+            attestations,
+            &["attestation_id", "issuer_sovereign_id"],
+            "issued_at",
+        )
+        && lists(attestations)
+        && shaped(
+            treaties,
+            &["treaty_id", "subject_sovereign_id"],
+            "issued_at",
+        )
+        && treaties.iter().all(|t| {
+            t.get("subject_public_keys")
+                .is_none_or(|k| k.as_array().is_some_and(|a| a.iter().all(Value::is_string)))
+        })
+        && lists(treaties)
+        && shaped(feeds, &["feed_id", "issuer_sovereign_id"], "issued_at")
+        && lists(feeds)
 }
 
 fn check_cited_trust(
@@ -917,35 +1271,7 @@ fn check_cited_trust(
             return;
         }
     };
-    let shaped = |items: &[Value], fields: &[&str], time: &str| {
-        items.iter().all(|item| {
-            item.is_object()
-                && fields.iter().all(|f| item[*f].is_string())
-                && field(item, time).is_some_and(|s| parse_timestamp(s).is_ok())
-        })
-    };
-    let lists = |items: &[Value]| {
-        items
-            .iter()
-            .all(|i| i["signatures"].is_array() || i.get("signatures").is_none())
-    };
-    if !shaped(&policies, &["policy_id"], "issued_at")
-        || !policies.iter().all(|p| p["version"].is_i64())
-        || !shaped(
-            &attestations,
-            &["attestation_id", "issuer_sovereign_id"],
-            "issued_at",
-        )
-        || !lists(&attestations)
-        || !shaped(
-            &treaties,
-            &["treaty_id", "subject_sovereign_id"],
-            "issued_at",
-        )
-        || !lists(&treaties)
-        || !shaped(&feeds, &["feed_id", "issuer_sovereign_id"], "issued_at")
-        || !lists(&feeds)
-    {
+    if !trust_shapes(&policies, &attestations, &treaties, &feeds) {
         result.fail(
             Some(POLICIES_FILE),
             None,
@@ -954,34 +1280,22 @@ fn check_cited_trust(
         );
         return;
     }
-    let any_signature =
-        |canonical: Result<String, crate::GenesisMeshError>, item: &Value, k: &[String]| {
-            let Ok(body) = canonical else { return false };
-            item["signatures"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|s| field(s, "sig"))
-                .any(|sig| verify_canonical(&body, sig, k))
-        };
+    let named = |reason: &'static str, otherwise: &'static str| {
+        if reason == "invalid_signature" {
+            otherwise
+        } else {
+            reason
+        }
+    };
 
     let mut by_version: HashMap<(String, i64), &Value> = HashMap::new();
     for policy in &policies {
-        let verifies =
-            |k: &[String]| signed_by(policy_canonical(policy), policy.get("signature"), k);
-        let refusal = if policy["signature"].is_null() {
-            Some("invalid_signature")
-        } else {
-            signed_at(&verifies, keys, time_of(policy, "issued_at"))
-        };
         let id = field(policy, "policy_id").unwrap_or_default();
         let version = policy["version"].as_i64().unwrap_or_default();
-        if let Some(reason) = refusal {
-            let reason = if reason == "invalid_signature" {
-                "policy_invalid_signature"
-            } else {
-                reason
-            };
+        if let Some(reason) =
+            received_signature_reason("BoundaryPolicy", policy, keys, time_of(policy, "issued_at"))
+        {
+            let reason = named(reason, "policy_invalid_signature");
             result.fail(
                 Some(POLICIES_FILE),
                 None,
@@ -994,18 +1308,9 @@ fn check_cited_trust(
     let own = history.sovereign_id.as_str();
     let mut issuer_keys: HashMap<String, Vec<String>> = HashMap::new();
     for treaty in &treaties {
-        let body = |t: &Value| {
-            let mut fields = t.as_object().cloned().unwrap_or_default();
-            fields.remove("signatures");
-            canonical_json(&Value::Object(fields))
-        };
-        let verifies = |k: &[String]| any_signature(body(treaty), treaty, k);
-        if let Some(reason) = signed_at(&verifies, keys, time_of(treaty, "issued_at")) {
-            let reason = if reason == "invalid_signature" {
-                "treaty_invalid_signature"
-            } else {
-                reason
-            };
+        let at = time_of(treaty, "issued_at");
+        if let Some(reason) = received_signature_reason("RecognitionTreaty", treaty, keys, at) {
+            let reason = named(reason, "treaty_invalid_signature");
             result.fail(
                 Some(TREATIES_FILE),
                 None,
@@ -1032,39 +1337,38 @@ fn check_cited_trust(
     let mut by_attestation: HashMap<&str, &Value> = HashMap::new();
     for attestation in &attestations {
         let issuer = field(attestation, "issuer_sovereign_id").unwrap_or_default();
-        let verifies =
-            |k: &[String]| any_signature(attestation_canonical(attestation), attestation, k);
-        let refusal = if issuer == own {
-            signed_at(&verifies, keys, time_of(attestation, "issued_at"))
+        let model = "MembershipAttestation";
+        let reason = if issuer == own {
+            received_signature_reason(model, attestation, keys, time_of(attestation, "issued_at"))
         } else {
-            let k = issuer_keys.get(issuer).cloned().unwrap_or_default();
-            (!verifies(&k)).then_some("invalid_signature")
+            received_by(
+                model,
+                attestation,
+                issuer_keys
+                    .get(issuer)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )
         };
         let id = field(attestation, "attestation_id").unwrap_or_default();
-        if let Some(reason) = refusal {
-            let reason = if reason == "invalid_signature" {
-                "attestation_invalid_signature"
-            } else {
-                reason
-            };
+        if let Some(reason) = reason {
+            let reason = named(reason, "attestation_invalid_signature");
             result.fail(Some(ATTESTATIONS_FILE), None, reason, id);
         }
         by_attestation.insert(id, attestation);
     }
     for feed in &feeds {
+        let issuer = field(feed, "issuer_sovereign_id").unwrap_or_default();
         let k = issuer_keys
-            .get(field(feed, "issuer_sovereign_id").unwrap_or_default())
-            .cloned()
+            .get(issuer)
+            .map(Vec::as_slice)
             .unwrap_or_default();
-        if !any_signature(
-            received_canonical("SovereignRevocationFeed", feed),
-            feed,
-            &k,
-        ) {
+        if let Some(reason) = received_by("SovereignRevocationFeed", feed, k) {
+            let reason = named(reason, "feed_invalid_signature");
             result.fail(
                 Some(FEEDS_FILE),
                 None,
-                "feed_invalid_signature",
+                reason,
                 field(feed, "feed_id").unwrap_or_default(),
             );
         }
@@ -1160,13 +1464,14 @@ pub fn differences_from_pack_checks(
             json!({"field": "verified", "pack": claimed["verified"], "verifier": result.verified}),
         );
     }
-    let reasons: std::collections::BTreeSet<String> = claimed["failures"]
+    let reasons: BTreeSet<String> = claimed["failures"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|f| f.is_object())
         .map(|f| match &f["reason"] {
             Value::String(s) => s.clone(),
+            Value::Null => "None".to_owned(),
             other => other.to_string(),
         })
         .collect();
@@ -1183,77 +1488,454 @@ pub fn differences_from_pack_checks(
     out
 }
 
-/// Where a verification differs from what `report.md` says the NA found:
-/// its verdict, the reasons in its checks table and its totals. The fields
-/// start with `report.md`.
-pub fn differences_from_report(
-    result: &PackVerification,
-    files: &BTreeMap<String, Vec<u8>>,
-) -> Vec<Value> {
-    let Some(report) = files
-        .get(REPORT_FILE)
-        .and_then(|data| std::str::from_utf8(data).ok())
-    else {
-        return vec![json!({"field": REPORT_FILE, "pack": null, "verifier": "unreadable"})];
-    };
-    let lines: Vec<&str> = report.lines().collect();
-    // The table that follows a heading or line, up to the next blank line.
-    let table = |from: usize| -> Vec<Vec<String>> {
-        lines
-            .iter()
-            .skip(from)
-            .skip_while(|l| !l.starts_with('|'))
-            .take_while(|l| l.starts_with('|'))
-            .skip(2)
-            .map(|row| {
-                row.trim_matches('|')
-                    .split(" | ")
-                    .map(|cell| cell.trim().to_owned())
-                    .collect()
-            })
-            .collect()
-    };
-    let mut out = Vec::new();
-    let verdict = lines
-        .iter()
-        .position(|l| l.starts_with("Verified by the Network Authority"));
-    let said = verdict.map(|i| lines[i].contains("**yes**"));
-    if said != Some(result.verified) {
-        out.push(json!({"field": "report.md verified", "pack": said, "verifier": result.verified}));
+// ── The report ───────────────────────────────────────────────────────────────
+
+/// Python's truth value of a JSON value.
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
     }
-    if let Some(i) = verdict {
-        let none = lines.get(i + 2).is_some_and(|l| l.starts_with("None."));
-        let reasons: std::collections::BTreeSet<String> = if none {
-            Default::default()
-        } else {
-            table(i + 1)
-                .into_iter()
-                .filter_map(|row| row.first().cloned())
-                .collect()
-        };
-        let reasons: Vec<String> = reasons.into_iter().collect();
-        if reasons != result.reasons() {
-            out.push(json!({"field": "report.md failures", "pack": reasons, "verifier": result.reasons()}));
-        }
+}
+
+/// `a or b` as Python reads it.
+fn or<'a>(a: &'a Value, b: &'a Value) -> &'a Value {
+    if truthy(a) {
+        a
+    } else {
+        b
     }
-    if let Some(i) = lines.iter().position(|l| *l == "## Totals") {
-        let none = lines.get(i + 2).is_some_and(|l| l.starts_with("None."));
-        let said: BTreeMap<String, u64> = if none {
-            BTreeMap::new()
-        } else {
-            table(i)
-                .into_iter()
-                .filter_map(|row| Some((row.first()?.clone(), row.get(1)?.parse().ok()?)))
-                .collect()
-        };
-        for (name, value) in result.counts.iter().filter(|(_, v)| **v > 0) {
-            let pack = said.get(name).copied().unwrap_or(0);
-            if pack != *value {
-                out.push(json!({"field": format!("report.md counts.{name}"), "pack": pack, "verifier": value}));
+}
+
+/// Python's `str()` of a JSON value, for the keys the report looks up.
+fn py_str(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => "None".to_owned(),
+        Value::Bool(true) => "True".to_owned(),
+        Value::Bool(false) => "False".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// One value of the report, on one line (the reference's `_cell`): a
+/// backslash is written `\\`, a `|` `\|`; a line feed, carriage return or
+/// tab `\n`, `\r`, `\t`; any other control character (U+0000 to U+001F,
+/// U+007F to U+009F) and the line and paragraph separators `\uXXXX`. A value
+/// is written as itself when it is a string, in decimal when it is an
+/// integer, `true` or `false`, empty when absent, and as canonical JSON
+/// otherwise.
+pub fn report_cell(value: &Value) -> String {
+    let text = match value {
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Number(n) if n.is_i64() || n.is_u64() => n.to_string(),
+        other => pack_json(other),
+    };
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        let code = ch as u32;
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '|' => out.push_str("\\|"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ if code < 0x20
+                || (0x7F..=0x9F).contains(&code)
+                || code == 0x2028
+                || code == 0x2029 =>
+            {
+                out.push_str(&format!("\\u{code:04X}"));
             }
+            _ => out.push(ch),
         }
     }
     out
+}
+
+/// One section of the report: its title, its headers and its rows.
+type Section<'a> = (&'a str, &'a [&'a str], &'a [Vec<Value>]);
+
+fn table(headers: &[&str], rows: &[Vec<Value>]) -> Vec<String> {
+    if rows.is_empty() {
+        return vec!["None.".into(), String::new()];
+    }
+    let mut out = vec![
+        format!("| {} |", headers.join(" | ")),
+        format!("|{}|", vec!["---"; headers.len()].join("|")),
+    ];
+    for row in rows {
+        let cells: Vec<String> = row.iter().map(report_cell).collect();
+        out.push(format!("| {} |", cells.join(" | ")));
+    }
+    out.push(String::new());
+    out
+}
+
+/// What [`render_report`] reads of a manifest (the reference's
+/// `report_header`).
+pub fn report_header(manifest: &Value) -> Value {
+    let at = |key: &str| time_of(manifest, key).map(iso);
+    json!({
+        "pack_id": manifest["pack_id"],
+        "sovereign_id": manifest["sovereign_id"],
+        "from_sequence": manifest["from_sequence"],
+        "through_sequence": manifest["through_sequence"],
+        "start_anchor_sequence": manifest.get("start_anchor_sequence").cloned().unwrap_or(Value::Null),
+        "end_anchor_sequence": manifest["end_anchor_sequence"],
+        "created_at": at("created_at"),
+        "requested_by": manifest.get("requested_by").cloned().unwrap_or(Value::Null),
+        "period_from": at("period_from"),
+        "period_until": at("period_until"),
+    })
+}
+
+/// `report.md` (the reference's `render_report`, byte for byte): what a
+/// reader of the pack sees first, from the manifest's header
+/// ([`report_header`]), the entries, `checks.json` and the states and
+/// notices of `states.json`.
+pub fn render_report(
+    header: &Value,
+    entries: &[Value],
+    checks: &Value,
+    states: &Value,
+    notices: &Value,
+) -> String {
+    let get = |key: &str| header.get(key).unwrap_or(&Value::Null);
+    let cell = |key: &str| report_cell(get(key));
+    let mut judgements: HashMap<(String, String), &Value> = HashMap::new();
+    for e in entries {
+        if field(&e["entry"], "entry_kind") == Some("judgement") {
+            let p = &e["payload"];
+            judgements.insert((py_str(&p["subject_kind"]), py_str(&p["subject_id"])), p);
+        }
+    }
+    let mut lines: Vec<String> = vec![
+        format!("# Audit pack {}", cell("pack_id")),
+        String::new(),
+        format!("- Sovereign: {}", cell("sovereign_id")),
+        format!(
+            "- Range: store entries {} to {}, ending at anchor {}{}",
+            cell("from_sequence"),
+            cell("through_sequence"),
+            cell("end_anchor_sequence"),
+            if truthy(get("start_anchor_sequence")) {
+                format!(", starting after anchor {}", cell("start_anchor_sequence"))
+            } else {
+                String::new()
+            }
+        ),
+        format!(
+            "- Created: {}{}",
+            cell("created_at"),
+            if truthy(get("requested_by")) {
+                format!(" for {}", cell("requested_by"))
+            } else {
+                String::new()
+            }
+        ),
+    ];
+    if truthy(get("period_from")) || truthy(get("period_until")) {
+        lines.push(format!(
+            "- Asked for: {} to {}",
+            report_cell(or(get("period_from"), &json!("the start"))),
+            report_cell(or(get("period_until"), &json!("the last anchor")))
+        ));
+    }
+    lines.extend([
+        String::new(),
+        "Verify it with `genesis-mesh audit verify <dir> --anchor <root public key> --known-anchors <anchors>`, \
+         from the root key and the anchors you hold. The remediation states and notices below are the \
+         Network Authority's operational records at pack time (states.json), not signed records."
+            .to_owned(),
+        String::new(),
+        "## Checks".to_owned(),
+        String::new(),
+        format!(
+            "Verified by the Network Authority when it wrote the pack, against its own anchors: **{}**.",
+            if truthy(&checks["verified"]) { "yes" } else { "no" }
+        ),
+        String::new(),
+    ]);
+    let failures: Vec<Vec<Value>> = checks["failures"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f.is_object())
+        .map(|f| {
+            ["reason", "file", "store_sequence", "detail"]
+                .iter()
+                .map(|k| f.get(*k).cloned().unwrap_or(Value::Null))
+                .collect()
+        })
+        .collect();
+    lines.extend(table(&["Reason", "File", "Entry", "Detail"], &failures));
+    lines.extend(["## Totals".to_owned(), String::new()]);
+    let counts: Vec<Vec<Value>> = or(&checks["counts"], &json!({}))
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, v)| truthy(v))
+        .map(|(k, v)| vec![json!(k), v.clone()])
+        .collect();
+    lines.extend(table(&["Records", "Count"], &counts));
+
+    let state_of = |subject: &Value| -> Value {
+        match states.get(py_str(subject)) {
+            Some(Value::Object(value)) => value.get("state").cloned().unwrap_or(Value::Null),
+            _ => Value::Null,
+        }
+    };
+    let (mut changes, mut denials, mut remediations, mut reviews) =
+        (vec![], vec![], vec![], vec![]);
+    let (mut break_glass, mut quarantined, mut others) = (vec![], vec![], vec![]);
+    let null = Value::Null;
+    for e in entries {
+        let p = &e["payload"];
+        let kind = field(&e["entry"], "entry_kind").unwrap_or_default();
+        let seq = json!(seq_of(e));
+        let at = |key: &str| p.get(key).cloned().unwrap_or(Value::Null);
+        match kind {
+            "execution" => {
+                let state = state_of(&at("decision_id"));
+                changes.push(vec![
+                    seq,
+                    json!(kind),
+                    at("resource_id"),
+                    at("resource_action"),
+                    at("executed_at"),
+                    json!("prior_decision"),
+                    or(&state, &json!("recorded")).clone(),
+                    at("executor_sovereign_id"),
+                ]);
+            }
+            "observation" | "break_glass" => {
+                let record_id = py_str(or(&at("observation_id"), &at("break_glass_id")));
+                let judgement = judgements.get(&(kind.to_owned(), record_id)).copied();
+                let mut state = judgement.map_or(Value::Null, |j| state_of(&j["judgement_id"]));
+                if state.is_null() {
+                    state = json!(match judgement {
+                        None => "observed",
+                        Some(j)
+                            if j["governed_by"] == "prior_decision" && j["verdict"] != "deny" =>
+                            "matched",
+                        Some(j) => match py_str(&j["verdict"]).as_str() {
+                            "allow" => "judged_allowed",
+                            "deny" => "judged_denied",
+                            _ => "indeterminate",
+                        },
+                    });
+                }
+                changes.push(vec![
+                    seq.clone(),
+                    json!(kind),
+                    at("resource_id"),
+                    or(&at("action"), &at("resource_action")).clone(),
+                    or(
+                        or(&at("changed_at"), &at("changed_not_after")),
+                        &at("executed_at"),
+                    )
+                    .clone(),
+                    judgement.map_or(Value::Null, |j| {
+                        j.get("governed_by").cloned().unwrap_or(Value::Null)
+                    }),
+                    state,
+                    at("actor"),
+                ]);
+                if kind == "break_glass" {
+                    break_glass.push(vec![
+                        seq,
+                        at("resource_id"),
+                        at("capability"),
+                        at("executed_at"),
+                        at("evaluation_failure"),
+                        at("justification"),
+                    ]);
+                }
+            }
+            "decision" => {
+                let decision = or(&p["decision"], &null);
+                if decision.get("authorized") == Some(&Value::Bool(false)) {
+                    denials.push(vec![
+                        seq,
+                        json!("decision"),
+                        decision.get("decision_id").cloned().unwrap_or(Value::Null),
+                        decision
+                            .get("denial_reason")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    ]);
+                }
+            }
+            "judgement" if p["verdict"] == "deny" || p["verdict"] == "indeterminate" => {
+                let reason = py_str(or(&at("reason"), &json!("")));
+                denials.push(vec![
+                    seq,
+                    json!("judgement"),
+                    at("judgement_id"),
+                    json!(format!("{}: {reason}", py_str(&p["verdict"]))),
+                ]);
+            }
+            "remediation" => remediations.push(vec![
+                seq,
+                at("subject_kind"),
+                at("subject_id"),
+                at("outcome"),
+                at("steps"),
+                at("remediated_at"),
+                at("executor_sovereign_id"),
+            ]),
+            "review" => reviews.push(vec![
+                seq,
+                at("subject_id"),
+                at("verdict"),
+                at("requested_by"),
+                at("requester_holder"),
+                at("decided_by"),
+                at("decider_holder"),
+                at("decided_at"),
+            ]),
+            "quarantine" => quarantined.push(vec![
+                seq,
+                at("record_kind"),
+                at("resource_id"),
+                at("rejection_code"),
+                at("quarantined_at"),
+            ]),
+            "key_succession" | "archive" => others.push(vec![
+                seq,
+                json!(kind),
+                or(&at("succession_id"), &at("archive_id")).clone(),
+                or(&at("effective_at"), &at("archived_at")).clone(),
+            ]),
+            _ => {}
+        }
+    }
+    let notice_rows: Vec<Vec<Value>> = notices
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, v)| v.is_object())
+        .map(|(k, v)| {
+            vec![
+                json!(k),
+                v.get("notified_at").cloned().unwrap_or(Value::Null),
+                v.get("notified_by").cloned().unwrap_or(Value::Null),
+            ]
+        })
+        .collect();
+    let sections: [Section<'_>; 8] = [
+        (
+            "Changes",
+            &[
+                "Entry",
+                "Kind",
+                "Resource",
+                "Action",
+                "Changed at",
+                "Governed by",
+                "State",
+                "Actor",
+            ],
+            &changes,
+        ),
+        ("Denials", &["Entry", "Record", "ID", "Reason"], &denials),
+        (
+            "Remediations",
+            &[
+                "Entry",
+                "Subject kind",
+                "Subject",
+                "Outcome",
+                "Steps",
+                "At",
+                "Executor",
+            ],
+            &remediations,
+        ),
+        (
+            "Reviews and deciders",
+            &[
+                "Entry",
+                "Subject",
+                "Verdict",
+                "Requested by",
+                "Requester holder",
+                "Decided by",
+                "Decider holder",
+                "Decided at",
+            ],
+            &reviews,
+        ),
+        ("Notices", &["Subject", "Notified at", "By"], &notice_rows),
+        (
+            "Break-glass uses",
+            &[
+                "Entry",
+                "Resource",
+                "Capability",
+                "Executed at",
+                "Failure",
+                "Justification",
+            ],
+            &break_glass,
+        ),
+        (
+            "Quarantined records",
+            &["Entry", "Record kind", "Resource", "Rejection", "At"],
+            &quarantined,
+        ),
+        (
+            "Key successions and archives",
+            &["Entry", "Kind", "ID", "At"],
+            &others,
+        ),
+    ];
+    for (title, headers, rows) in sections {
+        lines.extend([format!("## {title}"), String::new()]);
+        lines.extend(table(headers, rows));
+    }
+    let mut text = lines.join("\n").trim_end_matches('\n').to_owned();
+    text.push('\n');
+    text
+}
+
+/// The report a verification renders from what it verified (`audit verify
+/// --report`): its own verdict, failures and counts, the pack's verified
+/// entries and its states and notices.
+pub fn render_own_report(
+    files: &BTreeMap<String, Vec<u8>>,
+    result: &PackVerification,
+) -> Result<String, String> {
+    let manifest = read_json(files.get(MANIFEST_FILE).ok_or("manifest.json is missing")?)?;
+    let entries = read_events(files.get(ENTRIES_FILE).ok_or("entries.jsonl is missing")?)?;
+    let states = match files.get(STATES_FILE) {
+        Some(data) => read_json(data)?,
+        None => json!({}),
+    };
+    let checks = json!({
+        "verified": result.verified,
+        "failures": result.failures,
+        "counts": result.counts,
+    });
+    let or_empty = |v: &Value| if truthy(v) { v.clone() } else { json!({}) };
+    let text = render_report(
+        &report_header(&manifest),
+        &entries,
+        &checks,
+        &or_empty(&states["states"]),
+        &or_empty(&states["notices"]),
+    );
+    Ok(text.replace(
+        "Verified by the Network Authority when it wrote the pack, against its own anchors",
+        "Verified by this verifier, from the root key and the anchors it holds",
+    ))
 }
 
 // ── The completeness check ───────────────────────────────────────────────────
@@ -1287,7 +1969,7 @@ impl Change {
             "source_event_id": self.source_event_id,
             "resource_id": self.resource_id,
             "action": self.action,
-            "changed_at": isoformat(self.changed_at),
+            "changed_at": iso(self.changed_at),
             "actor": self.actor,
         })
     }
@@ -1302,6 +1984,76 @@ pub const CHANGE_COLUMNS: [&str; 6] = [
     "changed_at",
     "actor",
 ];
+
+/// An RFC 3339 `date-time` (`T` and `Z` in either case, an offset required,
+/// up to nine fraction digits, cut to microseconds), in microseconds since
+/// the epoch, UTC; `None` for anything else: a date without a time, a space
+/// for `T`, a missing offset, a leap second or an out-of-range field (the
+/// reference's `parse_rfc3339`).
+pub fn parse_rfc3339(value: &str) -> Option<i64> {
+    let b = value.as_bytes();
+    let digits = |from: usize, len: usize| -> Option<u32> {
+        let part = b.get(from..from + len)?;
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| std::str::from_utf8(part).ok()?.parse().ok())?
+    };
+    let (year, month, day) = (digits(0, 4)?, digits(5, 2)?, digits(8, 2)?);
+    let (hour, minute, second) = (digits(11, 2)?, digits(14, 2)?, digits(17, 2)?);
+    if b.get(4) != Some(&b'-')
+        || b.get(7) != Some(&b'-')
+        || !matches!(b.get(10), Some(b'T' | b't'))
+        || b.get(13) != Some(&b':')
+        || b.get(16) != Some(&b':')
+    {
+        return None;
+    }
+    let mut at = 19;
+    let mut micro = 0u32;
+    if b.get(at) == Some(&b'.') {
+        let count = b[at + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if !(1..=9).contains(&count) {
+            return None;
+        }
+        let fraction = std::str::from_utf8(&b[at + 1..at + 1 + count]).ok()?;
+        let six: String = fraction
+            .chars()
+            .chain(std::iter::repeat('0'))
+            .take(6)
+            .collect();
+        micro = six.parse().ok()?;
+        at += 1 + count;
+    }
+    let offset_minutes: i64 = match &b[at..] {
+        b"Z" | b"z" => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let (h, m) = (digits(at + 1, 2)?, digits(at + 4, 2)?);
+            if h > 23 || m > 59 {
+                return None;
+            }
+            let minutes = i64::from(h) * 60 + i64::from(m);
+            if *sign == b'+' {
+                minutes
+            } else {
+                -minutes
+            }
+        }
+        _ => return None,
+    };
+    let date = chrono::NaiveDate::from_ymd_opt(i32::try_from(year).ok()?, month, day)?;
+    if year == 0 {
+        return None;
+    }
+    let time = chrono::NaiveTime::from_hms_micro_opt(hour, minute, second, micro)?;
+    if second > 59 {
+        return None;
+    }
+    let local = date.and_time(time).and_utc().timestamp_micros();
+    Some(local - offset_minutes * 60_000_000)
+}
 
 /// RFC 4180 rows: commas, quoted fields with doubled quotes, CRLF or LF.
 fn csv_rows(text: &str) -> Vec<Vec<String>> {
@@ -1338,9 +2090,10 @@ fn csv_rows(text: &str) -> Vec<Vec<String>> {
 
 /// Changes from CSV (a header row naming [`CHANGE_COLUMNS`]) or JSON (a
 /// list, or `{"changes": [...]}`), as the reference reads them:
-/// `resource_id`, `action` and `changed_at` (ISO 8601 with an offset) are
-/// required; `source` and `source_event_id` go together. The error names the
-/// first bad row.
+/// `resource_id`, `action` and `changed_at` (RFC 3339 with an offset) are
+/// required; `source` and `source_event_id` go together. In JSON a field is
+/// a string or null (`true` or `7` is refused); an empty string is absent.
+/// The error names the first bad row.
 pub fn parse_changes(text: &str, csv: bool) -> std::result::Result<Vec<Change>, String> {
     let rows: Vec<Map<String, Value>> = if csv {
         let mut rows = csv_rows(text).into_iter();
@@ -1379,34 +2132,28 @@ pub fn parse_changes(text: &str, csv: bool) -> std::result::Result<Vec<Change>, 
     let mut out = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         let n = i + 1;
-        let value = |name: &str| match row.get(name) {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) if s.is_empty() => None,
-            Some(Value::String(s)) => Some(s.trim().to_owned()),
-            Some(other) => Some(other.to_string().trim().to_owned()),
+        let value = |name: &str| -> std::result::Result<Option<String>, String> {
+            match row.get(name) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(s)) => Ok(Some(s.trim().to_owned()).filter(|s| !s.is_empty())),
+                Some(_) => Err(format!("change {n}: {name} must be a string")),
+            }
         };
-        let (Some(resource), Some(action), Some(changed)) =
-            (value("resource_id"), value("action"), value("changed_at"))
-        else {
+        let (Some(resource), Some(action), Some(changed)) = (
+            value("resource_id")?,
+            value("action")?,
+            value("changed_at")?,
+        ) else {
             return Err(format!(
                 "change {n}: resource_id, action and changed_at are required"
             ));
         };
-        if resource.is_empty() || action.is_empty() || changed.is_empty() {
+        let Some(at) = parse_rfc3339(&changed) else {
             return Err(format!(
-                "change {n}: resource_id, action and changed_at are required"
+                "change {n}: changed_at is not an RFC 3339 time with an offset (Z for UTC)"
             ));
-        }
-        let at = chrono::DateTime::parse_from_rfc3339(&changed)
-            .or_else(|_| chrono::DateTime::parse_from_str(&changed, "%Y-%m-%dT%H:%M:%S%.f%:z"))
-            .map_err(|_| {
-                if parse_timestamp(&changed).is_ok() {
-                    format!("change {n}: changed_at needs an offset (Z for UTC)")
-                } else {
-                    format!("change {n}: changed_at is not an ISO 8601 time")
-                }
-            })?;
-        let (source, event_id) = (value("source"), value("source_event_id"));
+        };
+        let (source, event_id) = (value("source")?, value("source_event_id")?);
         if source.is_none() != event_id.is_none() {
             return Err(format!(
                 "change {n}: source and source_event_id go together"
@@ -1416,10 +2163,10 @@ pub fn parse_changes(text: &str, csv: bool) -> std::result::Result<Vec<Change>, 
             index: n,
             resource_id: resource,
             action,
-            changed_at: at.timestamp_micros(),
+            changed_at: at,
             source,
             source_event_id: event_id,
-            actor: value("actor"),
+            actor: value("actor")?,
         });
     }
     Ok(out)
@@ -1457,11 +2204,7 @@ fn records(entries: &[Value], cited: &[Value]) -> Vec<Recorded> {
         let p = &event["payload"];
         if field(&event["entry"], "entry_kind") == Some("judgement") {
             if let Some(evidence) = field(p, "matched_evidence_id").filter(|e| !e.is_empty()) {
-                let subject = match &p["subject_id"] {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                matched.insert(subject, evidence.to_owned());
+                matched.insert(py_str(&p["subject_id"]), evidence.to_owned());
             }
         }
     }
@@ -1530,15 +2273,100 @@ fn records(entries: &[Value], cited: &[Value]) -> Vec<Recorded> {
     out
 }
 
+/// The changes and recorded changes of one (resource, action).
+type Bucket<'a, 'b> = (Vec<&'a Change>, Vec<&'b Group<'b>>);
+
+/// One recorded change: the records of one group, matched by its
+/// representative (its execution evidence or break-glass record when it
+/// holds one, else its observation; the earliest in the store on a tie).
+struct Group<'a> {
+    group: String,
+    members: Vec<&'a Recorded>,
+}
+
+impl Group<'_> {
+    fn representative(&self) -> &Recorded {
+        self.members
+            .iter()
+            .min_by_key(|r| (r.kind == "observation", r.store_sequence))
+            .copied()
+            .expect("a group holds a record")
+    }
+}
+
+/// The matching of one (resource, action): the most pairs, then the least
+/// total distance (the reference's `_match_bucket`). Changes in time order
+/// (then by index) are matched to groups in time order (their
+/// representative's earliest time, then store position) without crossing,
+/// by dynamic programming; at each step the choices are, in this order,
+/// pairing (when within the tolerance), leaving the change unmatched,
+/// leaving the group unmatched, and the first best one is taken.
+fn match_bucket<'a, 'b>(
+    changes: &[&'a Change],
+    groups: &[&'b Group<'b>],
+    tolerance: i64,
+) -> Vec<(&'a Change, &'b Group<'b>)> {
+    let mut cs = changes.to_vec();
+    cs.sort_by_key(|c| (c.changed_at, c.index));
+    let mut gs = groups.to_vec();
+    gs.sort_by_key(|g| {
+        (
+            g.representative().earliest,
+            g.representative().store_sequence,
+        )
+    });
+    let (n, m) = (cs.len(), gs.len());
+    let mut best = vec![vec![(0i64, 0i64); m + 1]; n + 1];
+    let mut choice = vec![vec![0u8; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            let mut options: Vec<((i64, i64), u8)> = Vec::with_capacity(3);
+            let distance = gs[j].representative().distance(cs[i].changed_at);
+            if distance <= tolerance {
+                let (pairs, cost) = best[i + 1][j + 1];
+                options.push(((pairs + 1, cost - distance), 0));
+            }
+            options.push((best[i + 1][j], 1));
+            options.push((best[i][j + 1], 2));
+            let top = options.iter().map(|o| o.0).max().unwrap_or_default();
+            let (value, taken) = options
+                .into_iter()
+                .find(|o| o.0 == top)
+                .unwrap_or(((0, 0), 1));
+            best[i][j] = value;
+            choice[i][j] = taken;
+        }
+    }
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        match choice[i][j] {
+            0 => {
+                out.push((cs[i], gs[j]));
+                i += 1;
+                j += 1;
+            }
+            1 => i += 1,
+            _ => j += 1,
+        }
+    }
+    out
+}
+
 /// Match changes from an outside log against a pack's records (the
-/// reference's `check_completeness`): first by source and source event id
-/// (an observation of that very event), then by resource, action and time
-/// within the tolerance (the closest record, the earliest on a tie; each
-/// record matched once; an observation and the execution evidence it was
-/// matched to are one change). An unmatched change dated inside the period
-/// (microseconds, widened by the tolerance) is in `unmatched_changes`, one
-/// outside it in `outside_period`; records no change matched are in
-/// `unmatched_records`.
+/// reference's `check_completeness`):
+///
+/// 1. changes repeating a (source, source event id) pair already seen are set
+///    aside (`duplicate_changes`);
+/// 2. a change with a source and source event id matches the record that
+///    names that very event when it agrees on resource and action;
+/// 3. the rest are matched per (resource, action) by the best overall
+///    pairing: an observation and the execution evidence it was matched to
+///    are one change.
+///
+/// An unmatched change dated inside the period (microseconds, the tolerance
+/// either side) is in `unmatched_changes`, one outside it in
+/// `outside_period`; records no change matched are in `unmatched_records`.
 pub fn check_completeness(
     changes: &[Change],
     entries: &[Value],
@@ -1548,13 +2376,33 @@ pub fn check_completeness(
 ) -> Value {
     let tolerance = tolerance_seconds * 1_000_000;
     let records = records(entries, cited);
+    let mut groups: Vec<Group<'_>> = Vec::new();
+    for record in &records {
+        match groups.iter_mut().find(|g| g.group == record.group) {
+            Some(group) => group.members.push(record),
+            None => groups.push(Group {
+                group: record.group.clone(),
+                members: vec![record],
+            }),
+        }
+    }
     let mut used: HashSet<String> = HashSet::new();
     let mut pairs: Vec<(usize, Value)> = Vec::new();
-    let mut left: Vec<&Change> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let (mut duplicates, mut unique) = (Vec::new(), Vec::new());
+    for change in changes {
+        if let (Some(source), Some(event)) = (&change.source, &change.source_event_id) {
+            if !seen.insert((source.clone(), event.clone())) {
+                duplicates.push(change);
+                continue;
+            }
+        }
+        unique.push(change);
+    }
     let mut by_event: HashMap<(String, String), &Recorded> = HashMap::new();
     for r in &records {
         if let (Some(source), Some(event)) = (&r.source, &r.source_event_id) {
-            by_event.insert((source.clone(), event.clone()), r);
+            by_event.entry((source.clone(), event.clone())).or_insert(r);
         }
     }
     let pair = |change: &Change, r: &Recorded, how: &str| {
@@ -1564,60 +2412,71 @@ pub fn check_completeness(
                    "store_sequence": r.store_sequence, "matched_by": how}),
         )
     };
-    for change in changes {
-        let found = change.source.as_ref().and_then(|source| {
-            by_event
-                .get(&(
-                    source.clone(),
-                    change.source_event_id.clone().unwrap_or_default(),
-                ))
-                .copied()
-        });
-        match found {
-            Some(r) if !used.contains(&r.group) => {
+    let mut left: Vec<&Change> = Vec::new();
+    for change in unique {
+        let named = match (&change.source, &change.source_event_id) {
+            (Some(source), Some(event)) => by_event.get(&(source.clone(), event.clone())).copied(),
+            _ => None,
+        };
+        match named {
+            Some(r)
+                if !used.contains(&r.group)
+                    && r.resource_id == change.resource_id
+                    && r.action == change.action =>
+            {
                 used.insert(r.group.clone());
                 pairs.push(pair(change, r, "source_event_id"));
             }
             _ => left.push(change),
         }
     }
-    let mut unmatched: Vec<&Change> = Vec::new();
-    for change in left {
-        let best = records
-            .iter()
-            .filter(|r| {
-                !used.contains(&r.group)
-                    && r.resource_id == change.resource_id
-                    && r.action == change.action
-                    && r.distance(change.changed_at) <= tolerance
-            })
-            .min_by_key(|r| (r.distance(change.changed_at), r.store_sequence));
-        match best {
-            Some(r) => {
-                used.insert(r.group.clone());
-                pairs.push(pair(change, r, "resource_action_time"));
-            }
-            None => unmatched.push(change),
+    let mut buckets: BTreeMap<(String, String), Bucket<'_, '_>> = BTreeMap::new();
+    for change in &left {
+        buckets
+            .entry((change.resource_id.clone(), change.action.clone()))
+            .or_default()
+            .0
+            .push(change);
+    }
+    for group in groups.iter().filter(|g| !used.contains(&g.group)) {
+        let rep = group.representative();
+        if let Some(bucket) = buckets.get_mut(&(rep.resource_id.clone(), rep.action.clone())) {
+            bucket.1.push(group);
         }
     }
+    let mut matched_changes: HashSet<usize> = HashSet::new();
+    for (bucket_changes, bucket_groups) in buckets.values() {
+        for (change, group) in match_bucket(bucket_changes, bucket_groups, tolerance) {
+            used.insert(group.group.clone());
+            matched_changes.insert(change.index);
+            pairs.push(pair(change, group.representative(), "resource_action_time"));
+        }
+    }
+    let unmatched: Vec<&Change> = left
+        .into_iter()
+        .filter(|c| !matched_changes.contains(&c.index))
+        .collect();
     let (start, end) = period;
-    let (inside, outside): (Vec<&Change>, Vec<&Change>) = unmatched
+    let (mut inside, mut outside): (Vec<&Change>, Vec<&Change>) = unmatched
         .into_iter()
         .partition(|c| start - tolerance <= c.changed_at && c.changed_at <= end + tolerance);
-    let mut last_of_group: BTreeMap<String, &Recorded> = BTreeMap::new();
-    for r in records.iter().filter(|r| !used.contains(&r.group)) {
-        last_of_group.insert(r.group.clone(), r);
-    }
-    let mut unmatched_records: Vec<&Recorded> = last_of_group.into_values().collect();
+    inside.sort_by_key(|c| c.index);
+    outside.sort_by_key(|c| c.index);
+    let mut unmatched_records: Vec<&Recorded> = groups
+        .iter()
+        .filter(|g| !used.contains(&g.group))
+        .map(Group::representative)
+        .collect();
     unmatched_records.sort_by_key(|r| r.store_sequence);
     pairs.sort_by_key(|(index, _)| *index);
     json!({
         "changes": changes.len(),
         "tolerance_seconds": tolerance_seconds,
-        "period": {"from": isoformat(start), "to": isoformat(end)},
+        "period": {"from": iso(start), "to": iso(end)},
         "pairs": pairs.into_iter().map(|(_, p)| p).collect::<Vec<_>>(),
         "unmatched_changes": inside.iter().map(|c| c.to_json()).collect::<Vec<_>>(),
         "outside_period": outside.iter().map(|c| c.to_json()).collect::<Vec<_>>(),
+        "duplicate_changes": duplicates.iter().map(|c| c.to_json()).collect::<Vec<_>>(),
         "unmatched_records": unmatched_records.iter().map(|r| json!({
             "kind": r.kind, "record_id": r.record_id, "store_sequence": r.store_sequence,
             "resource_id": r.resource_id, "action": r.action,
