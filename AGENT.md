@@ -29,6 +29,8 @@ sdk-rust/
     health.rs      # HealthClient
     canonical.rs   # canonical bodies, digests, Pydantic timestamps (pure)
     verify.rs      # offline verification, Python reason codes (pure)
+    key_history.rs # NA key history and succession, which key is valid when (1.5.0, pure)
+    audit_pack.rs  # audit pack verification and the completeness check (1.5.0, pure)
     execution.rs   # ExecutionRecorder, secret-material guard
     out_of_band.rs # ObservationRecorder, break-glass records (1.3.0)
     remediation.rs # remediation records, review checks, plans and the state table (1.4.0, pure)

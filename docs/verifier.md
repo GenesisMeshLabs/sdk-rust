@@ -67,7 +67,8 @@ For a stronger check, rebuild it from source and compare digests
 ```text
 genesis-mesh-verify record <kind> <file> [options]
 genesis-mesh-verify export <file> [options]
-genesis-mesh-verify pack <dir> --anchor <key> --known-anchors <path>
+genesis-mesh-verify pack <dir> --anchor <root key> [options]
+genesis-mesh-verify key-history <file> --root-key <key>
 ```
 
 A key is a base64 Ed25519 public key, given inline or as a file holding it
@@ -83,7 +84,11 @@ genesis-mesh-verify record execution evidence.json --executor-keys executor-keys
 
 `<kind>` is one of the kinds in [What is checked](#what-is-checked)
 (`checkpoint` for a retention checkpoint; `break-glass` and `break_glass`
-alike). `--na-key` (repeatable) gives the NA's keys; `--executor-keys` the
+alike; `key-succession` and `archive` from 1.5.0). The NA's keys come from
+`--key-history <file> --root-key <key>` (the NA's key history, `GET
+/na/key-history`, verified from the root key you hold: each NA key verifies
+only what it signed while it was valid) or, before 1.5.0 or for one key,
+`--na-key` (repeatable; valid at every time). `--executor-keys` gives the
 JSON from `GET /admin/evidence/executor-keys` (or a list of its keys). A
 decision as the NA returns it (`{"decision": ..., ...}`) is read as the
 decision it holds.
@@ -102,6 +107,8 @@ genesis-mesh-verify export export.jsonl --na-key na.pub \
 
 The same checks, options and JSON as `genesis-mesh evidence verify-export`:
 
+- `--key-history <file> --root-key <key>` or `--na-key`, and
+  `--executor-keys`, as for a record;
 - `--known-anchors <path>`: anchors held outside the NA, a directory written
   by `genesis-mesh evidence anchors fetch` or a JSON or JSON Lines file;
 - `--checkpoint <file>`: the retention checkpoint the export continues from
@@ -112,8 +119,42 @@ The same checks, options and JSON as `genesis-mesh evidence verify-export`:
 
 ### An audit pack
 
-`pack` is not available yet: it follows the 1.5.0 audit pack format and
-exits with code 4 until then. Verify the pack's export with `export`.
+```sh
+genesis-mesh-verify pack pack-2026 --anchor root.pub \
+    --known-anchors /audit/anchors --changes cloud-log.csv
+```
+
+The checks, reason codes and JSON of `genesis-mesh audit verify` (the core's
+`docs/reference/audit-pack-format.md` is the normative description):
+
+- `--anchor <key>`: the root public key you hold (required): the NA's keys
+  are accepted only through the key history, from the root key down;
+- `--known-anchors <path>`: the anchors you hold. Unlike `audit verify`, it
+  may be left out: the pack then proves its integrity, not that nothing was
+  removed, and the result carries the warning `no_held_anchors`;
+- `--executor-keys <file>`: executor keys you hold, for a store without
+  registry records (the pack's own `keys/executor-keys.json` is never
+  trusted);
+- `--changes <file>`: changes from a log outside Genesis Mesh (CSV with a
+  header row, or JSON), matched against the pack (`change_unmatched`);
+  `--tolerance-seconds` (default 300) bounds how far apart a change and its
+  record may be.
+
+The result also lists `report_differences`: where this verification differs
+from the NA's own checks in the pack, `checks.json` (`verified`, the sorted
+reason codes, a count) and, beyond `audit verify`, what `report.md` says
+(fields starting with `report.md`). A difference is not a failure by itself:
+the NA checked the pack against its own anchors.
+
+### A key history
+
+`key-history <file> --root-key <key>` verifies a genesis block and its key
+successions (`{"genesis": ..., "successions": [...]}`, as `GET
+/na/key-history` serves them) from the root key you hold, and lists each NA
+key's validity: the genesis key until the first succession takes effect, each
+later key from its `effective_at` until the next succession and never at or
+after its own `new_valid_to`, and a succeeded key for 300 seconds more (the
+hand-over).
 
 ### Output and exit codes
 
@@ -123,7 +164,7 @@ exits with code 4 until then. Verify the pack's export with `export`.
 | 1 | Not verified: each failure names its reason code |
 | 2 | Usage error: an unknown option, kind or command, or a key that is not one |
 | 3 | An input could not be read: missing, not UTF-8, not strict JSON, or not the document it should be |
-| 4 | Not available in this version |
+| 4 | Not available in this version (no command uses it in 1.5.0) |
 
 Anything but 0 means the input is not verified. A genuine decision that denies
 its action is verified (0): `authorized` is `false` and the reason is the
@@ -134,8 +175,13 @@ first failure's code, `verified`, or a decision's `authorized` or
 `unauthorized_...`), `authorized` for a decision, `failures` and `warnings`;
 `export` prints the reference CLI's JSON (`verified`, `checked_entries`, the
 counts, `failures` with `store_sequence`, `reason` and `detail`, `warnings`,
-and `anchors` with `--known-anchors`). A usage or input error prints
-`{"error": {"exit_code", "message"}}`.
+and `anchors` with `--known-anchors`); `pack` prints the reference's
+`audit verify --format json` (`verified`, `failures` and `warnings` with
+`file`, `store_sequence`, `reason` and `detail`, `counts`, `range`, `keys`,
+`anchors`, `completeness`, `report_differences`); `key-history` prints
+`verified`, `failures` and `keys`. A key history given with `--key-history`
+that does not verify fails the record or export (exit 1) with its reason. A
+usage or input error prints `{"error": {"exit_code", "message"}}`.
 
 ## What is checked
 
@@ -149,7 +195,8 @@ the same reason codes, in the same order: fields the crate does not know
 
 | Signed by | Kinds |
 |---|---|
-| The NA (`--na-key`) | `decision`, `justification`, `checkpoint`, `judgement`, `quarantine`, `registry`, `review`, `policy`, `attestation` |
+| The NA (`--key-history` or `--na-key`) | `decision`, `justification`, `checkpoint`, `judgement`, `quarantine`, `registry`, `review`, `archive`, `policy`, `attestation` |
+| The root key and the outgoing NA key (`--key-history`) | `key-succession` |
 | An executor key of the record's sovereign (`--executor-keys`) | `execution`, `break-glass`, `remediation` |
 | An observer key of the record's sovereign (`--executor-keys`) | `observation` |
 
@@ -176,6 +223,18 @@ judges it at another time. Its freshness proof is judged at
 validity (`evidence_outside_decision_window`). Nothing else depends on the
 time the verifier runs.
 
+With the NA's key history, an NA signature must be made by the key valid at
+the record's own time; a signature by another key of the history is
+`na_key_not_valid_at_time`. The record's time is a store entry's
+`recorded_at`, an anchor's `anchored_at`, a retention checkpoint read alone
+or a manifest's `created_at`, a policy's or an attestation's `issued_at`,
+and a decision verified alone its `decision_made_at`. Another record read
+alone with `record` has no time the specification names and is accepted
+under any key of the history; in an export it is judged at its entry's
+`recorded_at`. A key succession entry must be signed by its outgoing key and
+the root key, and be one of the history's successions
+(`succession_invalid_root_signature`, `succession_not_in_history`).
+
 ### An export
 
 `export` checks every line's envelope, digests and the store chain; every
@@ -190,6 +249,34 @@ outside the NA: the anchors' signatures, chain and positions
 `anchor_not_increasing`); each anchored entry as anchored (`anchor_mismatch`,
 `anchor_entry_missing`); and the export tied to the anchors at both ends
 (`export_not_linked_to_anchors`, `export_ends_before_anchor`).
+
+### An audit pack
+
+`pack` runs the six check groups of `audit verify`, in order, with its
+reason codes:
+
+1. the manifest (`manifest_missing`, `manifest_invalid`,
+   `manifest_file_missing`, `manifest_digest_mismatch`,
+   `manifest_unlisted_file`, `manifest_invalid_signature`); a pack whose
+   manifest fails is not checked further;
+2. the key history from the root key (`key_history_invalid`,
+   `genesis_invalid`, `genesis_root_mismatch`, `genesis_invalid_signature`,
+   the succession reasons); a history that fails stops it;
+3. the anchors (the anchor reasons, `pack_end_anchor_mismatch`,
+   `pack_end_anchor_not_held`, `pack_start_not_tied`,
+   `pack_start_anchor_not_held`, and the range against the anchors held);
+4. the entries (`entries_invalid`, `pack_range_mismatch`,
+   `cited_out_of_range`, then every export reason, with the cited records as
+   the range's predecessors and `cited_record_missing` for what neither
+   holds);
+5. what the records rest on outside the store (`cited_trust_invalid`,
+   `policy_invalid_signature`, `treaty_invalid_signature`,
+   `attestation_invalid_signature`, `feed_invalid_signature`,
+   `cited_policy_missing`, `cited_policy_mismatch`,
+   `cited_attestation_missing`, `cited_attestation_mismatch`);
+6. with `--changes`, the completeness check (`change_unmatched`).
+
+The library offers the same as `audit_pack::verify_audit_pack`.
 
 ### What it does not prove
 
@@ -271,17 +358,25 @@ the source describes.
 ## The differential harness
 
 `cargo test -p genesis-mesh-verify --test differential` runs the binary on the
-reference's vectors (`tests/fixtures`) and compares each verdict and reason
-code with the reference's. `GM_VERIFY_CORPUS=<file>` also runs the core's
-verification corpus (`scripts/export_reference_corpus.py --suite
-verification`), and `GM_VERIFY_BINARY=<path>` runs a release binary instead of
-the one cargo built:
+reference's vectors (`tests/fixtures`, the `audit` suite's packs, key
+histories and exports among them) and compares each verdict and reason code
+with the reference's. `GM_VERIFY_CORPUS=<dir>` also runs the core's
+verification corpus: the `verification/` directory the core's
+`scripts/export_reference_corpus.py --suite verification` writes (115 cases
+in 1.5.0: one signed record of every kind, valid and in each way refused,
+exports across a key succession, key histories and packs), and checks that
+the suites it copies are this crate's fixtures. `GM_VERIFY_BINARY=<path>`
+runs a release binary instead of the one cargo built:
 
 ```sh
+python genesismesh/scripts/export_reference_corpus.py --suite verification --out corpus
 GM_VERIFY_BINARY=./genesis-mesh-verify-1.5.0-x86_64-unknown-linux-musl \
-GM_VERIFY_CORPUS=verification.json \
+GM_VERIFY_CORPUS=corpus/verification GM_VERIFY_CORPUS_STRICT=1 \
   cargo test -p genesis-mesh-verify --test differential
 ```
+
+CI generates the corpus from the core revision it tests against and runs it
+this way.
 
 The vectors are read through a format adapter
 (`verifier/tests/adapter/mod.rs`); a vector kind without one is reported as
