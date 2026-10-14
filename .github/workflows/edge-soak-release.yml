@@ -1,0 +1,40 @@
+name: Edge agent soak (release)
+
+# Release pull requests: the two-hour scenario (edge-soak-run.yml) against the
+# core branch of the same name when it exists, main otherwise. Pull requests
+# only, which run without write access or secrets.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edge-soak-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: Choose the core revision
+    if: startsWith(github.head_ref, 'release/')
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.choose.outputs.ref }}
+    steps:
+      - id: choose
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          ref=main
+          if git ls-remote --exit-code --heads https://github.com/GenesisMeshLabs/genesismesh.git "refs/heads/$BRANCH" > /dev/null; then
+            ref="$BRANCH"
+          fi
+          echo "Testing with core revision: $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+  soak:
+    needs: core
+    uses: ./.github/workflows/edge-soak-run.yml
+    with:
+      core_ref: ${{ needs.core.outputs.ref }}

@@ -121,8 +121,9 @@ mod tests {
         let key = SigningKey::from_bytes(&[1; 32]);
         let public = STANDARD.encode(key.verifying_key().to_bytes());
         let body = json!({"cert_id": "c", "node_public_key": public, "purpose": PURPOSE_STATE});
+        let nonce = uuid::Uuid::new_v4().to_string();
         let signed =
-            sign_node_request(body, &key, "2026-10-14T12:00:00.000000+00:00", "n").unwrap();
+            sign_node_request(body, &key, "2026-10-14T12:00:00.000000+00:00", &nonce).unwrap();
         let payload = node_signing_payload(&signed).unwrap();
         assert!(!payload.contains("signature"));
         assert!(verify_canonical(
