@@ -93,6 +93,7 @@ pub fn fixture(name: &str) -> Value {
         "audit" => include_str!("../../../tests/fixtures/audit.json"),
         "canonical" => include_str!("../../../tests/fixtures/canonical.json"),
         "field_registry" => include_str!("../../../tests/fixtures/field_registry.json"),
+        "grants" => include_str!("../../../tests/fixtures/grants.json"),
         "out_of_band" => include_str!("../../../tests/fixtures/out_of_band.json"),
         "python-vectors" => include_str!("../../../tests/fixtures/python-vectors.json"),
         "remediation" => include_str!("../../../tests/fixtures/remediation.json"),

@@ -24,7 +24,8 @@ record: verify one signed record (a JSON file) as an export verifies it.
   <kind>                    decision, justification, execution, checkpoint,
                             observation, break-glass, judgement, quarantine,
                             registry, remediation, review, key-succession,
-                            archive, policy, attestation
+                            archive, policy, attestation, grant,
+                            grant-execution, grant-revocation, time-token
   --na-key <key>            an NA public key, valid at every time (repeatable)
   --key-history <file>      the NA's key history (GET /na/key-history): each
                             NA key valid at its own times; needs --root-key
@@ -429,6 +430,11 @@ mod tests {
         assert_eq!(record_kind("checkpoint").unwrap(), "retention_checkpoint");
         assert_eq!(record_kind("Break-Glass").unwrap(), "break_glass");
         assert_eq!(record_kind("key-succession").unwrap(), "key_succession");
+        // 1.6.0: grants, their uses, revocations and time tokens.
+        assert_eq!(record_kind("grant").unwrap(), "grant");
+        assert_eq!(record_kind("grant-execution").unwrap(), "grant_execution");
+        assert_eq!(record_kind("Grant_Revocation").unwrap(), "grant_revocation");
+        assert_eq!(record_kind("time-token").unwrap(), "time_token");
         assert!(matches!(record_kind("anchor"), Err(Stop::Usage(_))));
     }
 

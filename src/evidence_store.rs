@@ -401,8 +401,9 @@ impl EvidenceStoreClient {
 
     /// Search stored entries (admin). Filters: `vendor_id`, `attestation_id`,
     /// `capability`, `resource_id`, `outcome`, `entry_kind`, `decision_id`,
-    /// `since`, `until`, `after_sequence`, `limit` (1..1000). Use
-    /// `next_after_sequence` as the next `after_sequence`.
+    /// `grant_id` (1.6.0: a grant's uses and revocation), `since`, `until`,
+    /// `after_sequence`, `limit` (1..1000). Use `next_after_sequence` as the
+    /// next `after_sequence`.
     pub async fn search(&self, params: Value) -> Result<Value> {
         self.http
             .admin_get("/admin/evidence", &query_pairs(&params)?)
@@ -566,7 +567,9 @@ impl EvidenceStoreClient {
     /// The head of a resource chain, or `None` for a resource with no history
     /// (admin). One indexed lookup on the NA (`/admin/evidence/resource-heads`,
     /// v0.63.1), which also covers chains whose records retention removed.
-    /// Against an older NA it falls back to the resource history.
+    /// Against an older NA it falls back to the resource history. Since 1.6.0
+    /// the head may be a grant use: [`resource_head_entry`](Self::resource_head_entry)
+    /// says which.
     pub async fn resource_head(&self, resource_id: &str) -> Result<Option<ResourceHead>> {
         let path = format!(
             "/admin/evidence/resource-heads/{}",
@@ -580,6 +583,26 @@ impl EvidenceStoreClient {
             // Route missing: an NA older than v0.63.1.
             Err(GenesisMeshError::NotFound { .. }) => {
                 self.resource_head_from_history(resource_id).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The head of a resource chain as the NA answers it (admin, 1.6.0):
+    /// `resource_sequence`, `record_digest`, and what the head is,
+    /// `entry_kind` (`execution`, `grant_execution`, or
+    /// `retention_checkpoint` once retention removed every stored record) and
+    /// its `record_id` (an execution's `evidence_id`, a use's `use_id`).
+    /// `None` for a resource with no history.
+    pub async fn resource_head_entry(&self, resource_id: &str) -> Result<Option<Value>> {
+        let path = format!(
+            "/admin/evidence/resource-heads/{}",
+            resource_path(resource_id)?
+        );
+        match self.http.admin_get::<Value>(&path, &[]).await {
+            Ok(head) => Ok(Some(head)),
+            Err(GenesisMeshError::NotFound { code, .. }) if code == "resource_not_found" => {
+                Ok(None)
             }
             Err(err) => Err(err),
         }
@@ -627,6 +650,10 @@ impl EvidenceStoreClient {
             RecordKind::Remediation => {
                 ("/evidence/remediations", json!({ "record": entry.record }))
             }
+            RecordKind::GrantExecution => (
+                "/evidence/grant-executions",
+                json!({ "evidence": entry.record }),
+            ),
         };
         self.http.public_post_waiting(path, body).await
     }
@@ -668,7 +695,8 @@ impl EvidenceStoreClient {
     }
 
     /// Keep a signed observation or break-glass record (1.4.0: or remediation
-    /// record) in the record outbox and submit it (v1.3.0). A failed
+    /// record; 1.6.0: or grant use) in the record outbox and submit it
+    /// (v1.3.0). A failed
     /// submission is not an error: a
     /// transient one leaves the record pending for
     /// [`flush_records`](Self::flush_records), and a refusal no retry can
@@ -681,7 +709,8 @@ impl EvidenceStoreClient {
         let fresh = RecordOutboxEntry::new(record);
         if fresh.id.is_empty() {
             return Err(GenesisMeshError::Configuration(
-                "a record needs an observation_id, a break_glass_id or a remediation_id".into(),
+                "a record needs an observation_id, a break_glass_id, a remediation_id or a use_id"
+                    .into(),
             ));
         }
         let entries = outbox.list().await.map_err(outbox_error)?;
@@ -711,7 +740,10 @@ impl EvidenceStoreClient {
     }
 
     /// Submit the record outbox's pending records (v1.3.0): break-glass
-    /// records first, one at a time (1.3.1), then observations, consecutive
+    /// records first, one at a time (1.3.1), then grant uses one at a time in
+    /// the order they were made (1.6.0: their chain's order; a use the NA
+    /// quarantines still takes its place in the chain, so the next is
+    /// submitted and judged on its own), then observations, consecutive
     /// ones up to 100 per request, then remediation records one at a time
     /// (1.4.0: the changes they remediate are judged by then), each in the
     /// order they were added.
@@ -742,11 +774,14 @@ impl EvidenceStoreClient {
             .into_iter()
             .filter(|e| e.state == OutboxState::Pending)
             .collect();
-        // Stable: each kind keeps the order its records were added in.
+        // Stable: each kind keeps the order its records were added in (a
+        // grant's uses in their chain's order). Grant uses (1.6.0) go before
+        // observations, which the NA matches to them.
         entries.sort_by_key(|e| match e.kind {
             RecordKind::BreakGlass => 0,
-            RecordKind::Observation => 1,
-            RecordKind::Remediation => 2,
+            RecordKind::GrantExecution => 1,
+            RecordKind::Observation => 2,
+            RecordKind::Remediation => 3,
         });
         // A record `enqueue_record` is submitting is left to it, as pending.
         let due = |e: &RecordOutboxEntry| {

@@ -45,8 +45,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     auth::{canonical_json, verify_canonical},
     canonical::{
-        entry_digest, micros, parse_timestamp, policy_digest, policy_set_digest, python_timestamp,
-        received_canonical,
+        attestation_digest, entry_digest, micros, parse_timestamp, policy_digest,
+        policy_set_digest, python_timestamp, received_canonical,
     },
     key_history::{verify_key_history, NaKeyHistory, NaKeys},
     strict::{non_canonical_fields, unknown_fields},
@@ -105,6 +105,15 @@ pub const PACK_FILES: [&str; 13] = [
     FEEDS_FILE,
     TREATIES_FILE,
 ];
+
+/// The agreements a pack's grants rest on (1.6.0), each as received: held
+/// only when the pack holds a grant under an agreement, so a pack without one
+/// keeps the 1.5 file set.
+pub const AGREEMENTS_FILE: &str = "trust/agreements.jsonl";
+
+/// Files of the format a pack holds only when it has something to put in
+/// them (1.6.0).
+pub const OPTIONAL_PACK_FILES: [&str; 1] = [AGREEMENTS_FILE];
 
 /// The completeness check's default tolerance, in seconds.
 pub const DEFAULT_TOLERANCE_SECONDS: i64 = 300;
@@ -572,7 +581,7 @@ fn check_manifest(
         }
     }
     for (path, item) in &listed {
-        if !PACK_FILES.contains(&path.as_str()) {
+        if !PACK_FILES.contains(&path.as_str()) && !OPTIONAL_PACK_FILES.contains(&path.as_str()) {
             // A pack holds the files of its format and nothing else.
             let detail = format!("{path} is not a file of the format");
             result.fail(m, None, "manifest_unknown_file", &detail);
@@ -1261,9 +1270,14 @@ fn check_cited_trust(
             read(ATTESTATIONS_FILE)?,
             read(TREATIES_FILE)?,
             read(FEEDS_FILE)?,
+            // 1.6.0: only in a pack holding a grant under an agreement.
+            match files.get(AGREEMENTS_FILE) {
+                Some(_) => read(AGREEMENTS_FILE)?,
+                None => Vec::new(),
+            },
         ))
     })();
-    let (policies, attestations, treaties, feeds) = match read_all {
+    let (policies, attestations, treaties, feeds, agreements) = match read_all {
         Ok(all) => all,
         Err(e) => {
             let detail: String = e.chars().take(200).collect();
@@ -1306,6 +1320,7 @@ fn check_cited_trust(
         by_version.insert((id.to_owned(), version), policy);
     }
     let own = history.sovereign_id.as_str();
+    let own_sovereign = own.to_owned();
     let mut issuer_keys: HashMap<String, Vec<String>> = HashMap::new();
     for treaty in &treaties {
         let at = time_of(treaty, "issued_at");
@@ -1418,6 +1433,42 @@ fn check_cited_trust(
                 }
                 &event["payload"]["policy_binding"]
             }
+            // v1.6.0: the policy versions a grant is bound to, and the
+            // attestation or (review fixes) agreement it rests on.
+            "grant" => {
+                let grant = &event["payload"];
+                if !reads_as("CapabilityGrant", grant) {
+                    continue;
+                }
+                let id = field(grant, "basis_id").unwrap_or_default();
+                if field(grant, "basis_kind") == Some("attestation") {
+                    match by_attestation.get(id) {
+                        None => result.fail(file, Some(seq), "cited_attestation_missing", id),
+                        Some(held) => {
+                            if attestation_digest(held).ok().as_deref()
+                                != field(grant, "basis_digest")
+                            {
+                                result.fail(file, Some(seq), "cited_attestation_mismatch", id);
+                            }
+                        }
+                    }
+                } else {
+                    let held = agreements
+                        .iter()
+                        .find(|a| field(a, "agreement_id") == Some(id));
+                    if let Some(problem) =
+                        agreement_problem(grant, held, &own_sovereign, keys, &issuer_keys)
+                    {
+                        let at = if problem == "cited_agreement_missing" {
+                            file
+                        } else {
+                            Some(AGREEMENTS_FILE)
+                        };
+                        result.fail(at, Some(seq), problem, id);
+                    }
+                }
+                &grant["policy_binding"]
+            }
             _ => continue,
         };
         if binding.is_null() {
@@ -1446,6 +1497,87 @@ fn check_cited_trust(
             }
         }
     }
+}
+
+/// Why the agreement a grant rests on does not hold up in a pack, or `None`
+/// (1.6.0 review fixes, the reference's `_agreement_problem`):
+/// `cited_agreement_missing` when the pack does not hold it;
+/// `cited_agreement_mismatch` when it is not the one the grant's
+/// `basis_digest` names, or its parties are not the grant's (the responder is
+/// the requester, the offerer the provider); `agreement_invalid_signature`
+/// when its two parties did not sign it, as received, with keys the pack
+/// vouches for (the NA's key valid at `agreed_terms.valid_from` for its own
+/// sovereign, a treaty's subject keys for another; an agreement the NA
+/// offered and accepted itself carries the NA's signature for both, which
+/// holds only while the pack carries a treaty for the responder), or it is
+/// not in the form the reference writes.
+fn agreement_problem(
+    grant: &Value,
+    agreement: Option<&Value>,
+    own: &str,
+    keys: &NaKeys,
+    treaty_keys: &HashMap<String, Vec<String>>,
+) -> Option<&'static str> {
+    let Some(agreement) = agreement else {
+        return Some("cited_agreement_missing");
+    };
+    let valid_from = agreement["agreed_terms"]["valid_from"]
+        .as_str()
+        .and_then(|t| micros(t).ok());
+    let readable = agreement.is_object()
+        && [
+            "agreement_id",
+            "offerer_sovereign_id",
+            "responder_sovereign_id",
+        ]
+        .iter()
+        .all(|k| agreement[*k].is_string())
+        && valid_from.is_some();
+    if !readable {
+        return Some("cited_agreement_mismatch");
+    }
+    let digest = received_canonical("AgreementRecord", agreement)
+        .map(|body| sha256_hex(body.as_bytes()))
+        .ok();
+    if digest.as_deref() != field(grant, "basis_digest")
+        || field(agreement, "responder_sovereign_id") != field(grant, "requester_sovereign_id")
+        || field(agreement, "offerer_sovereign_id") != field(grant, "provider_sovereign_id")
+    {
+        return Some("cited_agreement_mismatch");
+    }
+    let na_keys = keys.at(valid_from);
+    let party_keys = |party: &str| -> Vec<String> {
+        if party == own {
+            na_keys.clone()
+        } else {
+            treaty_keys
+                .get(party)
+                .into_iter()
+                .flatten()
+                .filter(|k| !na_keys.contains(k))
+                .cloned()
+                .collect()
+        }
+    };
+    let offerer = field(agreement, "offerer_sovereign_id").unwrap_or_default();
+    let responder = field(agreement, "responder_sovereign_id").unwrap_or_default();
+    let mut pairs = vec![(party_keys(offerer), party_keys(responder))];
+    // The NA-offered-and-accepted exception holds, as on the NA's routes,
+    // only while the responder holds a treaty from this NA (one the pack
+    // carries).
+    let responder_trusted = treaty_keys.get(responder).is_some_and(|k| !k.is_empty());
+    if offerer == own && responder_trusted {
+        pairs.push((na_keys.clone(), na_keys.clone()));
+    }
+    let well_formed = unknown_fields("AgreementRecord", agreement).is_empty()
+        && non_canonical_fields("AgreementRecord", agreement).is_empty();
+    let signed = pairs.iter().any(|(offerer, responder)| {
+        !offerer.is_empty()
+            && !responder.is_empty()
+            && signed_as_received("AgreementRecord", agreement, offerer)
+            && signed_as_received("AgreementRecord", agreement, responder)
+    });
+    (!(signed && well_formed)).then_some("agreement_invalid_signature")
 }
 
 /// Where a verification differs from the checks the NA wrote into the pack
@@ -1705,6 +1837,8 @@ pub fn render_report(
     let (mut changes, mut denials, mut remediations, mut reviews) =
         (vec![], vec![], vec![], vec![]);
     let (mut break_glass, mut quarantined, mut others) = (vec![], vec![], vec![]);
+    // v1.6.0: grants and their revocations.
+    let (mut grants, mut grant_revocations) = (vec![], vec![]);
     let null = Value::Null;
     for e in entries {
         let p = &e["payload"];
@@ -1725,6 +1859,29 @@ pub fn render_report(
                     at("executor_sovereign_id"),
                 ]);
             }
+            // v1.6.0: a change made under a grant, governed by it.
+            "grant_execution" => changes.push(vec![
+                seq,
+                json!(kind),
+                at("resource_id"),
+                at("resource_action"),
+                at("executed_at"),
+                json!("grant"),
+                json!("recorded"),
+                at("executor_sovereign_id"),
+            ]),
+            "grant" => grants.push(vec![
+                seq,
+                at("grant_id"),
+                at("bearer_sovereign_id"),
+                at("capabilities"),
+                at("valid_from"),
+                at("valid_until"),
+                at("max_uses"),
+            ]),
+            "grant_revocation" => {
+                grant_revocations.push(vec![seq, at("grant_id"), at("reason"), at("revoked_at")])
+            }
             "observation" | "break_glass" => {
                 let record_id = py_str(or(&at("observation_id"), &at("break_glass_id")));
                 let judgement = judgements.get(&(kind.to_owned(), record_id)).copied();
@@ -1732,8 +1889,11 @@ pub fn render_report(
                 if state.is_null() {
                     state = json!(match judgement {
                         None => "observed",
+                        // v1.6.0: or matched to a grant use.
                         Some(j)
-                            if j["governed_by"] == "prior_decision" && j["verdict"] != "deny" =>
+                            if (j["governed_by"] == "prior_decision"
+                                || j["governed_by"] == "grant")
+                                && j["verdict"] != "deny" =>
                             "matched",
                         Some(j) => match py_str(&j["verdict"]).as_str() {
                             "allow" => "judged_allowed",
@@ -1840,7 +2000,7 @@ pub fn render_report(
             ]
         })
         .collect();
-    let sections: [Section<'_>; 8] = [
+    let mut sections: Vec<Section<'_>> = vec![
         (
             "Changes",
             &[
@@ -1907,6 +2067,30 @@ pub fn render_report(
             &others,
         ),
     ];
+    // v1.6.0: grants and their revocations, only in a pack that holds them
+    // (a pack without them renders as in 1.5).
+    if !grants.is_empty() {
+        sections.push((
+            "Grants",
+            &[
+                "Entry",
+                "Grant",
+                "Bearer",
+                "Capabilities",
+                "Valid from",
+                "Valid until",
+                "Budget",
+            ],
+            &grants,
+        ));
+    }
+    if !grant_revocations.is_empty() {
+        sections.push((
+            "Grant revocations",
+            &["Entry", "Grant", "Reason", "Revoked at"],
+            &grant_revocations,
+        ));
+    }
     for (title, headers, rows) in sections {
         lines.extend([format!("## {title}"), String::new()]);
         lines.extend(table(headers, rows));
@@ -2182,8 +2366,8 @@ pub fn parse_changes(text: &str, csv: bool) -> std::result::Result<Vec<Change>, 
     Ok(out)
 }
 
-/// A change as the pack records it: an observation, a break-glass record or
-/// execution evidence.
+/// A change as the pack records it: an observation, a break-glass record,
+/// execution evidence or (1.6.0) a grant use.
 #[derive(Debug, Clone)]
 struct Recorded {
     kind: &'static str,
@@ -2241,22 +2425,19 @@ fn records(entries: &[Value], cited: &[Value]) -> Vec<Recorded> {
                     group: String::new(),
                 })
             })(),
-            Some(kind @ ("break_glass" | "execution")) => (|| {
-                if kind == "execution" && field(p, "resource_id").is_none_or(str::is_empty) {
+            // v1.6.0: a grant use is a change made under a grant.
+            Some(kind @ ("break_glass" | "execution" | "grant_execution")) => (|| {
+                if kind != "break_glass" && field(p, "resource_id").is_none_or(str::is_empty) {
                     return None;
                 }
                 let at = when("executed_at")?;
-                let id = if kind == "execution" {
-                    "evidence_id"
-                } else {
-                    "break_glass_id"
+                let (kind, id) = match kind {
+                    "execution" => ("execution", "evidence_id"),
+                    "grant_execution" => ("grant_execution", "use_id"),
+                    _ => ("break_glass", "break_glass_id"),
                 };
                 Some(Recorded {
-                    kind: if kind == "execution" {
-                        "execution"
-                    } else {
-                        "break_glass"
-                    },
+                    kind,
                     record_id: text(id)?,
                     store_sequence: seq,
                     resource_id: text("resource_id")?,
@@ -2493,4 +2674,113 @@ pub fn check_completeness(
         })).collect::<Vec<_>>(),
         "complete": inside.is_empty(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{load_signing_key, public_key_from_seed, sign_canonical};
+
+    fn seed(byte: u8) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode([byte; 32])
+    }
+
+    /// The registry suite's agreement, signed by `signers` (seeds).
+    fn agreement(signers: &[u8]) -> Value {
+        let suite: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/field_registry.json")).unwrap();
+        let mut record = suite["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == "agreementrecord-clean")
+            .unwrap()["record"]
+            .clone();
+        let body = received_canonical("AgreementRecord", &record).unwrap();
+        record["signatures"] = Value::Array(
+            signers
+                .iter()
+                .map(|s| sign_canonical(&body, "k", &load_signing_key(&seed(*s)).unwrap()))
+                .collect(),
+        );
+        record
+    }
+
+    fn grant_on(agreement: &Value) -> Value {
+        let body = received_canonical("AgreementRecord", agreement).unwrap();
+        json!({
+            "basis_digest": sha256_hex(body.as_bytes()),
+            "requester_sovereign_id": agreement["responder_sovereign_id"],
+            "provider_sovereign_id": agreement["offerer_sovereign_id"],
+        })
+    }
+
+    #[test]
+    fn a_grant_on_an_agreement_rests_on_one_both_parties_signed_with_keys_the_pack_vouches_for() {
+        // The NA is the offerer's sovereign (`sovereign-a`); the responder's
+        // keys come from its treaty.
+        let na = NaKeys::Any(vec![public_key_from_seed(&seed(1)).unwrap()]);
+        let treaties: HashMap<String, Vec<String>> = [(
+            "sovereign-b".to_owned(),
+            vec![public_key_from_seed(&seed(2)).unwrap()],
+        )]
+        .into();
+        let signed = agreement(&[1, 2]);
+        let grant = grant_on(&signed);
+        let problem = |record: Option<&Value>, grant: &Value| {
+            agreement_problem(grant, record, "sovereign-a", &na, &treaties)
+        };
+        assert_eq!(problem(Some(&signed), &grant), None);
+        assert_eq!(problem(None, &grant), Some("cited_agreement_missing"));
+        // Another agreement than the grant's digest names, or other parties.
+        let mut other = grant.clone();
+        other["basis_digest"] = json!("0".repeat(64));
+        assert_eq!(
+            problem(Some(&signed), &other),
+            Some("cited_agreement_mismatch")
+        );
+        let mut parties = grant.clone();
+        parties["requester_sovereign_id"] = json!("sovereign-x");
+        assert_eq!(
+            problem(Some(&signed), &parties),
+            Some("cited_agreement_mismatch")
+        );
+        // The NA is the responder's sovereign, and another key signed for it.
+        let na_b = NaKeys::Any(vec![public_key_from_seed(&seed(2)).unwrap()]);
+        let treaty_a: HashMap<String, Vec<String>> = [(
+            "sovereign-a".to_owned(),
+            vec![public_key_from_seed(&seed(1)).unwrap()],
+        )]
+        .into();
+        let as_responder = |record: &Value| {
+            agreement_problem(
+                &grant_on(record),
+                Some(record),
+                "sovereign-b",
+                &na_b,
+                &treaty_a,
+            )
+        };
+        assert_eq!(as_responder(&signed), None);
+        assert_eq!(
+            as_responder(&agreement(&[1, 3])),
+            Some("agreement_invalid_signature")
+        );
+        // An offerer no treaty vouches for.
+        assert_eq!(
+            as_responder(&agreement(&[4, 2])),
+            Some("agreement_invalid_signature")
+        );
+        // An agreement the NA offered and accepted itself, signed by the NA
+        // alone: it holds while the pack carries the responder's treaty, and
+        // not without it.
+        let own = agreement(&[1]);
+        assert_eq!(problem(Some(&own), &grant_on(&own)), None);
+        let no_treaty = HashMap::new();
+        assert_eq!(
+            agreement_problem(&grant_on(&own), Some(&own), "sovereign-a", &na, &no_treaty),
+            Some("agreement_invalid_signature")
+        );
+    }
 }

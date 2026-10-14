@@ -21,6 +21,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::grants::{
+    continues_chain, next_previous, token_signature_valid, use_problem, PreviousUse, UseContext,
+};
 use crate::key_history::{
     succession_form_refusal, succession_signed_by, NaKeyHistory, NaKeys,
     SUCCESSION_MIN_LEAD_SECONDS,
@@ -489,7 +492,11 @@ validator!(
             ("resource_id", bounded(256, 1)),
             ("action", action()),
             ("capability", bounded(256, 1)),
-            ("governed_by", one_of(&["prior_decision", "after_the_fact"])),
+            // v1.6.0: `grant`, a change matched to a grant use.
+            (
+                "governed_by",
+                one_of(&["prior_decision", "after_the_fact", "grant"])
+            ),
             ("verdict", verdict()),
             ("reason", absent(bounded(1024, 0))),
             ("evaluated_as_of", utc_timestamp()),
@@ -518,8 +525,15 @@ validator!(
             ("quarantine_id", bounded(128, 1)),
             (
                 "record_kind",
-                // v1.4.0: also a refused remediation record.
-                one_of(&["execution", "observation", "break_glass", "remediation"])
+                // v1.4.0: also a refused remediation record; v1.6.0: a
+                // refused grant use.
+                one_of(&[
+                    "execution",
+                    "observation",
+                    "break_glass",
+                    "remediation",
+                    "grant_execution"
+                ])
             ),
             ("record", object()),
             ("record_digest", sha256()),
@@ -640,6 +654,8 @@ pub(crate) fn reads_as(model: &str, record: &Value) -> bool {
         "RegistryRecord" => valid_registry(Some(record)),
         "JudgementRecord" => valid_judgement(Some(record)),
         "BoundaryDecision" => valid_decision(Some(record)),
+        // v1.6.0: a grant's policy binding and basis are checked as a decision's.
+        "CapabilityGrant" => valid_grant(Some(record)),
         _ => false,
     };
     valid && unknown_fields(model, record).is_empty()
@@ -763,6 +779,273 @@ validator!(
         false
     )
 );
+
+// v1.6.0: pre-issued grants, their time tokens, uses and revocations. An
+// absent optional field is left out of the signed form; a null reads as
+// absent.
+
+/// A field's value when present and not `null`.
+fn given<'a>(record: &'a Value, key: &str) -> Option<&'a Value> {
+    record.get(key).filter(|v| !v.is_null())
+}
+
+/// A grant's capabilities: 1 to 16 exact capability ids of 1 to 256
+/// characters, none twice.
+fn grant_capabilities() -> Check {
+    Box::new(|v| {
+        let Some(Value::Array(items)) = v else {
+            return false;
+        };
+        (1..=crate::grants::MAX_GRANT_CAPABILITIES).contains(&items.len())
+            && items.iter().enumerate().all(|(i, item)| {
+                item.as_str()
+                    .is_some_and(|c| (1..=256).contains(&c.chars().count()) && !c.contains('*'))
+                    && !items[..i].contains(item)
+            })
+    })
+}
+
+fn grant_policy_binding() -> Check {
+    shape(
+        vec![
+            (
+                "policies",
+                filled(array(shape(
+                    vec![
+                        ("policy_id", string()),
+                        ("version", integer()),
+                        ("policy_digest", string()),
+                        ("signed_by", string()),
+                    ],
+                    false,
+                ))),
+            ),
+            ("policy_set_digest", string()),
+            (
+                "gate_outcomes",
+                filled(array(shape(
+                    vec![
+                        ("capability", string()),
+                        ("policy_id", string()),
+                        ("policy_version", integer()),
+                        ("gate_id", string()),
+                        ("gate_type", string()),
+                        ("mode", one_of(&["observe", "enforce"])),
+                        ("outcome", one_of(&["pass", "may_fail", "undecidable"])),
+                        ("detail", bounded(1024, 0)),
+                    ],
+                    false,
+                ))),
+            ),
+            ("registry_gate_types", filled(array(string()))),
+        ],
+        false,
+    )
+}
+
+/// A use sequence between `min` and the largest budget.
+fn use_sequence(min: i64) -> Check {
+    Box::new(move |v| {
+        v.and_then(Value::as_i64)
+            .is_some_and(|n| n >= min && n <= crate::grants::GRANT_MAX_USES as i64)
+    })
+}
+
+/// `use_head_digest` is given exactly when `use_sequence` is 1 or more.
+fn head_consistent(record: &Value) -> bool {
+    (record["use_sequence"].as_i64() == Some(0)) == given(record, "use_head_digest").is_none()
+}
+
+validator!(valid_grant, {
+    let fields = shape(
+        vec![
+            ("grant_id", bounded(128, 1)),
+            ("bearer_key_id", bounded(256, 1)),
+            ("bearer_public_key", bounded(256, 1)),
+            ("bearer_sovereign_id", bounded(256, 1)),
+            ("capabilities", grant_capabilities()),
+            ("basis_kind", one_of(&["agreement", "attestation"])),
+            ("basis_id", bounded(128, 1)),
+            ("basis_digest", sha256()),
+            ("requester_sovereign_id", bounded(256, 1)),
+            ("provider_sovereign_id", bounded(256, 1)),
+            ("valid_from", utc_timestamp()),
+            ("valid_until", utc_timestamp()),
+            (
+                "max_uses",
+                int_where(|n| (1..=crate::grants::GRANT_MAX_USES as i64).contains(&n)),
+            ),
+            (
+                "max_uses_per_time_token",
+                int_where(|n| {
+                    (1..=crate::grants::GRANT_MAX_USES_PER_TIME_TOKEN as i64).contains(&n)
+                }),
+            ),
+            (
+                "parameter_envelope",
+                filled(Box::new(|v| {
+                    v.is_some_and(|e| crate::grants::envelope_form_problem(e).is_none())
+                })),
+            ),
+            ("basis_checks", filled(array(gate_result()))),
+            ("policy_binding", grant_policy_binding()),
+            ("issued_at", utc_timestamp()),
+            ("issuer_sovereign_id", string()),
+            ("issued_by", string()),
+            ("signature", optional(signature())),
+        ],
+        false,
+    );
+    // At most 24 hours, ending after it starts.
+    let validity = |record: &Value| {
+        let at = |key: &str| micros(str_field(record, key).unwrap_or_default());
+        matches!((at("valid_from"), at("valid_until")), (Ok(from), Ok(until))
+            if from < until
+                && until - from <= crate::grants::GRANT_MAX_VALIDITY_SECONDS * 1_000_000)
+    };
+    Box::new(move |v| fields(v) && v.is_some_and(validity))
+});
+
+validator!(valid_time_token, {
+    let fields = shape(
+        vec![
+            ("time_token_id", bounded(128, 1)),
+            ("grant_id", bounded(128, 1)),
+            ("use_sequence", use_sequence(0)),
+            ("use_head_digest", absent(sha256())),
+            ("issued_at", utc_timestamp()),
+            ("issuer_sovereign_id", string()),
+            ("issued_by", string()),
+            ("signature", optional(signature())),
+        ],
+        false,
+    );
+    Box::new(move |v| fields(v) && v.is_some_and(head_consistent))
+});
+
+validator!(valid_time_token_request, {
+    let fields = shape(
+        vec![
+            ("grant_id", bounded(128, 1)),
+            ("use_sequence", use_sequence(0)),
+            ("use_head_digest", absent(sha256())),
+            ("requested_at", utc_timestamp()),
+            ("signature", optional(signature())),
+        ],
+        false,
+    );
+    Box::new(move |v| fields(v) && v.is_some_and(head_consistent))
+});
+
+validator!(valid_grant_use, {
+    let fields = shape(
+        vec![
+            (
+                "use_id",
+                Box::new(|v| {
+                    v.and_then(Value::as_str)
+                        .is_some_and(crate::grants::valid_use_id)
+                }),
+            ),
+            ("grant_id", bounded(128, 1)),
+            ("grant_digest", sha256()),
+            ("use_sequence", use_sequence(1)),
+            ("prev_use_digest", absent(sha256())),
+            ("executor_sovereign_id", bounded(256, 1)),
+            ("capability", bounded(256, 1)),
+            ("request_parameters", filled(object())),
+            ("resource_id", absent(bounded(256, 1))),
+            ("resource_action", absent(action())),
+            ("executed_at", utc_timestamp()),
+            ("time_token", Box::new(valid_time_token)),
+            ("outcome", one_of(&crate::grants::USE_OUTCOMES)),
+            ("outcome_detail", absent(bounded(1024, 0))),
+            ("execution_parameters", filled(object())),
+            ("signature", optional(signature())),
+        ],
+        false,
+    );
+    // A resource and its action go together; `prev_use_digest` is given
+    // exactly from the second use on.
+    let consistent = |record: &Value| {
+        given(record, "resource_id").is_some() == given(record, "resource_action").is_some()
+            && (record["use_sequence"].as_i64() == Some(1))
+                == given(record, "prev_use_digest").is_none()
+    };
+    Box::new(move |v| fields(v) && v.is_some_and(consistent))
+});
+
+validator!(
+    valid_grant_revocation,
+    shape(
+        vec![
+            ("revocation_id", bounded(128, 1)),
+            ("grant_id", bounded(128, 1)),
+            ("grant_digest", sha256()),
+            ("reason", one_of(&crate::grants::REVOCATION_REASONS)),
+            ("detail", absent(bounded(1024, 1))),
+            ("revoked_by", absent(bounded(256, 1))),
+            ("revoked_at", utc_timestamp()),
+            ("issuer_sovereign_id", string()),
+            ("issued_by", string()),
+            ("signature", optional(signature())),
+        ],
+        false
+    )
+);
+
+validator!(
+    valid_feed,
+    shape(
+        vec![
+            ("feed_id", string()),
+            ("issuer_sovereign_id", string()),
+            ("sequence", nonnegative()),
+            ("issued_at", timestamp()),
+            ("revoked_attestation_ids", filled(array(string()))),
+            ("revocation_reasons", filled(dictionary(string()))),
+            // v1.6.0: the revoked grants not yet past their end, with grants on.
+            ("revoked_grant_ids", absent(array(string()))),
+            ("issued_by", string()),
+            (
+                "signatures",
+                filled(array(shape(
+                    vec![("key_id", string()), ("sig", string())],
+                    false
+                )))
+            ),
+        ],
+        false
+    )
+);
+
+/// True when a sovereign revocation feed (`GET /sovereign-revocation-feed`)
+/// is well formed, one of its signatures verifies under the issuer's keys
+/// over the feed as received, and it carries no field this crate does not
+/// know (1.6.0: it knows `revoked_grant_ids`, which an NA with grants on
+/// lists; a 1.5 verifier refuses it). The revoked grants a holder must refuse
+/// are its `revoked_grant_ids`.
+pub fn verify_revocation_feed(feed: &Value, issuer_public_keys: &[String]) -> bool {
+    valid_feed(Some(feed))
+        && unknown_fields("SovereignRevocationFeed", feed).is_empty()
+        && crate::grants::signed_as_received("SovereignRevocationFeed", feed, issuer_public_keys)
+}
+
+/// True when a grant record (a `CapabilityGrant`, `TimeToken`,
+/// `TimeTokenRequest`, `GrantExecutionEvidence` or `GrantRevocationRecord`,
+/// named by `model`) is well formed and carries no field this crate does
+/// not know (1.6.0); its signature is checked apart.
+pub fn valid_grant_record(model: &str, record: &Value) -> bool {
+    let valid = match model {
+        "CapabilityGrant" => valid_grant(Some(record)),
+        "TimeToken" => valid_time_token(Some(record)),
+        "TimeTokenRequest" => valid_time_token_request(Some(record)),
+        "GrantExecutionEvidence" => valid_grant_use(Some(record)),
+        "GrantRevocationRecord" => valid_grant_revocation(Some(record)),
+        _ => false,
+    };
+    valid && unknown_fields(model, record).is_empty()
+}
 
 validator!(
     valid_event,
@@ -923,9 +1206,24 @@ const OUT_OF_BAND_IDS: [(&str, &str, Validator); 8] = [
 /// the keys, with no signed field the registry does not list. Its form is
 /// checked apart ([`non_canonical_fields`]).
 fn out_of_band_verifies(model: &str, record: &Value, keys: &[String]) -> bool {
-    signed_by(out_of_band_canonical(record), record.get("signature"), keys)
-        && unknown_fields(model, record).is_empty()
+    // v1.6.0: a grant record is signed over its form as received, as the
+    // field registry describes it (a nested time token keeps its form).
+    let signed = if GRANT_MODELS.contains(&model) {
+        crate::grants::signed_as_received(model, record, keys)
+    } else {
+        signed_by(out_of_band_canonical(record), record.get("signature"), keys)
+    };
+    signed && unknown_fields(model, record).is_empty()
 }
+
+/// The models of the grant records (v1.6.0) an export or a single record
+/// holds.
+const GRANT_MODELS: [&str; 4] = [
+    "CapabilityGrant",
+    "GrantExecutionEvidence",
+    "GrantRevocationRecord",
+    "TimeToken",
+];
 
 /// True when a record of a change made outside the controlled path (v1.3.0:
 /// an observation, break-glass, judgement, quarantine or registry record;
@@ -1265,6 +1563,15 @@ pub struct EvidenceVerification {
     /// Archive entries checked (v1.5.0); left out when zero.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub archives: u64,
+    /// Grant entries checked (v1.6.0); left out when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub grants: u64,
+    /// Grant use entries checked (v1.6.0); left out when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub grant_executions: u64,
+    /// Grant revocation entries checked (v1.6.0); left out when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub grant_revocations: u64,
     /// Every failure, in order.
     pub failures: Vec<VerificationFailure>,
     /// Findings that do not fail verification (v1.2.0), such as
@@ -1292,6 +1599,9 @@ impl EvidenceVerification {
             reviews: 0,
             key_successions: 0,
             archives: 0,
+            grants: 0,
+            grant_executions: 0,
+            grant_revocations: 0,
             failures: Vec::new(),
             warnings: Vec::new(),
         }
@@ -1447,18 +1757,25 @@ fn check_payload_fields(
         "key_succession" => succession_signed_by(payload, na),
         // v1.3.0: the key the signature names, whatever its role or sovereign,
         // so an authentic record with a field this crate does not know is
-        // refused by name first, as the reference refuses it.
-        "observation" | "break_glass" | "remediation" => payload
+        // refused by name first, as the reference refuses it (v1.6.0: also a
+        // grant use, signed by its bearer key).
+        "observation" | "break_glass" | "remediation" | "grant_execution" => payload
             .get("signature")
             .and_then(|sig| str_field(sig, "key_id"))
             .and_then(|id| executor_keys.get(id))
             .is_some_and(|key| {
-                signed_by(
-                    out_of_band_canonical(payload),
-                    payload.get("signature"),
-                    &[str_field(key, "public_key").unwrap_or_default().to_owned()],
-                )
+                let keys = [str_field(key, "public_key").unwrap_or_default().to_owned()];
+                if kind == "grant_execution" {
+                    crate::grants::signed_as_received(model, payload, &keys)
+                } else {
+                    signed_by(
+                        out_of_band_canonical(payload),
+                        payload.get("signature"),
+                        &keys,
+                    )
+                }
             }),
+        _ if GRANT_MODELS.contains(&model) => crate::grants::signed_as_received(model, payload, na),
         _ => signed_by(out_of_band_canonical(payload), payload.get("signature"), na),
     };
     if signed_as_received {
@@ -1490,6 +1807,11 @@ fn out_of_band_model(kind: &str) -> Option<&'static str> {
         // v1.5.0
         "key_succession" => "KeySuccessionRecord",
         "archive" => "ArchiveRecord",
+        // v1.6.0; a time token is no entry kind, but verified as a record.
+        "grant" => "CapabilityGrant",
+        "grant_execution" => "GrantExecutionEvidence",
+        "grant_revocation" => "GrantRevocationRecord",
+        "time_token" => "TimeToken",
         _ => return None,
     })
 }
@@ -1521,7 +1843,8 @@ fn out_of_band_keys(
 ) -> Vec<String> {
     let (role, sovereign) = match kind {
         "observation" => ("observer", "observer_sovereign_id"),
-        "break_glass" | "remediation" => ("executor", "executor_sovereign_id"),
+        // v1.6.0: a grant use is signed by its grant's bearer key, an executor key.
+        "break_glass" | "remediation" | "grant_execution" => ("executor", "executor_sovereign_id"),
         _ => return na_public_keys.to_vec(),
     };
     payload
@@ -1629,6 +1952,11 @@ fn valid_payload(kind: &str, payload: &Value) -> bool {
         // v1.5.0
         "key_succession" => crate::key_history::valid_succession_record(payload),
         "archive" => valid_archive(Some(payload)),
+        // v1.6.0
+        "grant" => valid_grant(Some(payload)),
+        "grant_execution" => valid_grant_use(Some(payload)),
+        "grant_revocation" => valid_grant_revocation(Some(payload)),
+        "time_token" => valid_time_token(Some(payload)),
         _ => false,
     }
 }
@@ -1649,6 +1977,10 @@ fn record_id_of(kind: &str, payload: &Value) -> String {
         "review" => &payload["review_id"],
         "key_succession" => &payload["succession_id"],
         "archive" => &payload["archive_id"],
+        "grant" => &payload["grant_id"],
+        "grant_execution" => &payload["use_id"],
+        "grant_revocation" => &payload["revocation_id"],
+        "time_token" => &payload["time_token_id"],
         _ => &Value::Null,
     };
     id.as_str().unwrap_or_default().to_owned()
@@ -1657,7 +1989,7 @@ fn record_id_of(kind: &str, payload: &Value) -> String {
 /// v1.3.1: the envelope fields a Stage 2 entry derives from its record, and
 /// the record field each must equal (an absent field is null). The NA
 /// searches and matches on them.
-const ENVELOPE_FIELDS: [(&str, &[(&str, &str)]); 9] = [
+const ENVELOPE_FIELDS: [(&str, &[(&str, &str)]); 12] = [
     // v1.5.0: a key succession or archive entry carries its record's id only.
     ("key_succession", &[("record_id", "succession_id")]),
     ("archive", &[("record_id", "archive_id")]),
@@ -1726,6 +2058,38 @@ const ENVELOPE_FIELDS: [(&str, &[(&str, &str)]); 9] = [
             ("resource_id", "resource_id"),
             ("capability", "capability"),
             ("outcome", "verdict"),
+        ],
+    ),
+    // v1.6.0: no new envelope field. A grant names its bearer's sovereign; a
+    // use its grant (`subject_id`) and its place in the grant's chain
+    // (`exec_sequence_no`); a revocation its grant and reason. A use's
+    // `resource_sequence` is the NA's, outside the record.
+    (
+        "grant",
+        &[
+            ("record_id", "grant_id"),
+            ("executor_sovereign_id", "bearer_sovereign_id"),
+        ],
+    ),
+    (
+        "grant_execution",
+        &[
+            ("record_id", "use_id"),
+            ("subject_id", "grant_id"),
+            ("resource_id", "resource_id"),
+            ("resource_action", "resource_action"),
+            ("capability", "capability"),
+            ("executor_sovereign_id", "executor_sovereign_id"),
+            ("outcome", "outcome"),
+            ("exec_sequence_no", "use_sequence"),
+        ],
+    ),
+    (
+        "grant_revocation",
+        &[
+            ("record_id", "revocation_id"),
+            ("subject_id", "grant_id"),
+            ("outcome", "reason"),
         ],
     ),
 ];
@@ -1819,6 +2183,40 @@ fn fail(result: &mut EvidenceVerification, seq: Option<i64>, reason: &str, detai
 ///   start); and no waiver follows a remediation of the same subject
 ///   (`review_waiver_after_remediation`);
 /// * remediation and review ids are not decisions (`evidence_cites_judgement`).
+///
+/// v1.6.0, pre-issued grants ([`crate::grants`]), as the reference verifies
+/// them:
+///
+/// * a grant use (`grant_execution`) and a grant revocation name a grant the
+///   run holds when it holds the store from its start (`grant_missing`; in a
+///   pack `cited_record_missing`), with its digest (`grant_mismatch`); a use
+///   is signed by the grant's bearer key (`grant_bearer_mismatch`), and a
+///   grant is revoked once (`duplicate_grant_revocation`);
+/// * the uses of a grant form a chain (`grant_use_chain_break`), and each use
+///   is checked by [`use_problem`] with what the
+///   run holds (envelope, budget, time token, times, revocation; its reason
+///   codes);
+/// * a use takes the next position of its resource's chain, assigned by the
+///   NA in the envelope (`resource_sequence`; `resource_chain_break`), only
+///   when it has a resource (`envelope_mismatch`), and the next record of
+///   that resource links to the use's digest;
+/// * a judgement may match a use (`governed_by: grant`), and a quarantine
+///   entry may hold a refused one.
+///
+/// The 1.6.0 review fixes:
+///
+/// * a quarantined use (an authentic `quarantine` entry of `record_kind`
+///   `grant_execution`, signed by the grant's bearer key) that continues its
+///   grant's use chain is the chain's head: the next use may link to it, and a
+///   time token may name it. The budget counts the admitted uses (when the
+///   run holds the chain from its first use), and the order and time rules
+///   compare a use with the last admitted one;
+/// * a use signed by a bearer key with a `resource_prefix` is within it
+///   (`grant_use_out_of_scope`);
+/// * a use's `use_id` is not the id of execution evidence or a break-glass
+///   record (`duplicate_record`, in either order);
+/// * a grant whose signature fails is not held: its uses and revocation are
+///   checked as for a grant the run does not hold.
 pub fn verify_evidence_events<'a>(
     events: impl IntoIterator<Item = &'a Value>,
     options: &VerifyEvidenceOptions,
@@ -1862,6 +2260,12 @@ pub fn verify_evidence_events<'a>(
     // execution evidence's resources, remediated subjects, and operator keys
     // as the holder registry records them.
     let mut stage3 = Stage3::default();
+    // v1.6.0: grants by id (the record and its digest as received; only an
+    // authentic grant is held), when each was revoked, and the state of each
+    // grant's use chain.
+    let mut grants_held: HashMap<String, (Value, String)> = HashMap::new();
+    let mut revoked: HashMap<String, i64> = HashMap::new();
+    let mut chains = GrantChains::default();
     let mut first_sequence: Option<i64> = None;
     let mut from_start = false;
     let mut prev: Option<Value> = None;
@@ -2223,7 +2627,15 @@ pub fn verify_evidence_events<'a>(
                     _ => {}
                 }
                 last_exec.insert(decision_id, ev.clone());
-                matchable.insert(str_field(ev, "evidence_id").unwrap_or_default().to_owned());
+                let evidence_id = str_field(ev, "evidence_id").unwrap_or_default().to_owned();
+                // v1.6.0 review fixes: observations match a use and execution
+                // evidence by id, so they never share one.
+                if chains.use_ids.contains(&evidence_id) {
+                    let detail = format!("execution {evidence_id} is a grant use's ID");
+                    fail(result, s, "duplicate_record", &detail);
+                }
+                chains.other_ids.insert(evidence_id.clone());
+                matchable.insert(evidence_id);
                 stage3.executed.insert(
                     str_field(ev, "evidence_id").unwrap_or_default().to_owned(),
                     Execution {
@@ -2354,6 +2766,12 @@ pub fn verify_evidence_events<'a>(
                     observation_heads.insert(resource, next);
                 } else {
                     result.break_glass += 1;
+                    // v1.6.0 review fixes: nor a use and a break-glass record.
+                    if chains.use_ids.contains(&record_id) {
+                        let detail = format!("break_glass {record_id} is a grant use's ID");
+                        fail(result, s, "duplicate_record", &detail);
+                    }
+                    chains.other_ids.insert(record_id.clone());
                     matchable.insert(record_id);
                 }
             }
@@ -2427,13 +2845,20 @@ pub fn verify_evidence_events<'a>(
                 }
             }
             "quarantine" => {
+                let failed_before = result.failures.len();
                 let signed = signed_now(kind, payload);
                 signature(result, signed, model_of(kind), payload, kind);
+                let authentic = result.failures.len() == failed_before;
                 result.quarantined += 1;
                 if payload_digest(&payload["record"]).ok().as_deref()
                     != str_field(payload, "record_digest")
                 {
                     fail(result, s, "quarantine_digest_mismatch", "");
+                } else if authentic && str_field(payload, "record_kind") == Some("grant_execution")
+                {
+                    // v1.6.0 review fixes: a quarantined use that continues
+                    // its grant's chain is the chain's head.
+                    chains.quarantined(&payload["record"], &grants_held, from_start || pack);
                 }
             }
             "registry" => {
@@ -2511,6 +2936,180 @@ pub fn verify_evidence_events<'a>(
                 signature(result, signed, model_of(kind), payload, kind);
                 result.archives += 1;
             }
+            // v1.6.0: a grant, held for the uses and revocation that name it;
+            // review fixes: only when authentic (one whose signature fails is
+            // not held, so its uses are checked as a missing grant's).
+            "grant" => {
+                let failed_before = result.failures.len();
+                let signed = signed_now(kind, payload);
+                signature(result, signed, model_of(kind), payload, kind);
+                result.grants += 1;
+                if result.failures.len() == failed_before {
+                    let digest = crate::grants::grant_digest(payload).unwrap_or_default();
+                    grants_held.insert(record_id, (payload.clone(), digest));
+                }
+            }
+            "grant_revocation" => {
+                let failed_before = result.failures.len();
+                let signed = signed_now(kind, payload);
+                signature(result, signed, model_of(kind), payload, kind);
+                let authentic = result.failures.len() == failed_before;
+                result.grant_revocations += 1;
+                let grant_id = str_field(payload, "grant_id").unwrap_or_default();
+                match grants_held.get(grant_id) {
+                    // A pack holds (or cites) the grant of every revocation in its range.
+                    None if pack && chained => {
+                        fail(
+                            result,
+                            s,
+                            "cited_record_missing",
+                            &format!("grant {grant_id}"),
+                        );
+                    }
+                    None if chained && options.contiguous && from_start => {
+                        fail(result, s, "grant_missing", grant_id);
+                    }
+                    Some((_, digest))
+                        if str_field(payload, "grant_digest") != Some(digest.as_str()) =>
+                    {
+                        fail(result, s, "grant_mismatch", grant_id);
+                    }
+                    _ => {}
+                }
+                if revoked.contains_key(grant_id) {
+                    fail(result, s, "duplicate_grant_revocation", grant_id);
+                } else if authentic {
+                    let at = micros(str_field(payload, "revoked_at").unwrap_or_default());
+                    revoked.insert(grant_id.to_owned(), at.unwrap_or_default());
+                }
+            }
+            "grant_execution" => {
+                if placed(result, kind, payload) {
+                    let signed = signed_now(kind, payload);
+                    signature(result, signed, model_of(kind), payload, kind);
+                }
+                result.grant_executions += 1;
+                let received = crate::grants::use_digest(payload).unwrap_or_default();
+                let grant_id = str_field(payload, "grant_id").unwrap_or_default();
+                let key_id = payload["signature"]["key_id"].as_str();
+                let signer = key_id.and_then(|id| executor_keys.get(id));
+                // Its place in the chain first: after the head (an admitted
+                // use, or a quarantined one that continued the chain).
+                let expected = chains.head(grant_id, from_start);
+                if chained
+                    && expected.is_some_and(|(at, digest)| {
+                        !continues_chain(payload, (at, digest.as_deref()))
+                    })
+                {
+                    fail(result, s, "grant_use_chain_break", grant_id);
+                }
+                let held = grants_held.get(grant_id);
+                match held {
+                    // A pack holds (or cites) the grant of every use in its range.
+                    None if pack && chained => {
+                        fail(
+                            result,
+                            s,
+                            "cited_record_missing",
+                            &format!("grant {grant_id}"),
+                        );
+                    }
+                    None if chained && options.contiguous && from_start => {
+                        fail(result, s, "grant_missing", grant_id);
+                    }
+                    Some((grant, _))
+                        if key_id.is_none()
+                            || key_id != str_field(grant, "bearer_key_id")
+                            || str_field(payload, "executor_sovereign_id")
+                                != str_field(grant, "bearer_sovereign_id")
+                            || signer.is_some_and(|b| {
+                                str_field(b, "public_key") != str_field(grant, "bearer_public_key")
+                            }) =>
+                    {
+                        fail(result, s, "grant_bearer_mismatch", &record_id);
+                    }
+                    _ => {}
+                }
+                // Review fixes: a bearer key with a resource prefix signs
+                // within it, as for execution evidence.
+                if let Some(prefix) = signer.and_then(|k| str_field(k, "resource_prefix")) {
+                    let within = str_field(payload, "resource_id")
+                        .is_some_and(|resource| resource.starts_with(prefix));
+                    if !within {
+                        let detail =
+                            format!("signing key covers only resources starting with {prefix:?}");
+                        fail(result, s, "grant_use_out_of_scope", &detail);
+                    }
+                }
+                if held.is_some_and(|(_, digest)| {
+                    str_field(payload, "grant_digest") != Some(digest.as_str())
+                }) {
+                    fail(result, s, "grant_mismatch", grant_id);
+                }
+                let sequence = payload["use_sequence"].as_u64().unwrap_or_default();
+                if sequence == 1 {
+                    chains.admitted.entry(grant_id.to_owned()).or_insert(0);
+                }
+                let token = &payload["time_token"];
+                let token_keys = na.at(str_field(token, "issued_at").and_then(|t| micros(t).ok()));
+                if chained {
+                    let token_sequence = token["use_sequence"].as_u64().unwrap_or_default();
+                    let named = chains
+                        .positions
+                        .get(&(grant_id.to_owned(), token_sequence))
+                        .filter(|_| token_sequence != 0)
+                        .and_then(|(digest, at)| {
+                            Some((digest.as_str(), DateTime::from_timestamp_micros(*at)?))
+                        });
+                    let context = UseContext {
+                        grant: held.map(|(grant, _)| grant),
+                        previous: chains.last_admitted.get(grant_id),
+                        admitted: chains.admitted.get(grant_id).copied(),
+                        token_head: named,
+                        token_keys: &token_keys,
+                        revoked_at: revoked
+                            .get(grant_id)
+                            .and_then(|at| DateTime::from_timestamp_micros(*at)),
+                        recorded_at: recorded.and_then(DateTime::from_timestamp_micros),
+                    };
+                    if let Some((reason, detail)) = use_problem(payload, &context) {
+                        fail(result, s, reason, &detail);
+                    }
+                } else if !token_signature_valid(token, &token_keys) {
+                    fail(result, s, "grant_time_token_invalid", &record_id);
+                }
+                chains.admit(grant_id, sequence, &received, payload);
+                if chains.other_ids.contains(&record_id) {
+                    let detail = format!("grant_execution {record_id} is another record's ID");
+                    fail(result, s, "duplicate_record", &detail);
+                }
+                chains.use_ids.insert(record_id.clone());
+                matchable.insert(record_id.clone());
+                let position = entry["resource_sequence"].as_u64();
+                if let Some(resource_id) = str_field(payload, "resource_id") {
+                    let head = resource_heads.get(resource_id);
+                    if chained
+                        && (head.is_some() || from_start)
+                        && position != Some(head.map_or(1, |h| h.resource_sequence + 1))
+                    {
+                        fail(result, s, "resource_chain_break", resource_id);
+                    }
+                    resource_heads.insert(
+                        resource_id.to_owned(),
+                        ResourceHead {
+                            resource_sequence: position.unwrap_or_default(),
+                            record_digest: received,
+                        },
+                    );
+                } else if !entry["resource_sequence"].is_null() {
+                    fail(
+                        result,
+                        s,
+                        "envelope_mismatch",
+                        "grant_execution: resource_sequence",
+                    );
+                }
+            }
             other => fail(result, s, "unknown_entry_kind", other),
         }
     }
@@ -2518,6 +3117,100 @@ pub fn verify_evidence_events<'a>(
         merge_cited(&mut main, &mut cited_result);
     }
     main
+}
+
+/// The use chains of an export's grants (1.6.0; the review fixes).
+#[derive(Default)]
+struct GrantChains {
+    /// Each grant's chain head: its position and digest (an admitted use, or
+    /// a quarantined one that continued the chain).
+    heads: HashMap<String, (u64, String)>,
+    /// Each grant's last admitted use: the order and time rules compare a use
+    /// with it.
+    last_admitted: HashMap<String, PreviousUse>,
+    /// How many uses of each grant were admitted, when the run holds its
+    /// chain from its first use.
+    admitted: HashMap<String, u64>,
+    /// Each chain use's digest and time (microseconds), by grant and
+    /// position: what a time token names.
+    positions: HashMap<(String, u64), (String, i64)>,
+    /// The ids of the uses, and of the execution evidence and break-glass
+    /// records observations also match by id.
+    use_ids: HashSet<String>,
+    other_ids: HashSet<String>,
+}
+
+impl GrantChains {
+    /// The head a use must continue: the chain's, or its start when the run
+    /// holds the store from its start; `None` when it cannot tell.
+    fn head(&self, grant_id: &str, from_start: bool) -> Option<(u64, Option<String>)> {
+        match self.heads.get(grant_id) {
+            Some((at, digest)) => Some((*at, Some(digest.clone()))),
+            None => from_start.then_some((0, None)),
+        }
+    }
+
+    /// An admitted use: the chain's head and its last admitted use.
+    fn admit(&mut self, grant_id: &str, sequence: u64, digest: &str, use_record: &Value) {
+        let previous = next_previous(use_record);
+        let executed = previous.executed_at.timestamp_micros();
+        self.heads
+            .insert(grant_id.to_owned(), (sequence, digest.to_owned()));
+        self.last_admitted.insert(grant_id.to_owned(), previous);
+        if let Some(count) = self.admitted.get_mut(grant_id) {
+            *count += 1;
+        }
+        self.positions.insert(
+            (grant_id.to_owned(), sequence),
+            (digest.to_owned(), executed),
+        );
+    }
+
+    /// A use the NA quarantined (the record an authentic quarantine entry
+    /// holds): the chain's head when it continues the chain, signed by its
+    /// grant's bearer key when the run holds the grant.
+    fn quarantined(
+        &mut self,
+        record: &Value,
+        grants_held: &HashMap<String, (Value, String)>,
+        held_from_start: bool,
+    ) {
+        if !valid_grant_record("GrantExecutionEvidence", record) {
+            return;
+        }
+        let grant_id = str_field(record, "grant_id").unwrap_or_default();
+        if let Some((grant, _)) = grants_held.get(grant_id) {
+            let bearer = str_field(grant, "bearer_public_key").unwrap_or_default();
+            if record["signature"]["key_id"].as_str() != str_field(grant, "bearer_key_id")
+                || !crate::grants::signed_as_received(
+                    "GrantExecutionEvidence",
+                    record,
+                    &[bearer.to_owned()],
+                )
+            {
+                return;
+            }
+        }
+        let sequence = record["use_sequence"].as_u64().unwrap_or_default();
+        let expected = self.head(grant_id, held_from_start || sequence == 1);
+        let Some((at, digest)) = expected else {
+            return;
+        };
+        if !continues_chain(record, (at, digest.as_deref())) {
+            return;
+        }
+        let digest = crate::grants::use_digest(record).unwrap_or_default();
+        let executed = str_field(record, "executed_at")
+            .and_then(|t| micros(t).ok())
+            .unwrap_or_default();
+        self.heads
+            .insert(grant_id.to_owned(), (sequence, digest.clone()));
+        self.positions
+            .insert((grant_id.to_owned(), sequence), (digest, executed));
+        if sequence == 1 {
+            self.admitted.entry(grant_id.to_owned()).or_insert(0);
+        }
+    }
 }
 
 /// What a key succession entry signed by its outgoing key still lacks (1.5.0;
@@ -2608,7 +3301,9 @@ fn signing_key<'a>(
 ) -> Option<&'a Value> {
     let (role, sovereign) = match kind {
         "observation" => ("observer", "observer_sovereign_id"),
-        "execution" | "break_glass" | "remediation" => ("executor", "executor_sovereign_id"),
+        "execution" | "break_glass" | "remediation" | "grant_execution" => {
+            ("executor", "executor_sovereign_id")
+        }
         _ => return None,
     };
     record
@@ -2864,8 +3559,9 @@ impl Stage3 {
 // ── Single records (1.5.0) ────────────────────────────────────────────────────
 
 /// The kinds [`verify_record`] verifies: each entry kind of an evidence
-/// export, and the policies and attestations a decision binds.
-pub const RECORD_KINDS: [&str; 15] = [
+/// export, the policies and attestations a decision binds, and (1.6.0) a
+/// grant's time token.
+pub const RECORD_KINDS: [&str; 19] = [
     "key_succession",
     "archive",
     "decision",
@@ -2881,6 +3577,11 @@ pub const RECORD_KINDS: [&str; 15] = [
     "review",
     "policy",
     "attestation",
+    // v1.6.0
+    "grant",
+    "grant_execution",
+    "grant_revocation",
+    "time_token",
 ];
 
 /// What a single record is verified against.
@@ -2893,7 +3594,8 @@ pub struct VerifyRecordOptions {
     /// Registered keys as `GET /admin/evidence/executor-keys` lists them
     /// (`key_id`, `public_key`, `executor_sovereign_id`, `role`): they sign
     /// execution evidence, break-glass and remediation records (executor
-    /// keys) and observations (observer keys).
+    /// keys; 1.6.0: and grant uses, by the grant's bearer key) and
+    /// observations (observer keys).
     pub executor_keys: Vec<Value>,
     /// Judge a decision's expiry as of this time. `None`, the default: as of
     /// the decision's own time (`decision_made_at`).
@@ -2980,7 +3682,11 @@ fn payload_model(kind: &str) -> Option<&'static str> {
 /// order: `unknown_field`, `payload_invalid`, `invalid_signature`,
 /// `non_canonical_form`, and the checks a record carries in itself
 /// (`quarantine_digest_mismatch`, `retention_count_mismatch` for a first
-/// checkpoint, `review_approval_invalid`, `review_same_holder`). The checks
+/// checkpoint, `review_approval_invalid`, `review_same_holder`; 1.6.0: a
+/// grant use's time token, `grant_time_token_invalid`,
+/// `grant_time_token_mismatch`, `grant_use_before_time_token`). A grant, a
+/// grant revocation and a time token are NA-signed, a grant use by its
+/// grant's bearer key (an executor key). The checks
 /// that need the rest of the store (chains, subjects, matches) are an
 /// export's. A decision is verified by [`verify_boundary_decision`], its
 /// expiry as of its own time unless [`VerifyRecordOptions::at`] says
@@ -3130,6 +3836,21 @@ pub fn verify_record(
                     if review_holder_problem(&ReviewHolders::of(payload)).is_some() {
                         let decider = str_field(payload, "decided_by").unwrap_or_default();
                         out.fail("review_same_holder", decider);
+                    }
+                }
+                // v1.6.0: what a use carries in itself: a time token the NA
+                // signed for its grant, issued before it, not after it was
+                // made. The rest needs its grant and chain (an export's).
+                "grant_execution" => {
+                    let token = &payload["time_token"];
+                    let issued = str_field(token, "issued_at").and_then(|t| micros(t).ok());
+                    let token_keys = na.at(issued);
+                    let context = UseContext {
+                        token_keys: &token_keys,
+                        ..UseContext::default()
+                    };
+                    if let Some((reason, detail)) = use_problem(payload, &context) {
+                        out.fail(reason, &detail);
                     }
                 }
                 _ => {}

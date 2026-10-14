@@ -201,7 +201,9 @@ pub enum GenesisMeshError {
     /// A record of a change made outside the controlled path would be
     /// refused, so it was not signed (v1.3.0). `code` is the one the NA would
     /// return: `observation_malformed`, `observation_secret_material`,
-    /// `break_glass_malformed` or `break_glass_secret_material`.
+    /// `break_glass_malformed` or `break_glass_secret_material`; 1.6.0:
+    /// `grant_use_malformed`, `grant_use_secret_material` or
+    /// `time_token_request_malformed`.
     #[error("record refused: {message} [{code}]")]
     OutOfBandRecord {
         /// Why, as the NA names it.
@@ -215,6 +217,22 @@ pub enum GenesisMeshError {
     /// the record outbox methods and break-glass need one (v1.3.0).
     #[error("no record outbox is configured (ClientOptions::with_record_outbox)")]
     RecordOutboxRequired,
+
+    /// A grant does not cover a request, or cannot be used for it now, and
+    /// nothing ran (1.6.0, [`GrantHolder::act`](crate::GrantHolder::act)).
+    /// `code` is the one the NA would give: `grant_use_out_of_scope`,
+    /// `grant_capability_mismatch`,
+    /// `grant_envelope_mismatch`, `grant_use_outside_validity`, or, without
+    /// a fallback, `grant_revoked`, `grant_expired`,
+    /// `grant_budget_exhausted`, `grant_bearer_key_retired`,
+    /// `grant_time_token_exhausted`.
+    #[error("grant refused: {message} [{code}]")]
+    GrantRefused {
+        /// Why, as the NA names it.
+        code: String,
+        /// What is wrong.
+        message: String,
+    },
 
     /// [`rotate_forward_then_disable`](crate::rotate_forward_then_disable)
     /// rotated the resource forward (its execution evidence is `rotation`),
@@ -274,7 +292,8 @@ impl GenesisMeshError {
             | Self::RateLimit { code, .. }
             | Self::BadRequest { code, .. }
             | Self::Http { code, .. }
-            | Self::OutOfBandRecord { code, .. } => code,
+            | Self::OutOfBandRecord { code, .. }
+            | Self::GrantRefused { code, .. } => code,
             Self::DecisionVerification(reason) => reason,
             Self::StrictJson { reason, .. } => reason,
             Self::SecretMaterial(_) => "evidence_secret_material",

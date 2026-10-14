@@ -122,17 +122,21 @@ pub enum RecordKind {
     BreakGlass,
     /// A `RemediationRecord`, submitted to `/evidence/remediations` (1.4.0).
     Remediation,
+    /// A `GrantExecutionEvidence` (one use of a pre-issued grant), submitted
+    /// to `/evidence/grant-executions` (1.6.0).
+    GrantExecution,
 }
 
 /// One signed observation or break-glass record in the record outbox
-/// (v1.3.0), or remediation record (1.4.0). The TypeScript SDK reads and
-/// writes the same JSON.
+/// (v1.3.0), remediation record (1.4.0) or grant use (1.6.0). The
+/// TypeScript SDK reads and writes the same JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RecordOutboxEntry {
-    /// The record's `observation_id`, `break_glass_id` or `remediation_id`.
+    /// The record's `observation_id`, `break_glass_id`, `remediation_id`
+    /// or (1.6.0) `use_id`.
     pub id: String,
-    /// Observation, break-glass or remediation.
+    /// Observation, break-glass, remediation or grant use.
     pub kind: RecordKind,
     /// The signed record, exactly as it will be submitted.
     pub record: Value,
@@ -150,13 +154,15 @@ pub struct RecordOutboxEntry {
 
 impl RecordOutboxEntry {
     /// A new pending entry for a signed observation (a record with an
-    /// `observation_id`), remediation record (a `remediation_id`, 1.4.0) or
-    /// break-glass record.
+    /// `observation_id`), remediation record (a `remediation_id`, 1.4.0),
+    /// grant use (a `use_id`, 1.6.0) or break-glass record.
     pub fn new(record: Value) -> Self {
         let (kind, key) = if record.get("observation_id").is_some() {
             (RecordKind::Observation, "observation_id")
         } else if record.get("remediation_id").is_some() {
             (RecordKind::Remediation, "remediation_id")
+        } else if record.get("use_id").is_some() {
+            (RecordKind::GrantExecution, "use_id")
         } else {
             (RecordKind::BreakGlass, "break_glass_id")
         };
@@ -360,15 +366,53 @@ pub fn classify_submission_error(err: &GenesisMeshError) -> (SubmissionFailure, 
 /// [`classify_submission_error`] for an observation or break-glass record
 /// (v1.3.0): refused for good only by [`RECORD_PERMANENT_REFUSALS`]; for a
 /// remediation record (1.4.0), by
-/// [`REMEDIATION_PERMANENT_REFUSALS`](crate::REMEDIATION_PERMANENT_REFUSALS).
+/// [`REMEDIATION_PERMANENT_REFUSALS`](crate::REMEDIATION_PERMANENT_REFUSALS);
+/// for a grant use (1.6.0), by [`GRANT_USE_PERMANENT_REFUSALS`].
 pub fn classify_record_submission_error(err: &GenesisMeshError) -> (SubmissionFailure, bool) {
     let refusals: Vec<&str> = RECORD_PERMANENT_REFUSALS
         .iter()
         .chain(crate::remediation::REMEDIATION_PERMANENT_REFUSALS.iter())
+        .chain(GRANT_USE_PERMANENT_REFUSALS.iter())
         .copied()
         .collect();
     classify(err, &refusals)
 }
+
+/// The NA's refusals of a grant use that no retry can overcome (1.6.0): the
+/// use is not one it can read, verify or store, or it is authentic and
+/// refused for good, and the NA keeps it as a quarantine entry
+/// ([`QUARANTINED_USE_CODES`](crate::grants::QUARANTINED_USE_CODES)); a
+/// quarantined use that continues the chain still takes its place in it, so
+/// the uses after it are submitted and judged on their own. Retried:
+/// `grants_disabled` (grants may be turned on), an earlier use not uploaded
+/// yet (`grant_use_chain_gap`), a use dated ahead of the NA's clock
+/// (`grant_use_in_future`), and every transient failure.
+pub const GRANT_USE_PERMANENT_REFUSALS: [&str; 24] = [
+    "invalid_json",
+    "invalid_grant_use",
+    "grant_use_malformed",
+    "grant_not_found",
+    "grant_use_invalid_signature",
+    "grant_use_secret_material",
+    "grant_use_conflict",
+    "grant_use_chain_mismatch",
+    "grant_bearer_mismatch",
+    "grant_bearer_key_retired",
+    "grant_use_out_of_scope",
+    "grant_mismatch",
+    "grant_capability_mismatch",
+    "grant_envelope_mismatch",
+    "grant_budget_exhausted",
+    "grant_time_token_invalid",
+    "grant_time_token_mismatch",
+    "grant_time_token_regressed",
+    "grant_time_token_exhausted",
+    "grant_use_before_time_token",
+    "grant_use_out_of_order",
+    "grant_use_outside_validity",
+    "grant_use_uploaded_late",
+    "grant_revoked",
+];
 
 fn classify(err: &GenesisMeshError, refusals: &[&str]) -> (SubmissionFailure, bool) {
     let status = match err {

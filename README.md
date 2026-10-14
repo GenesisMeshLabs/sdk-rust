@@ -92,6 +92,7 @@ can also be verified locally (see [Governed actions](#governed-actions)).
 | `evidence` | `build` | `verify` |
 | `policy` | `validate`, `publish`, `list`, `active`, `history`, `activate`, `deactivate` | `verify` |
 | `evidence_store` | `search`, `search_all`, `status`, `verify`, `resource_history`, `vendor_history`, `resource_head`, `export_text`, `export`, `export_all`, `list_executor_keys`, `register_executor_key`, `retire_executor_key`, `apply_retention`, `latest_checkpoint`, `judge_observation`, `judge_break_glass`, `resource_changes`, `operator_holders`, `propose_holder`, `approve_holder`, `remediations`, `remediations_all`, `remediation`, `mark_notified`, `request_review`, `review`, `decide_review` | `submit` (executor-signed), `submit_observation`, `submit_observations` (observer-signed), `submit_break_glass`, `submit_remediation` (executor-signed) |
+| `grants` (1.6.0, beta) | `issue`, `list`, `get`, `revoke` | `request_time_token`, `submit_use` (bearer-signed), `revocation_feed` |
 | `health` | | `liveness`, `readiness`, `health` |
 
 `evidence.build(decision)` wraps its argument as `{"decision": decision}`.
@@ -590,6 +591,129 @@ rules are in `remediation` (`remediation_plan`, `decision_plan`,
 `steps_problem`, `review_holder_problem`, `review_request_problem`,
 `rfc3339`, `emergency_map`), checked by the shared conformance suite
 `remediation`.
+
+## Pre-issued grants
+
+*Unreleased.*
+
+A grant (1.6.0) is an authorisation the NA signs in advance, so a device can
+make a known, bounded kind of change while it cannot reach the NA. Where
+break-glass records a change and has it judged afterwards, a grant authorises
+it beforehand: the NA checks, when it issues the grant, that every policy that
+applies allows every request the grant permits. The NA issues grants only with
+`EVIDENCE_GRANTS=on` (every grant route answers `404 grants_disabled`
+otherwise); the routes are beta, the records stable. See the core's
+*Pre-Issued Grants* operations page for the rules in full and the limits of
+offline trust.
+
+### Issuing and revoking
+
+`grants.issue` names one bearer (a registered executor key), the
+capabilities, the basis (`attestation_id` or `agreement`), a validity of at
+most 24 hours, a budget (`max_uses`), the uses one time token may anchor
+(`max_uses_per_time_token`) and a closed `parameter_envelope`: each parameter
+`one_of` a set of scalars, `subset_of` a set of strings, or a
+`number_range` (`integer` or `number`, inclusive or exclusive bounds). The NA
+answers with the signed grant and its first time token, or refuses naming the
+first problem (`grants::ISSUANCE_REFUSALS`, such as `grant_gate_may_deny`
+when a value of the envelope may be denied). `grants.list`, `grants.get` and
+`grants.revoke` read and revoke grants; a use made before a revocation
+stands, one at or after it is refused.
+
+### Acting within a grant
+
+A `GrantHolder` holds one grant for the device whose `ExecutionRecorder`
+signs with the bearer key. `act` checks each use offline, in the NA's order:
+the bearer key's resource prefix (`set_resource_prefix`, when the key was
+registered with one), the capability, the envelope
+(`grants::envelope_problem`: closed, numbers compared exactly, booleans never
+numbers, `true` is not `1`), revocation (the feed the holder last read), the
+validity, the budget, and at most `max_uses_per_time_token` uses after the
+use its latest time token names. It then runs the action, signs a
+`GrantExecutionEvidence` chained to the previous use and citing the time
+token, keeps it in the record outbox and submits it:
+
+```no_run
+use genesis_mesh_sdk::{
+    json, ActionError, ActionReport, GenesisMeshClient, GovernedVerification, GrantActionOutcome,
+    GrantFallback, GrantHolder, GrantRequest,
+};
+
+async fn rotate(gm: &GenesisMeshClient, holder: &mut GrantHolder, na_key: String)
+    -> Result<(), Box<dyn std::error::Error>> {
+    let verify = GovernedVerification { operator_public_keys: vec![na_key], ..Default::default() };
+    let request = GrantRequest::new("secret.manage", json!({"lifetime_days": 30}))
+        .on("kv:site-7/api-key", "rotate")
+        .with_fallback(GrantFallback::new("the credential must rotate now", verify));
+    match holder.act(gm, request, |_authority| async move {
+        Ok::<_, ActionError>(ActionReport::<()> {
+            execution_parameters: Some(json!({"version_id": "v9"})),
+            ..ActionReport::default()
+        })
+    }).await? {
+        GrantActionOutcome::Used(used) => eprintln!("use {}", used.record["use_sequence"]),
+        GrantActionOutcome::FellBack { unusable, .. } => eprintln!("fell back: {}", unusable.code),
+    }
+    // Persist the holder after every use: `holder.state()`, `GrantHolder::restore`.
+    Ok(())
+}
+```
+
+A request the grant does not cover (`grant_use_out_of_scope`,
+`grant_capability_mismatch`, `grant_envelope_mismatch`), a grant not valid
+yet, and secret material in the parameters are refused before anything runs (`GrantRefused`,
+`OutOfBandRecord` with `grant_use_secret_material`). A use is dated no
+earlier than its time token and the previous use. Metadata the secret guard
+refuses after the action ran is left out of the use and named in `dropped`;
+a failed action is recorded as a use with outcome `failure` (`ActionFailed`).
+`ExecutionRecorder::sign_grant_use` and `sign_time_token_request` sign the
+records directly. Keep `GrantHolder::state` durably: a holder that forgets its
+uses signs a second use at a position it already used, which the NA refuses.
+
+### Uploading, and the fallback
+
+On reconnecting, `holder.sync` reads and verifies the revocation feed
+(`revoked_grant_ids`), uploads the record outbox (the grant's uses one at a
+time in their chain's order, before observations; the NA gives each use the
+next position of its resource's chain) and asks for a new time token naming
+the head of the holder's chain. A use the NA refuses for good is a dead letter
+(`GRANT_USE_PERMANENT_REFUSALS`); the NA keeps it as a quarantine entry, and
+when it continues the chain it still takes its place in it, so the holder's
+later uses are submitted and judged on their own. An earlier use not uploaded
+yet (`grant_use_chain_gap`) and a use dated ahead of the NA's clock
+(`grant_use_in_future`) are retried. Execution evidence made online
+afterwards links to the last use, which the NA's resource head names
+(`resource_head_entry`). `grants.uses` lists a grant's use chain, each use
+admitted or quarantined, and `grants.get` its `chain_length`.
+
+When the grant has ended, its budget or its time token is spent (and no new
+one came), it is revoked or its bearer key is retired, `act` falls back with
+the request's `GrantFallback` to `governed_action_with_break_glass` with the
+grant's capability: the NA's decision when it answers (a DENY does not run
+the action), break-glass when it does not, so an urgent change is recorded
+and judged, never blocked. Pending uses are uploaded first. Without a
+fallback the request is refused (`GrantRefused` with the reason). A grant on
+an agreement needs `GrantFallback::evaluate`.
+
+### Verifying grants
+
+`verify_evidence_events`, `verify_record` and `verify_audit_pack` check the
+three new entry kinds (`grant`, `grant_execution`, `grant_revocation`) and a
+time token: each record's signature (a use by its grant's bearer key, its
+time token by the NA), the store's grant rules (`grant_use_chain_break`, a
+quarantined use that continues the chain being its head; `grant_missing`,
+also for a grant whose signature fails; `grant_bearer_mismatch`,
+`grant_use_out_of_scope`, `grant_mismatch`, `duplicate_grant_revocation`,
+`duplicate_record` for a `use_id` another record holds; in a pack a missing
+grant is `cited_record_missing`), then the use rules with the NA's codes
+(`grants::use_problem`), the resource position the NA assigned
+(`resource_chain_break`, `envelope_mismatch`), a judgement `governed_by:
+grant`, a quarantined use, and the revocation feed's `revoked_grant_ids`
+(`verify::verify_revocation_feed`). An audit pack checks a grant's basis (its
+attestation, or the agreement in `trust/agreements.jsonl`), and its report
+gains *Grants* and *Grant revocations* sections when it holds them. Turn grants on only once
+every verifier that reads your exports, packs and feed runs 1.6: a 1.5
+verifier refuses the new kinds and the feed's field.
 
 ## Independent verification
 

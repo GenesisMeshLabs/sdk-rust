@@ -34,6 +34,9 @@ sdk-rust/
     execution.rs   # ExecutionRecorder, secret-material guard
     out_of_band.rs # ObservationRecorder, break-glass records (1.3.0)
     remediation.rs # remediation records, review checks, plans and the state table (1.4.0, pure)
+    grants.rs      # pre-issued grants: envelopes, number rules, use rules, signing (1.6.0, pure)
+    grant_client.rs # GrantClient: grant routes, time tokens, uses, the revocation feed (1.6.0)
+    grant_holder.rs # GrantHolder: acts within a grant offline, uploads, falls back (1.6.0)
     outbox.rs      # evidence and record outboxes
     governance.rs  # governed_action, governed_action_with_break_glass, rotate_forward_then_disable, summarize_decision
     lib.rs         # public exports

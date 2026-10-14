@@ -175,11 +175,13 @@ fn refusal(state: &str, event: &str) -> &'static str {
     }
 }
 
-/// A judged change's Stage 2 state, where it enters the state table.
+/// A judged change's Stage 2 state, where it enters the state table. 1.6.0:
+/// a change matched to a grant use (`governed_by: grant`) is governed
+/// (`matched`), as one matched to execution evidence is.
 pub fn judgement_state(verdict: &str, governed_by: &str) -> &'static str {
     match (governed_by, verdict) {
-        ("prior_decision", "deny") => "judged_denied",
-        ("prior_decision", _) => "matched",
+        ("prior_decision" | "grant", "deny") => "judged_denied",
+        ("prior_decision" | "grant", _) => "matched",
         (_, "allow") => "judged_allowed",
         (_, "deny") => "judged_denied",
         _ => "indeterminate",

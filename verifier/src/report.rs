@@ -209,6 +209,10 @@ pub fn export(result: &EvidenceVerification, anchors: Option<&AnchorCoverage>) -
         ("Quarantined", result.quarantined),
         ("Remediations", result.remediations),
         ("Reviews", result.reviews),
+        // 1.6.0: grants, their uses and revocations.
+        ("Grants", result.grants),
+        ("Grant uses", result.grant_executions),
+        ("Revocations", result.grant_revocations),
     ] {
         if count > 0 {
             let _ = writeln!(out, "{label:<11}: {count}");

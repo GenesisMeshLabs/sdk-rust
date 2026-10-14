@@ -769,3 +769,88 @@ fn a_supplied_key_is_not_placed() {
         r.stdout
     );
 }
+
+/// A vector of the grants suite (1.6.0).
+fn grant_vector(id: &str) -> Value {
+    fixture("grants")["vectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == id)
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn grant_records_verify_under_the_keys_their_kind_needs() {
+    let scratch = Scratch::new("grant-records");
+    let na = grant_vector("signature-CapabilityGrant-signer")["public_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let grant = scratch.json(
+        "grant.json",
+        &grant_vector("canonical-CapabilityGrant")["record"],
+    );
+    let ok = run(&["record", "grant", &grant, "--na-key", &na, "--json"]);
+    assert_eq!(ok.code, 0, "{}", ok.stdout);
+    assert_eq!(ok.json()["kind"], "grant");
+    let token = scratch.json("token.json", &grant_vector("canonical-TimeToken")["record"]);
+    assert_eq!(
+        run(&["record", "time-token", &token, "--na-key", &na]).code,
+        0
+    );
+    // A use: its bearer key (an executor key), and its time token by the NA.
+    let signer = grant_vector("signature-GrantExecutionEvidence-signer");
+    let keys = scratch.json(
+        "keys.json",
+        &json!([{
+            "key_id": "executor-b", "public_key": signer["public_key"],
+            "executor_sovereign_id": signer["record"]["executor_sovereign_id"], "role": "executor",
+        }]),
+    );
+    let used = scratch.json("use.json", &signer["record"]);
+    let both = run(&[
+        "record",
+        "grant-execution",
+        &used,
+        "--executor-keys",
+        &keys,
+        "--na-key",
+        &na,
+    ]);
+    assert_eq!(both.code, 0, "{}", both.stdout);
+    let no_na = run(&[
+        "record",
+        "grant-execution",
+        &used,
+        "--executor-keys",
+        &keys,
+        "--json",
+    ]);
+    assert_eq!(no_na.code, 1);
+    assert_eq!(no_na.json()["reason"], "grant_time_token_invalid");
+}
+
+#[test]
+fn an_export_of_grants_counts_them_and_fails_a_missing_grant_by_name() {
+    let scratch = Scratch::new("grant-export");
+    let valid = grant_vector("export-valid")["input"].clone();
+    let keys = scratch.json("keys.json", &valid["executor_keys"]);
+    let na = valid["na_public_keys"][0].as_str().unwrap().to_owned();
+    let export = scratch.file("export.jsonl", valid["lines"].as_str().unwrap());
+    let ok = run(&["export", &export, "--na-key", &na, "--executor-keys", &keys]);
+    assert_eq!(ok.code, 0, "{}", ok.stdout);
+    assert!(ok.stdout.contains("Grants     : 1"), "{}", ok.stdout);
+    assert!(ok.stdout.contains("Grant uses : 2"), "{}", ok.stdout);
+    assert!(ok.stdout.contains("Revocations: 1"), "{}", ok.stdout);
+    let missing = grant_vector("export-grant-missing")["input"]["lines"].clone();
+    let export = scratch.file("missing.jsonl", missing.as_str().unwrap());
+    let refused = run(&["export", &export, "--na-key", &na, "--executor-keys", &keys]);
+    assert_eq!(refused.code, 1);
+    assert!(
+        refused.stdout.contains("grant_missing"),
+        "{}",
+        refused.stdout
+    );
+}

@@ -300,6 +300,61 @@ impl ExecutionRecorder {
         )
     }
 
+    /// The raw base64 public key of this executor's signing key: a grant's
+    /// `bearer_public_key` when it is the grant's bearer (1.6.0).
+    pub fn public_key(&self) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(self.signing_key.verifying_key().to_bytes())
+    }
+
+    /// Build and sign one use of a grant with this executor's key, the
+    /// grant's bearer key (1.6.0): a `GrantExecutionEvidence` in the grant's
+    /// use chain, citing the time token. A [`GrantHolder`](crate::GrantHolder)
+    /// calls it after checking the use against the grant offline. Refused
+    /// before signing ([`GenesisMeshError::OutOfBandRecord`]) as the NA would
+    /// refuse it: `grant_use_malformed` for a field of the wrong length, a
+    /// resource without its action, an outcome other than `success`,
+    /// `failure` or `partial`, a chain position without its link, or a time
+    /// outside the years 1 to 9999; `grant_use_secret_material` for secret
+    /// material in its parameters or outcome detail, or those over
+    /// [`MAX_METADATA_BYTES`] as the NA counts them (never stored by the NA).
+    /// Values nested too deep for every reader are refused as
+    /// [`GenesisMeshError::StrictJson`] (`invalid_json`).
+    pub fn sign_grant_use(&self, input: crate::grants::GrantUseInput) -> Result<Value> {
+        crate::grants::sign_grant_use(
+            &self.executor_sovereign_id,
+            &self.key_id,
+            &self.signing_key,
+            input,
+        )
+    }
+
+    /// Build and sign a `TimeTokenRequest` (1.6.0, beta) with this
+    /// executor's key, the grant's bearer key: the head of its use chain
+    /// (`use_sequence` uses made, `use_head_digest` the last one's digest,
+    /// absent before the first) at `requested_at` (default now; the NA
+    /// refuses one more than 300 s from its clock). Submit it with
+    /// [`GrantClient::request_time_token`](crate::GrantClient::request_time_token).
+    /// Refused as `time_token_request_malformed`
+    /// ([`GenesisMeshError::OutOfBandRecord`]) when the head is inconsistent.
+    pub fn sign_time_token_request(
+        &self,
+        grant_id: &str,
+        use_sequence: u64,
+        use_head_digest: Option<&str>,
+        requested_at: Option<DateTime<Utc>>,
+    ) -> Result<Value> {
+        crate::grants::sign_time_token_request(
+            &self.key_id,
+            &self.signing_key,
+            grant_id,
+            use_sequence,
+            use_head_digest,
+            requested_at.unwrap_or_else(Utc::now),
+        )
+    }
+
     /// Build and sign one ExecutionEvidence record. Refused before signing:
     /// a `resource_id` without a `resource_action` or the other way round,
     /// a `resource_id` that is not 1 to 256 characters, an action other than
