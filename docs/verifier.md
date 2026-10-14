@@ -360,7 +360,9 @@ outside the NA: the anchors' signatures, chain and positions
    grant's policy binding and its basis, an attestation as a decision's, or
    an agreement in the optional `trust/agreements.jsonl`, the one the grant
    names, between its parties and signed by both with keys the pack vouches
-   for: `cited_agreement_missing`, `cited_agreement_mismatch`,
+   for (one the NA offered and accepted itself, signed by the NA alone,
+   only while the pack carries the responder's treaty):
+   `cited_agreement_missing`, `cited_agreement_mismatch`,
    `agreement_invalid_signature`);
 6. the report (`report_mismatch`; 1.6.0: with *Grants* and *Grant
    revocations* sections when the pack holds them, a grant use listed as a

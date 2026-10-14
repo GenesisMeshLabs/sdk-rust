@@ -1508,8 +1508,9 @@ fn check_cited_trust(
 /// when its two parties did not sign it, as received, with keys the pack
 /// vouches for (the NA's key valid at `agreed_terms.valid_from` for its own
 /// sovereign, a treaty's subject keys for another; an agreement the NA
-/// offered and accepted itself carries the NA's signature for both), or it
-/// is not in the form the reference writes.
+/// offered and accepted itself carries the NA's signature for both, which
+/// holds only while the pack carries a treaty for the responder), or it is
+/// not in the form the reference writes.
 fn agreement_problem(
     grant: &Value,
     agreement: Option<&Value>,
@@ -1561,7 +1562,11 @@ fn agreement_problem(
     let offerer = field(agreement, "offerer_sovereign_id").unwrap_or_default();
     let responder = field(agreement, "responder_sovereign_id").unwrap_or_default();
     let mut pairs = vec![(party_keys(offerer), party_keys(responder))];
-    if offerer == own {
+    // The NA-offered-and-accepted exception holds, as on the NA's routes,
+    // only while the responder holds a treaty from this NA (one the pack
+    // carries).
+    let responder_trusted = treaty_keys.get(responder).is_some_and(|k| !k.is_empty());
+    if offerer == own && responder_trusted {
         pairs.push((na_keys.clone(), na_keys.clone()));
     }
     let well_formed = unknown_fields("AgreementRecord", agreement).is_empty()
@@ -2767,8 +2772,15 @@ mod tests {
             as_responder(&agreement(&[4, 2])),
             Some("agreement_invalid_signature")
         );
-        // An agreement the NA offered and accepted itself.
+        // An agreement the NA offered and accepted itself, signed by the NA
+        // alone: it holds while the pack carries the responder's treaty, and
+        // not without it.
         let own = agreement(&[1]);
         assert_eq!(problem(Some(&own), &grant_on(&own)), None);
+        let no_treaty = HashMap::new();
+        assert_eq!(
+            agreement_problem(&grant_on(&own), Some(&own), "sovereign-a", &na, &no_treaty),
+            Some("agreement_invalid_signature")
+        );
     }
 }
