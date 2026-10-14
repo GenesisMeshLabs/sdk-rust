@@ -12,11 +12,13 @@ use std::{
 
 use chrono::Utc;
 use genesis_mesh_sdk::{
-    EvidenceOutbox, OutboxEntry, OutboxFuture, OutboxState, RecordKind, RecordOutbox,
-    RecordOutboxEntry,
+    EvidenceOutbox, OutboxEntry, OutboxFuture, RecordKind, RecordOutbox, RecordOutboxEntry,
 };
-use rusqlite::{params, Connection, OptionalExtension as _};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension as _};
 use serde_json::Value;
+
+/// The schema this agent writes.
+pub const SCHEMA_VERSION: u32 = 1;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS evidence_outbox (
@@ -31,6 +33,30 @@ CREATE TABLE IF NOT EXISTS authorizations (
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
+/// Why the database cannot be used.
+#[derive(Debug)]
+pub enum DbError {
+    /// A newer agent wrote it (exit 2).
+    Newer(String),
+    /// Reading or writing failed (exit 1).
+    Io(io::Error),
+}
+
+impl std::fmt::Display for DbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Newer(m) => f.write_str(m),
+            Self::Io(e) => e.fmt(f),
+        }
+    }
+}
+
+impl From<io::Error> for DbError {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
 /// The database, shared by the outboxes and the agent.
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -42,8 +68,9 @@ fn sql(err: rusqlite::Error) -> io::Error {
 }
 
 impl Db {
-    /// Open (or create, 0600) the database at `path`.
-    pub fn open(path: &Path) -> io::Result<Self> {
+    /// Open (or create, 0600) the database at `path`. Refuses one a newer
+    /// agent wrote.
+    pub fn open(path: &Path) -> Result<Self, DbError> {
         if !path.exists() {
             OpenOptions::new()
                 .write(true)
@@ -64,16 +91,40 @@ impl Db {
         connection.execute_batch(SCHEMA).map_err(sql)?;
         connection
             .execute(
-                "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')",
-                [],
+                "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
+                [SCHEMA_VERSION.to_string()],
             )
             .map_err(sql)?;
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(sql)?;
+        if version.parse::<u32>().map_or(true, |v| v > SCHEMA_VERSION) {
+            return Err(DbError::Newer(format!(
+                "agent.db has schema version {version}, written by a newer agent (this one reads {SCHEMA_VERSION}): run that agent, or reset"
+            )));
+        }
         // SQLite creates its WAL and shared-memory files with the umask's mode.
         for suffix in ["-wal", "-shm"] {
             let mut name = path.as_os_str().to_owned();
             name.push(suffix);
             let _ = std::fs::set_permissions(&name, std::fs::Permissions::from_mode(0o600));
         }
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+        })
+    }
+
+    /// Open the database read-only (`status`, `outbox export`).
+    pub fn open_read_only(path: &Path) -> io::Result<Self> {
+        let connection =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(sql)?;
+        connection
+            .execute_batch("PRAGMA busy_timeout=5000;")
+            .map_err(sql)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -204,10 +255,33 @@ impl Db {
         .map(|n| n as u64)
     }
 
-    fn list<T: serde::de::DeserializeOwned>(&self, table: &str) -> io::Result<Vec<T>> {
+    /// Forget authorizations older than 7 days.
+    pub fn prune_authorizations(&self) -> io::Result<usize> {
+        let before = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM authorizations WHERE created_at < ?1 AND state != 'open'",
+                [before],
+            )
+        })
+    }
+
+    /// The entries of an outbox, in the order added: the pending ones only
+    /// and at most `window` of them when given (an upload's page).
+    fn list<T: serde::de::DeserializeOwned>(
+        &self,
+        table: &str,
+        window: Option<usize>,
+    ) -> io::Result<Vec<T>> {
+        let query = match window {
+            Some(n) => format!(
+                "SELECT entry_json FROM {table}
+                 WHERE json_extract(entry_json, '$.state') = 'pending' ORDER BY seq LIMIT {n}"
+            ),
+            None => format!("SELECT entry_json FROM {table} ORDER BY seq"),
+        };
         let texts: Vec<String> = self.with(|c| {
-            let mut statement =
-                c.prepare(&format!("SELECT entry_json FROM {table} ORDER BY seq"))?;
+            let mut statement = c.prepare(&query)?;
             let rows = statement
                 .query_map([], |r| r.get(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -259,20 +333,58 @@ impl Db {
         })
     }
 
-    /// Pending entries and dead letters across both outboxes.
+    /// Pending entries and dead letters across both outboxes, counted in
+    /// SQLite (a backlog is never loaded to count it).
     pub fn outbox_counts(&self) -> io::Result<(u64, u64)> {
-        let evidence: Vec<OutboxEntry> = self.list("evidence_outbox")?;
-        let records: Vec<RecordOutboxEntry> = self.list("record_outbox")?;
-        let dead = evidence
-            .iter()
-            .filter(|e| e.state == OutboxState::DeadLetter)
-            .count()
-            + records
-                .iter()
-                .filter(|e| e.state == OutboxState::DeadLetter)
-                .count();
-        let pending = evidence.len() + records.len() - dead;
-        Ok((pending as u64, dead as u64))
+        self.with(|c| {
+            let mut pending = 0_i64;
+            let mut dead = 0_i64;
+            for table in ["evidence_outbox", "record_outbox"] {
+                let (p, d): (i64, i64) = c.query_row(
+                    &format!(
+                        "SELECT
+                           COALESCE(SUM(json_extract(entry_json, '$.state') = 'pending'), 0),
+                           COALESCE(SUM(json_extract(entry_json, '$.state') = 'dead_letter'), 0)
+                         FROM {table}"
+                    ),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                pending += p;
+                dead += d;
+            }
+            Ok((pending as u64, dead as u64))
+        })
+    }
+
+    /// Every entry of both outboxes, as JSON lines (`outbox export`): each
+    /// with its `outbox` (`evidence` or `record`); dead letters only when
+    /// asked. Read-only.
+    pub fn export(&self, dead_letters_only: bool, out: &mut dyn io::Write) -> io::Result<u64> {
+        let mut count = 0;
+        for (table, name) in [("evidence_outbox", "evidence"), ("record_outbox", "record")] {
+            let filter = if dead_letters_only {
+                "WHERE json_extract(entry_json, '$.state') = 'dead_letter'"
+            } else {
+                ""
+            };
+            let rows: Vec<String> = self.with(|c| {
+                let mut statement = c.prepare(&format!(
+                    "SELECT entry_json FROM {table} {filter} ORDER BY seq"
+                ))?;
+                let rows = statement
+                    .query_map([], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })?;
+            for row in rows {
+                let mut entry: Value = serde_json::from_str(&row).map_err(io::Error::other)?;
+                entry["outbox"] = Value::from(name);
+                writeln!(out, "{entry}")?;
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// The newest use of each grant this agent has made that the NA
@@ -284,13 +396,17 @@ impl Db {
             .into_iter()
             .filter_map(|(_, v)| serde_json::from_str(&v).ok())
             .collect();
-        let records: Vec<RecordOutboxEntry> = self.list("record_outbox")?;
-        uses.extend(
-            records
-                .into_iter()
-                .filter(|e| e.kind == RecordKind::GrantExecution)
-                .map(|e| e.record),
-        );
+        let records: Vec<String> = self.with(|c| {
+            let mut statement = c.prepare(
+                "SELECT json_extract(entry_json, '$.record') FROM record_outbox
+                 WHERE json_extract(entry_json, '$.kind') = 'grant_execution' ORDER BY seq",
+            )?;
+            let rows = statement
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?;
+        uses.extend(records.iter().filter_map(|r| serde_json::from_str(r).ok()));
         Ok(uses)
     }
 }
@@ -298,13 +414,50 @@ impl Db {
 /// The meta key prefix of each grant's newest admitted use.
 const ADMITTED_USE: &str = "admitted_use:";
 
-/// The SDK's evidence outbox over `evidence_outbox`.
+/// The SDK's evidence outbox over `evidence_outbox`; windowed, it lists only
+/// the oldest pending entries (an upload's page).
 #[derive(Debug, Clone)]
-pub struct SqliteOutbox(pub Db);
+pub struct SqliteOutbox {
+    db: Db,
+    window: Option<usize>,
+}
 
-/// The SDK's record outbox over `record_outbox`.
+/// The SDK's record outbox over `record_outbox`, windowed the same way.
 #[derive(Debug, Clone)]
-pub struct SqliteRecordOutbox(pub Db);
+pub struct SqliteRecordOutbox {
+    db: Db,
+    window: Option<usize>,
+}
+
+impl SqliteOutbox {
+    /// The whole outbox.
+    pub fn new(db: Db) -> Self {
+        Self { db, window: None }
+    }
+
+    /// The oldest `window` pending entries.
+    pub fn windowed(db: Db, window: usize) -> Self {
+        Self {
+            db,
+            window: Some(window),
+        }
+    }
+}
+
+impl SqliteRecordOutbox {
+    /// The whole outbox.
+    pub fn new(db: Db) -> Self {
+        Self { db, window: None }
+    }
+
+    /// The oldest `window` pending entries.
+    pub fn windowed(db: Db, window: usize) -> Self {
+        Self {
+            db,
+            window: Some(window),
+        }
+    }
+}
 
 fn text<T: serde::Serialize>(entry: &T) -> io::Result<String> {
     serde_json::to_string(entry).map_err(io::Error::other)
@@ -312,34 +465,34 @@ fn text<T: serde::Serialize>(entry: &T) -> io::Result<String> {
 
 impl EvidenceOutbox for SqliteOutbox {
     fn add<'a>(&'a self, entry: &'a OutboxEntry) -> OutboxFuture<'a, ()> {
-        Box::pin(async move { self.0.add("evidence_outbox", &entry.id, text(entry)?) })
+        Box::pin(async move { self.db.add("evidence_outbox", &entry.id, text(entry)?) })
     }
 
     fn update<'a>(&'a self, entry: &'a OutboxEntry) -> OutboxFuture<'a, ()> {
-        Box::pin(async move { self.0.update("evidence_outbox", &entry.id, text(entry)?) })
+        Box::pin(async move { self.db.update("evidence_outbox", &entry.id, text(entry)?) })
     }
 
     fn remove<'a>(&'a self, id: &'a str) -> OutboxFuture<'a, ()> {
-        Box::pin(async move { self.0.remove("evidence_outbox", id).map(drop) })
+        Box::pin(async move { self.db.remove("evidence_outbox", id).map(drop) })
     }
 
     fn list(&self) -> OutboxFuture<'_, Vec<OutboxEntry>> {
-        Box::pin(async move { self.0.list("evidence_outbox") })
+        Box::pin(async move { self.db.list("evidence_outbox", self.window) })
     }
 }
 
 impl RecordOutbox for SqliteRecordOutbox {
     fn add<'a>(&'a self, entry: &'a RecordOutboxEntry) -> OutboxFuture<'a, ()> {
-        Box::pin(async move { self.0.add("record_outbox", &entry.id, text(entry)?) })
+        Box::pin(async move { self.db.add("record_outbox", &entry.id, text(entry)?) })
     }
 
     fn update<'a>(&'a self, entry: &'a RecordOutboxEntry) -> OutboxFuture<'a, ()> {
-        Box::pin(async move { self.0.update("record_outbox", &entry.id, text(entry)?) })
+        Box::pin(async move { self.db.update("record_outbox", &entry.id, text(entry)?) })
     }
 
     fn remove<'a>(&'a self, id: &'a str) -> OutboxFuture<'a, ()> {
         Box::pin(async move {
-            let Some(removed) = self.0.remove("record_outbox", id)? else {
+            let Some(removed) = self.db.remove("record_outbox", id)? else {
                 return Ok(());
             };
             // A grant use the NA admitted stays known as its chain's newest,
@@ -349,7 +502,7 @@ impl RecordOutbox for SqliteRecordOutbox {
             if entry.kind == RecordKind::GrantExecution {
                 let grant = entry.record["grant_id"].as_str().unwrap_or_default();
                 let key = format!("{ADMITTED_USE}{grant}");
-                let newer = match self.0.meta(&key)? {
+                let newer = match self.db.meta(&key)? {
                     Some(held) => serde_json::from_str::<Value>(&held)
                         .ok()
                         .and_then(|h| h["use_sequence"].as_u64())
@@ -357,7 +510,7 @@ impl RecordOutbox for SqliteRecordOutbox {
                     None => true,
                 };
                 if newer {
-                    self.0.set_meta(&key, &entry.record.to_string())?;
+                    self.db.set_meta(&key, &entry.record.to_string())?;
                 }
             }
             Ok(())
@@ -365,13 +518,14 @@ impl RecordOutbox for SqliteRecordOutbox {
     }
 
     fn list(&self) -> OutboxFuture<'_, Vec<RecordOutboxEntry>> {
-        Box::pin(async move { self.0.list("record_outbox") })
+        Box::pin(async move { self.db.list("record_outbox", self.window) })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use genesis_mesh_sdk::OutboxState;
     use serde_json::json;
 
     fn temporary() -> std::path::PathBuf {
@@ -387,7 +541,7 @@ mod tests {
     async fn the_outboxes_list_in_the_order_added_and_keep_admitted_uses() {
         let dir = temporary();
         let db = Db::open(&dir.join(DB_NAME)).unwrap();
-        let records = SqliteRecordOutbox(db.clone());
+        let records = SqliteRecordOutbox::new(db.clone());
         let first =
             RecordOutboxEntry::new(json!({"use_id": "u1", "grant_id": "g", "use_sequence": 1}));
         let second =
@@ -403,6 +557,7 @@ mod tests {
             .map(|e| e.id)
             .collect();
         assert_eq!(ids, ["u2", "u1"]);
+        assert_eq!(db.grant_uses().unwrap().len(), 2);
         records.remove("u2").await.unwrap();
         records.remove("u1").await.unwrap();
         assert!(records.list().await.unwrap().is_empty());
@@ -418,6 +573,43 @@ mod tests {
                 & 0o777,
             0o600
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn counts_in_sqlite_pages_pending_entries_and_exports() {
+        let dir = temporary();
+        let db = Db::open(&dir.join(DB_NAME)).unwrap();
+        let records = SqliteRecordOutbox::new(db.clone());
+        for n in 0..5 {
+            let mut entry = RecordOutboxEntry::new(json!({"break_glass_id": format!("b{n}")}));
+            if n == 0 {
+                entry.state = OutboxState::DeadLetter;
+            }
+            records.add(&entry).await.unwrap();
+        }
+        assert_eq!(db.outbox_counts().unwrap(), (4, 1));
+        let page: Vec<String> = SqliteRecordOutbox::windowed(db.clone(), 2)
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(page, ["b1", "b2"]);
+        let mut out = Vec::new();
+        assert_eq!(db.export(true, &mut out).unwrap(), 1);
+        let line: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(line["id"], "b0");
+        assert_eq!(line["outbox"], "record");
+        // A newer schema is refused.
+        db.set_meta("schema_version", "2").unwrap();
+        drop(records);
+        drop(db);
+        assert!(matches!(
+            Db::open(&dir.join(DB_NAME)),
+            Err(DbError::Newer(_))
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

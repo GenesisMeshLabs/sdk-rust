@@ -22,12 +22,17 @@ pub const ENROLLMENT: &str = "enrollment.json";
 pub const SNAPSHOT: &str = "snapshot.json";
 /// The agent's database.
 pub const DATABASE: &str = "agent.db";
+/// The lock `run` (and every command that changes the state) holds.
+pub const LOCK: &str = "agent.lock";
 
 /// Why the state directory cannot be used.
 #[derive(Debug)]
 pub enum StateError {
-    /// A key file is group- or world-accessible (exit 6).
+    /// A key file is group- or world-accessible, or the directory is
+    /// group- or world-writable (exit 6).
     Insecure(String),
+    /// Another process holds the state directory (exit 2).
+    Busy(String),
     /// Reading or writing failed (exit 1).
     Io(String),
 }
@@ -35,7 +40,7 @@ pub enum StateError {
 impl std::fmt::Display for StateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Insecure(m) | Self::Io(m) => f.write_str(m),
+            Self::Insecure(m) | Self::Busy(m) | Self::Io(m) => f.write_str(m),
         }
     }
 }
@@ -73,8 +78,18 @@ impl StateDir {
         self.root.join(name)
     }
 
-    /// Exit 6 when a key file is group- or world-accessible.
+    /// Exit 6 when the directory is group- or world-writable, or a key file
+    /// is group- or world-accessible.
     pub fn check_permissions(&self) -> Result<(), StateError> {
+        let meta = fs::metadata(&self.root)
+            .map_err(|e| io_error("cannot read the state directory", &self.root, e))?;
+        if meta.permissions().mode() & 0o022 != 0 {
+            return Err(StateError::Insecure(format!(
+                "the state directory {} is writable by other users (mode {:04o}); it must be 0700",
+                self.root.display(),
+                meta.permissions().mode() & 0o777
+            )));
+        }
         for name in [NODE_KEY, EXECUTOR_KEY] {
             let path = self.path(name);
             match fs::metadata(&path) {
@@ -178,7 +193,29 @@ impl StateDir {
         }
     }
 
-    /// Delete the keys and every state file (`enroll --reset`).
+    /// Take the state directory's lock, held until the returned file is
+    /// dropped: one process changes the state at a time (`run`, `enroll`,
+    /// `reset`, `init`).
+    pub fn lock(&self) -> Result<fs::File, StateError> {
+        let path = self.path(LOCK);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| io_error("cannot open", &path, e))?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(fs::TryLockError::WouldBlock) => Err(StateError::Busy(format!(
+                "another genesis-mesh-edge process holds {} (is the agent running? stop it first)",
+                path.display()
+            ))),
+            Err(fs::TryLockError::Error(e)) => Err(io_error("cannot lock", &path, e)),
+        }
+    }
+
+    /// Delete the keys and every state file (`reset`).
     pub fn reset(&self) -> Result<(), StateError> {
         for name in [
             NODE_KEY,
@@ -246,6 +283,24 @@ mod tests {
             StateDir::open(&root),
             Err(StateError::Insecure(_))
         ));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_writable_directory_is_refused_and_one_process_holds_the_lock() {
+        let root = temporary();
+        let dir = StateDir::open(&root).unwrap();
+        let held = dir.lock().unwrap();
+        assert!(matches!(dir.lock(), Err(StateError::Busy(_))));
+        drop(held);
+        dir.lock().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(matches!(
+            StateDir::open(&root),
+            Err(StateError::Insecure(_))
+        ));
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).unwrap();
+        StateDir::open(&root).unwrap();
         fs::remove_dir_all(&root).unwrap();
     }
 

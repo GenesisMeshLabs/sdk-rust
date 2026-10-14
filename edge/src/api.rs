@@ -2,7 +2,7 @@
 //! socket (authenticated by the peer's credentials) or a loopback port
 //! (authenticated by a bearer token).
 
-use std::{convert::Infallible, path::Path, sync::Arc};
+use std::{convert::Infallible, path::Path, sync::Arc, time::Duration};
 
 use genesis_mesh_sdk::{json, parse_strict_json, Value};
 use http_body_util::{BodyExt as _, Full, Limited};
@@ -12,12 +12,12 @@ use hyper::{
     service::service_fn,
     Method, Request, Response, StatusCode,
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::AsyncWriteExt as _,
     net::{TcpListener, UnixListener},
-    sync::watch,
+    sync::{watch, OwnedSemaphorePermit, Semaphore},
 };
 
 use crate::{
@@ -223,22 +223,19 @@ async fn route(
                 ));
             }
             let body = body_of(request).await?;
-            agent.authorize(authorize_request(&body)?).await
+            agent.authorize(authorize_request(&body)?, client).await
         }
-        (Method::POST, _)
-            if path.starts_with("/v1/authorizations/") && path.ends_with("/outcome") =>
-        {
-            let id = &path["/v1/authorizations/".len()..path.len() - "/outcome".len()];
-            if id.is_empty() || id.contains('/') {
-                return Err(ApiError::new(
-                    404,
-                    "authorization_not_found",
-                    "no such authorization",
-                ));
-            }
-            let id = id.to_owned();
+        (Method::POST, _) if path.starts_with("/v1/authorizations/") => {
+            let id = path
+                .strip_prefix("/v1/authorizations/")
+                .and_then(|rest| rest.strip_suffix("/outcome"))
+                .filter(|id| !id.is_empty() && !id.contains('/'))
+                .ok_or_else(|| {
+                    ApiError::new(404, "authorization_not_found", "no such authorization")
+                })?
+                .to_owned();
             let body = body_of(request).await?;
-            agent.report(&id, outcome_of(&body)?).await
+            agent.report(&id, client, outcome_of(&body)?).await
         }
         _ => Err(ApiError::new(404, "not_found", "no such route")),
     }
@@ -303,11 +300,19 @@ fn group_id(group: &str) -> Option<u32> {
         })
 }
 
+/// The most connections the local API holds at once: more are closed at
+/// once, so idle clients cannot exhaust the agent's file descriptors.
+pub const MAX_CONNECTIONS: usize = 64;
+
+/// How long a client may take to send a request's headers.
+pub const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn serve_connection<S>(
     agent: Arc<Agent>,
     stream: S,
     peer: Option<String>,
     limiter: Arc<RateLimiter>,
+    _slot: OwnedSemaphorePermit,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -320,13 +325,27 @@ async fn serve_connection<S>(
         )
     });
     let _ = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_TIMEOUT)
         .serve_connection(TokioIo::new(stream), service)
         .await;
 }
 
-/// Serve the local API until `stop` fires.
+/// An accept error is logged and the loop goes on; out of file descriptors,
+/// it waits a moment first.
+async fn accept_failed(err: &std::io::Error) {
+    log::warn("accept_failed", json!({"error": err.to_string()}));
+    // EMFILE, ENFILE: wait for connections to close.
+    if matches!(err.raw_os_error(), Some(23 | 24)) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Serve the local API until `stop` fires. Errors only when it cannot
+/// listen at all.
 pub async fn serve(agent: Arc<Agent>, mut stop: watch::Receiver<bool>) -> std::io::Result<()> {
     let limiter = Arc::new(RateLimiter::default());
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     match agent.config.listen.clone() {
         Listen::Unix(path) => {
             if let Some(parent) = path.parent() {
@@ -340,9 +359,20 @@ pub async fn serve(agent: Arc<Agent>, mut stop: watch::Receiver<bool>) -> std::i
                 json!({"listen": format!("unix:{}", path.display())}),
             );
             loop {
-                let (mut stream, _) = tokio::select! {
-                    accepted = listener.accept() => accepted?,
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
                     _ = stop.changed() => break,
+                };
+                let mut stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(err) => {
+                        accept_failed(&err).await;
+                        continue;
+                    }
+                };
+                let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                    log::warn("local_connections_full", json!({"max": MAX_CONNECTIONS}));
+                    continue;
                 };
                 let credentials = stream.peer_cred();
                 let allowed = credentials.as_ref().is_ok_and(|c| {
@@ -362,7 +392,12 @@ pub async fn serve(agent: Arc<Agent>, mut stop: watch::Receiver<bool>) -> std::i
                         body.len()
                     );
                     tokio::spawn(async move {
-                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _slot = slot;
+                        let _ = tokio::time::timeout(
+                            HEADER_TIMEOUT,
+                            stream.write_all(response.as_bytes()),
+                        )
+                        .await;
                         let _ = stream.shutdown().await;
                     });
                     continue;
@@ -373,6 +408,7 @@ pub async fn serve(agent: Arc<Agent>, mut stop: watch::Receiver<bool>) -> std::i
                     stream,
                     peer,
                     Arc::clone(&limiter),
+                    slot,
                 ));
             }
             let _ = std::fs::remove_file(&path);
@@ -384,15 +420,27 @@ pub async fn serve(agent: Arc<Agent>, mut stop: watch::Receiver<bool>) -> std::i
                 json!({"listen": format!("tcp://{}", listener.local_addr()?)}),
             );
             loop {
-                let (stream, _) = tokio::select! {
-                    accepted = listener.accept() => accepted?,
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
                     _ = stop.changed() => break,
+                };
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(err) => {
+                        accept_failed(&err).await;
+                        continue;
+                    }
+                };
+                let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                    log::warn("local_connections_full", json!({"max": MAX_CONNECTIONS}));
+                    continue;
                 };
                 tokio::spawn(serve_connection(
                     Arc::clone(&agent),
                     stream,
                     None,
                     Arc::clone(&limiter),
+                    slot,
                 ));
             }
         }

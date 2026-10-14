@@ -175,6 +175,7 @@ impl Na {
 const FORWARD: u8 = 0;
 const THROTTLE: u8 = 1;
 const BLACKHOLE: u8 = 2;
+const GATEWAY: u8 = 3;
 
 /// A TCP proxy between the agent and the NA: it forwards, refuses
 /// connections (the NA is stopped), answers every request `429` (the NA
@@ -224,7 +225,10 @@ impl Proxy {
                 let mode = mode.load(Ordering::SeqCst);
                 let connection = tokio::spawn(async move {
                     if mode == THROTTLE {
-                        return throttle(client).await;
+                        return refuse(client, THROTTLED).await;
+                    }
+                    if mode == GATEWAY {
+                        return refuse(client, BAD_GATEWAY).await;
                     }
                     if mode == BLACKHOLE {
                         let mut client = client;
@@ -290,6 +294,13 @@ impl Proxy {
         self.mode.store(THROTTLE, Ordering::SeqCst);
     }
 
+    /// A reverse proxy whose upstream is stopped: every request gets its own
+    /// `502` page (HTML, not the NA's JSON).
+    pub fn bad_gateway(&self) {
+        self.cut_connections();
+        self.mode.store(GATEWAY, Ordering::SeqCst);
+    }
+
     /// The network swallows every request: connections open, nothing answers.
     pub fn blackhole(&self) {
         self.cut_connections();
@@ -331,8 +342,20 @@ impl Proxy {
     }
 }
 
-/// Answer each request on a connection `429`, as a throttling NA does.
-async fn throttle(mut client: TcpStream) {
+/// A throttling NA's answer, with its JSON error body.
+const THROTTLED: (&str, &str) = (
+    "429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 60",
+    r#"{"error":{"code":"rate_limit_exceeded","message":"Rate limit exceeded"}}"#,
+);
+
+/// nginx's answer when its upstream is down: its own HTML page.
+const BAD_GATEWAY: (&str, &str) = (
+    "502 Bad Gateway\r\nServer: nginx\r\nContent-Type: text/html",
+    "<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center><hr><center>nginx</center></body></html>",
+);
+
+/// Answer each request on a connection with `response`.
+async fn refuse(mut client: TcpStream, (head, body): (&str, &str)) {
     let mut buffer = Vec::new();
     let mut chunk = vec![0_u8; 8192];
     loop {
@@ -343,8 +366,8 @@ async fn throttle(mut client: TcpStream) {
             }
             continue;
         };
-        let head = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
-        let length: usize = head
+        let request = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+        let length: usize = request
             .lines()
             .find_map(|l| l.strip_prefix("content-length:"))
             .and_then(|v| v.trim().parse().ok())
@@ -356,15 +379,18 @@ async fn throttle(mut client: TcpStream) {
             }
         }
         buffer.drain(..end + 4 + length);
-        let body = r#"{"error":{"code":"rate_limit_exceeded","message":"Rate limit exceeded"}}"#;
         let response = format!(
-            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         let _ = client.write_all(response.as_bytes()).await;
         let _ = client.shutdown().await;
         return;
     }
+}
+
+fn support_token() -> (String, String) {
+    token()
 }
 
 /// A loopback token and its digest.
@@ -421,7 +447,11 @@ pub struct Agent {
     pub api: Option<(String, String)>,
     /// Its socket, when it listens on one.
     pub socket: Option<PathBuf>,
+    /// A second loopback token, of another client.
+    pub other_token: String,
     child: Option<Child>,
+    /// Started without the `GM_EDGE_WRAP` wrapper.
+    direct: bool,
     log: PathBuf,
 }
 
@@ -449,6 +479,7 @@ impl Agent {
     pub fn new(na_url: &str, root_public_key: &str, extra: &[(&str, &str)]) -> Self {
         let state_dir = temporary("gm-edge-scenario");
         let (token, digest) = token();
+        let (other_token, other_digest) = support_token();
         let listen = format!("127.0.0.1:{}", free_port());
         let mut env: Vec<(String, String)> = [
             ("GM_EDGE_NA_URL", na_url.to_owned()),
@@ -458,7 +489,10 @@ impl Agent {
                 state_dir.join("state").display().to_string(),
             ),
             ("GM_EDGE_LISTEN", format!("tcp://{listen}")),
-            ("GM_EDGE_TOKENS", format!("scenario:{digest}")),
+            (
+                "GM_EDGE_TOKENS",
+                format!("scenario:{digest},other:{other_digest}"),
+            ),
             ("GM_EDGE_HEARTBEAT_INTERVAL_SECONDS", "2".to_owned()),
             ("GM_EDGE_SYNC_INTERVAL_SECONDS", "5".to_owned()),
             ("GM_EDGE_RETRY_INTERVAL_SECONDS", "1".to_owned()),
@@ -478,7 +512,9 @@ impl Agent {
             env,
             api: Some((listen, token)),
             socket: None,
+            other_token,
             child: None,
+            direct: false,
         }
     }
 
@@ -526,13 +562,48 @@ impl Agent {
         self.child = Some(child);
     }
 
+    /// Start `run` with at most `files` open file descriptors (`ulimit -n`).
+    pub fn start_limited(&mut self, files: u32) {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .unwrap();
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                &format!("ulimit -n {files} && exec \"$0\" run"),
+                &binary(),
+            ])
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default());
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        let child = command
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .expect("start the agent");
+        self.child = Some(child);
+        self.direct = true;
+    }
+
+    /// Whether the agent is still running.
+    pub fn alive(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_some_and(|child| child.try_wait().ok().flatten().is_none())
+    }
+
     /// Stop it with SIGTERM and wait; its exit code. Under a wrapper the
     /// agent (the wrapper's child) gets the signal, and the wrapper exits
     /// with the agent's code.
     pub async fn stop(&mut self) -> Option<i32> {
         let mut child = self.child.take()?;
         let pid = child.id().to_string();
-        if std::env::var("GM_EDGE_WRAP").is_ok_and(|w| !w.trim().is_empty()) {
+        if !self.direct && std::env::var("GM_EDGE_WRAP").is_ok_and(|w| !w.trim().is_empty()) {
             let _ = Command::new("pkill").args(["-TERM", "-P", &pid]).status();
         } else {
             let _ = Command::new("kill").args(["-TERM", &pid]).status();
@@ -558,6 +629,25 @@ impl Agent {
                 self.log()
             ),
         }
+    }
+
+    /// Call the local API with another client's token.
+    pub async fn call_as_other(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> (u16, Value) {
+        let (address, _) = self.api.clone().expect("a loopback API");
+        match try_tcp(&address, method, path, body, Some(&self.other_token)).await {
+            Some(answer) => answer,
+            None => panic!("the agent did not answer {method} {path}:\n{}", self.log()),
+        }
+    }
+
+    /// The loopback API's address.
+    pub fn address(&self) -> String {
+        self.api.clone().expect("a loopback API").0
     }
 
     /// `GET /v1/status`, waiting for the agent to listen.
@@ -715,6 +805,7 @@ pub fn assert_only_agent_files(state_dir: &Path) {
         .collect();
     names.sort();
     let allowed = [
+        "agent.lock",
         "agent.db",
         "agent.db-shm",
         "agent.db-wal",

@@ -14,6 +14,7 @@ mod agent;
 mod api;
 mod config;
 mod db;
+mod decision;
 mod log;
 mod state;
 
@@ -35,10 +36,15 @@ commands:
   init [--json]
   enroll [--invite-token-file <file>] [--reset [--discard-pending]]
   run [--invite-token-file <file>]
+  reset [--discard-pending]
   status [--json]
+  outbox export [--dead-letters]
   token new --name <name>
   check-config
   --version";
+
+/// The invite token's file outside systemd (read after the explicit sources).
+const INVITE_TOKEN_FILE: &str = "/etc/genesis-mesh-edge/invite-token";
 
 struct Args {
     config: Option<PathBuf>,
@@ -46,6 +52,7 @@ struct Args {
     invite_token_file: Option<PathBuf>,
     reset: bool,
     discard_pending: bool,
+    dead_letters: bool,
     json: bool,
     name: Option<String>,
 }
@@ -57,6 +64,7 @@ fn parse(arguments: Vec<String>) -> Result<Args, Exit> {
         invite_token_file: None,
         reset: false,
         discard_pending: false,
+        dead_letters: false,
         json: false,
         name: None,
     };
@@ -80,6 +88,7 @@ fn parse(arguments: Vec<String>) -> Result<Args, Exit> {
             }
             "--reset" => args.reset = true,
             "--discard-pending" => args.discard_pending = true,
+            "--dead-letters" => args.dead_letters = true,
             "--json" => args.json = true,
             "--name" => args.name = Some(iter.next().ok_or_else(|| usage("--name needs a name"))?),
             other if other.starts_with('-') && other != "--version" => {
@@ -92,7 +101,8 @@ fn parse(arguments: Vec<String>) -> Result<Args, Exit> {
 }
 
 /// The invite token: `--invite-token-file`, `GM_EDGE_INVITE_TOKEN_FILE`,
-/// `$CREDENTIALS_DIRECTORY/invite-token` (systemd), `GM_EDGE_INVITE_TOKEN`.
+/// `$CREDENTIALS_DIRECTORY/invite-token` (systemd; `none` is no token),
+/// `GM_EDGE_INVITE_TOKEN`, then `/etc/genesis-mesh-edge/invite-token`.
 fn invite_token(args: &Args) -> Result<Option<String>, Exit> {
     let env = process_env();
     let file = args
@@ -106,7 +116,11 @@ fn invite_token(args: &Args) -> Result<Option<String>, Exit> {
         .or_else(|| {
             env.get("CREDENTIALS_DIRECTORY")
                 .map(|d| PathBuf::from(d).join("invite-token"))
-                .filter(|p| p.exists())
+                // The unit's fallback credential (`none`) is no token.
+                .filter(|p| {
+                    std::fs::read_to_string(p)
+                        .is_ok_and(|t| !t.trim().is_empty() && t.trim() != "none")
+                })
         });
     if let Some(file) = file {
         let token = std::fs::read_to_string(&file).map_err(|e| {
@@ -124,10 +138,23 @@ fn invite_token(args: &Args) -> Result<Option<String>, Exit> {
         }
         return Ok(Some(token));
     }
-    Ok(env
+    if let Some(token) = env
         .get("GM_EDGE_INVITE_TOKEN")
         .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+    {
+        return Ok(Some(token));
+    }
+    Ok(std::fs::read_to_string(INVITE_TOKEN_FILE)
+        .ok()
+        .map(|t| t.trim().to_owned())
         .filter(|t| !t.is_empty()))
+}
+
+fn no_token() -> Exit {
+    Exit::Usage(format!(
+        "no invite token: --invite-token-file, GM_EDGE_INVITE_TOKEN_FILE, $CREDENTIALS_DIRECTORY/invite-token, GM_EDGE_INVITE_TOKEN or {INVITE_TOKEN_FILE}"
+    ))
 }
 
 fn load_config(args: &Args) -> Result<Config, Exit> {
@@ -147,7 +174,7 @@ fn runtime() -> Result<tokio::runtime::Runtime, Exit> {
 async fn enroll(agent: &Arc<Agent>, token: &str) -> Result<(), Exit> {
     agent.enroll(token).await?;
     // A first sync; a failure here is not fatal.
-    if let Err(err) = agent.sync().await {
+    if let Err(err) = agent.sync(true).await {
         log::warn("first_sync_failed", json!({"code": err.code()}));
     }
     Ok(())
@@ -159,6 +186,7 @@ async fn enroll(agent: &Arc<Agent>, token: &str) -> Result<(), Exit> {
 fn command_init(args: &Args) -> Result<(), Exit> {
     let config = load_config(args)?;
     let dir = StateDir::open(&config.state_dir)?;
+    let _lock = dir.lock()?;
     let node = dir.key(state::NODE_KEY)?;
     let executor = dir.key(state::EXECUTOR_KEY)?;
     let public = |seed: &str| {
@@ -176,32 +204,49 @@ fn command_init(args: &Args) -> Result<(), Exit> {
     Ok(())
 }
 
+/// Delete the keys and the state, refusing while records are not uploaded
+/// (unless `--discard-pending`) or while the agent runs.
+fn reset(dir: &StateDir, discard_pending: bool) -> Result<(), Exit> {
+    if dir.path(DATABASE).exists() {
+        let db = db::Db::open_read_only(&dir.path(DATABASE))
+            .map_err(|e| Exit::Internal(e.to_string()))?;
+        let (pending, dead) = db
+            .outbox_counts()
+            .map_err(|e| Exit::Internal(e.to_string()))?;
+        if pending + dead > 0 && !discard_pending {
+            return Err(Exit::Usage(format!(
+                "{pending} records are not uploaded yet ({dead} dead letters; `outbox export` saves them): run the agent until they are, or add --discard-pending"
+            )));
+        }
+    }
+    dir.reset()?;
+    log::warn("state_reset", json!({}));
+    Ok(())
+}
+
+fn command_reset(args: &Args) -> Result<(), Exit> {
+    let config = load_config(args)?;
+    let dir = StateDir::open(&config.state_dir)?;
+    let _lock = dir.lock()?;
+    reset(&dir, args.discard_pending)?;
+    eprintln!("state reset: run `genesis-mesh-edge init` for new keys, then enrol");
+    Ok(())
+}
+
 fn command_enroll(args: &Args) -> Result<(), Exit> {
     let config = load_config(args)?;
+    // The token first: a reset without one would leave the device with no
+    // keys and no enrolment.
+    let token = invite_token(args)?.ok_or_else(no_token)?;
+    let dir = StateDir::open(&config.state_dir)?;
+    let _lock = dir.lock()?;
     if args.reset {
-        let dir = StateDir::open(&config.state_dir)?;
-        if dir.path(DATABASE).exists() {
-            let db =
-                db::Db::open(&dir.path(DATABASE)).map_err(|e| Exit::Internal(e.to_string()))?;
-            let (pending, dead) = db
-                .outbox_counts()
-                .map_err(|e| Exit::Internal(e.to_string()))?;
-            if pending + dead > 0 && !args.discard_pending {
-                return Err(Exit::Usage(format!(
-                    "{pending} records are not uploaded yet ({dead} dead letters): run the agent until they are, or add --discard-pending"
-                )));
-            }
-        }
-        dir.reset()?;
-        log::warn("state_reset", json!({}));
+        reset(&dir, args.discard_pending)?;
     }
-    let token = invite_token(args)?.ok_or_else(|| {
-        Exit::Usage("no invite token: --invite-token-file, GM_EDGE_INVITE_TOKEN_FILE, $CREDENTIALS_DIRECTORY/invite-token or GM_EDGE_INVITE_TOKEN".into())
-    })?;
     let agent = Agent::load(config)?;
     if agent.enrolled() {
         return Err(Exit::Usage(
-            "already enrolled; enroll --reset starts again".into(),
+            "already enrolled; `reset` (or enroll --reset) starts again".into(),
         ));
     }
     runtime()?.block_on(enroll(&agent, &token))
@@ -209,6 +254,9 @@ fn command_enroll(args: &Args) -> Result<(), Exit> {
 
 fn command_run(args: &Args) -> Result<(), Exit> {
     let config = load_config(args)?;
+    let dir = StateDir::open(&config.state_dir)?;
+    // Held while the agent runs: `reset` and `enroll` refuse meanwhile.
+    let _lock = dir.lock()?;
     let agent = Agent::load(config)?;
     let token = if agent.enrolled() {
         None
@@ -231,28 +279,53 @@ fn command_run(args: &Args) -> Result<(), Exit> {
             let stop = stop_rx.clone();
             tokio::spawn(async move { agent.run(stop).await })
         };
-        log::info("started", json!({"version": VERSION, "state": agent.state().name()}));
-        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .map_err(|e| Exit::Internal(e.to_string()))?;
+        log::info(
+            "started",
+            json!({"version": VERSION, "state": agent.state().name()}),
+        );
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|e| Exit::Internal(e.to_string()))?;
         let mut server = server;
-        tokio::select! {
-            _ = terminate.recv() => {}
-            _ = tokio::signal::ctrl_c() => {}
-            served = &mut server => {
-                return match served {
-                    Ok(Err(err)) => Err(Exit::Usage(format!("the local API could not listen: {err}"))),
-                    _ => Err(Exit::Internal("the local API stopped".into())),
-                };
-            }
-        }
+        let failed = tokio::select! {
+            _ = terminate.recv() => None,
+            _ = tokio::signal::ctrl_c() => None,
+            // Only when it cannot listen at all: a runtime failure (exit 1,
+            // so the service manager restarts it), never configuration.
+            served = &mut server => Some(match served {
+                Ok(Err(err)) => format!("the local API could not listen: {err}"),
+                _ => "the local API stopped".to_owned(),
+            }),
+        };
         log::info("stopping", json!({}));
         let _ = stop_tx.send(true);
         agent.shut_down(Duration::from_secs(10)).await;
+        if let Some(message) = failed {
+            let _ = tokio::time::timeout(Duration::from_secs(2), schedule).await;
+            return Err(Exit::Internal(message));
+        }
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), schedule).await;
         log::info("stopped", json!({}));
         Ok(())
     })
+}
+
+/// `outbox export [--dead-letters]`: every record not uploaded (or the dead
+/// letters only), as JSON lines on stdout. Read-only.
+fn command_export(args: &Args) -> Result<(), Exit> {
+    let config = load_config(args)?;
+    let path = config.state_dir.join(DATABASE);
+    if !path.exists() {
+        return Ok(());
+    }
+    let db = db::Db::open_read_only(&path).map_err(|e| Exit::Internal(e.to_string()))?;
+    let mut out = std::io::stdout().lock();
+    let count = db
+        .export(args.dead_letters, &mut out)
+        .map_err(|e| Exit::Internal(e.to_string()))?;
+    eprintln!("{count} records");
+    Ok(())
 }
 
 fn command_status(args: &Args) -> Result<(), Exit> {
@@ -261,7 +334,7 @@ fn command_status(args: &Args) -> Result<(), Exit> {
     let enrollment = dir.read_json(ENROLLMENT)?;
     let snapshot = dir.read_json(SNAPSHOT)?.unwrap_or(json!({}));
     let (pending, dead) = if dir.path(DATABASE).exists() {
-        db::Db::open(&dir.path(DATABASE))
+        db::Db::open_read_only(&dir.path(DATABASE))
             .and_then(|db| db.outbox_counts())
             .map_err(|e| Exit::Internal(e.to_string()))?
     } else {
@@ -341,6 +414,8 @@ fn main() -> ExitCode {
         match words.as_slice() {
             ["init"] => command_init(&args),
             ["enroll"] => command_enroll(&args),
+            ["reset"] => command_reset(&args),
+            ["outbox", "export"] => command_export(&args),
             ["run"] => command_run(&args),
             ["status"] => command_status(&args),
             ["token", "new"] => command_token(&args),

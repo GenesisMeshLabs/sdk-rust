@@ -410,18 +410,23 @@ impl Config {
                 "snapshot.max_snapshot_age_seconds must be 60 to 604800",
             ));
         }
-        for (name, value) in [
-            ("authority.timeout_seconds", na_timeout),
-            ("node.heartbeat_interval_seconds", heartbeat_interval),
-            ("snapshot.sync_interval_seconds", sync_interval),
-            ("snapshot.retry_interval_seconds", retry_interval),
+        // Upper bounds keep every time computed from these within range.
+        for (name, value, most) in [
+            ("authority.timeout_seconds", na_timeout, 300),
+            ("node.heartbeat_interval_seconds", heartbeat_interval, 3600),
+            ("node.renew_before_seconds", renew_before, 30 * 86400),
+            ("snapshot.sync_interval_seconds", sync_interval, 86400),
+            ("snapshot.retry_interval_seconds", retry_interval, 3600),
         ] {
-            if value.is_zero() {
+            if value.is_zero() && name != "node.renew_before_seconds" {
                 return Err(bad(format!("{name} must be greater than zero")));
             }
+            if value.as_secs() > most {
+                return Err(bad(format!("{name} must be at most {most}")));
+            }
         }
-        if validity_hours == 0 {
-            return Err(bad("node.validity_hours must be greater than zero"));
+        if !(1..=8760).contains(&validity_hours) {
+            return Err(bad("node.validity_hours must be 1 to 8760"));
         }
         let state_dir = env_of(env, "GM_EDGE_STATE_DIR")
             .map(PathBuf::from)
@@ -490,16 +495,15 @@ impl Config {
         );
         let rate_limit_per_minute = number(env, "GM_EDGE_RATE_LIMIT_PER_MINUTE")?
             .or(file.local_api.rate_limit_per_minute)
-            .unwrap_or(60);
-        if rate_limit_per_minute == 0 {
-            return Err(bad(
-                "local_api.rate_limit_per_minute must be greater than zero",
-            ));
+            .unwrap_or(30);
+        if !(1..=100_000).contains(&rate_limit_per_minute) {
+            return Err(bad("local_api.rate_limit_per_minute must be 1 to 100000"));
         }
-        if report_timeout.is_zero() {
-            return Err(bad(
-                "local_api.report_timeout_seconds must be greater than zero",
-            ));
+        if report_timeout.is_zero() || report_timeout.as_secs() > 86400 {
+            return Err(bad("local_api.report_timeout_seconds must be 1 to 86400"));
+        }
+        if queue_timeout.as_secs() > 3600 {
+            return Err(bad("local_api.queue_timeout_seconds must be at most 3600"));
         }
         let level = env_of(env, "GM_EDGE_LOG_LEVEL")
             .or(file.log.level)
@@ -657,6 +661,21 @@ allowed_uids = [1000]
         assert!(refused(BASE, &[("GM_EDGE_MAX_SNAPSHOT_AGE_SECONDS", "59")]));
         assert!(refused(&format!("{BASE}\n[extra]\nx = 1\n"), &[]));
         assert!(refused(BASE, &[("GM_EDGE_SOCKET_MODE", "999")]));
+        // Bounded durations: nothing computed from them can overflow.
+        assert!(refused(
+            BASE,
+            &[("GM_EDGE_REPORT_TIMEOUT_SECONDS", "18446744073709551615")]
+        ));
+        assert!(refused(
+            BASE,
+            &[("GM_EDGE_REPORT_TIMEOUT_SECONDS", "86401")]
+        ));
+        assert!(refused(
+            BASE,
+            &[("GM_EDGE_HEARTBEAT_INTERVAL_SECONDS", "3601")]
+        ));
+        assert!(refused(BASE, &[("GM_EDGE_VALIDITY_HOURS", "0")]));
+        assert!(refused(BASE, &[("GM_EDGE_RATE_LIMIT_PER_MINUTE", "0")]));
         assert!(refused(BASE, &[("GM_EDGE_TOKENS", "ops:short")]));
     }
 }

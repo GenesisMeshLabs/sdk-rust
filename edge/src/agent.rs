@@ -1,11 +1,11 @@
 //! The agent: its enrolment, the trust snapshot, the schedule (heartbeat,
-//! renewal, sync) and the decision order for one authorization
-//! (docs/edge.md, "Decision order").
+//! renewal, sync, uploads) and the decision order for one authorization
+//! (docs/edge.md, "Decision order"; its rules are in `decision`).
 
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use genesis_mesh_sdk::{
     canonical::{parse_timestamp, python_timestamp},
     check_metadata_only, evaluation_failure, governed_action,
-    grants::use_digest,
+    grants::{envelope_problem, use_digest},
     json,
     key_history::verify_key_history,
     node_auth::executor_key_id,
@@ -30,13 +30,20 @@ use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     config::Config,
-    db::{Db, SqliteOutbox, SqliteRecordOutbox},
+    db::{Db, DbError, SqliteOutbox, SqliteRecordOutbox},
+    decision::{self, Answer, Candidate, GrantChoice, Next},
     log,
     state::{StateDir, StateError, DATABASE, ENROLLMENT, EXECUTOR_KEY, NODE_KEY, SNAPSHOT},
 };
 
 /// How far the device's clock may be behind the NA's signing time.
 const CLOCK_SKEW_SECONDS: i64 = 300;
+
+/// Records submitted per upload page: an upload never loads a whole backlog.
+const UPLOAD_PAGE: usize = 200;
+
+/// Pages a decision uploads before it asks the NA (sync uploads the rest).
+const DECISION_PAGES: usize = 5;
 
 /// The agent's version (the SDK's).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -88,7 +95,17 @@ impl From<StateError> for Exit {
     fn from(err: StateError) -> Self {
         match err {
             StateError::Insecure(m) => Self::Insecure(m),
+            StateError::Busy(m) => Self::Usage(m),
             StateError::Io(m) => Self::Internal(m),
+        }
+    }
+}
+
+impl From<DbError> for Exit {
+    fn from(err: DbError) -> Self {
+        match err {
+            DbError::Newer(m) => Self::Usage(m),
+            DbError::Io(e) => Self::Internal(e.to_string()),
         }
     }
 }
@@ -128,12 +145,20 @@ impl AgentState {
 struct Shared {
     enrollment: Option<Value>,
     client: Option<GenesisMeshClient>,
+    /// The client uploads go through: its outboxes list one page at a time.
+    uploader: Option<GenesisMeshClient>,
     identity: Option<NodeIdentity>,
     recorder: Option<ExecutionRecorder>,
     snapshot: Value,
     na_keys: Vec<String>,
     revoked: bool,
+    /// The NA's own last answer (not a proxy's page).
     last_contact: Option<DateTime<Utc>>,
+    /// The NA's last accepted heartbeat: it trusts the certificate.
+    heartbeat_ok: Option<DateTime<Utc>>,
+    /// What the last failed exchange said, for `/v1/status`.
+    last_answer: Option<Answer>,
+    last_na_error: Option<Value>,
 }
 
 /// The grant holders, one per grant, and the one an authorization holds.
@@ -151,6 +176,8 @@ pub struct Agent {
     db: Db,
     shared: Mutex<Shared>,
     holders: tokio::sync::Mutex<Holders>,
+    /// One upload at a time.
+    uploading: tokio::sync::Mutex<()>,
     /// One authorization at a time; others queue FIFO.
     slot: Arc<Semaphore>,
     open: Mutex<HashMap<String, Open>>,
@@ -159,6 +186,8 @@ pub struct Agent {
 
 /// An authorization handed to the caller, waiting for its outcome.
 struct Open {
+    /// The local client that asked (uid or token name): only it reports.
+    client: String,
     outcome: Option<oneshot::Sender<Outcome>>,
     task: tokio::task::JoinHandle<Finished>,
     link: Arc<Link>,
@@ -209,7 +238,7 @@ struct Link {
     granted: Mutex<Option<oneshot::Sender<Granted>>>,
     outcome: Mutex<Option<oneshot::Receiver<Outcome>>>,
     report_timeout: Duration,
-    expired: std::sync::atomic::AtomicBool,
+    expired: AtomicBool,
 }
 
 /// How an authorization ended.
@@ -250,6 +279,19 @@ impl ApiError {
     }
 }
 
+/// Aborts the decision task when the request that started it goes away
+/// before the action was handed to it (the client disconnected): nothing
+/// runs and nothing is signed.
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -267,17 +309,33 @@ fn timestamp(at: DateTime<Utc>) -> String {
     python_timestamp(at)
 }
 
+fn chrono(duration: Duration) -> chrono::Duration {
+    chrono::Duration::from_std(duration).unwrap_or(chrono::Duration::MAX)
+}
+
 /// A failed request to the NA that names a revoked node.
 fn revoked_code(err: &GenesisMeshError) -> bool {
     matches!(err.code(), "certificate_revoked" | "edge_node_retired")
 }
 
 impl Agent {
-    /// Open the state directory and what it holds.
+    /// Open the state directory and what it holds. Refuses an enrolment with
+    /// another NA than the configured one, and a database a newer agent
+    /// wrote (exit 2).
     pub fn load(config: Config) -> Result<Arc<Self>, Exit> {
         let dir = StateDir::open(&config.state_dir)?;
-        let db = Db::open(&dir.path(DATABASE)).map_err(internal)?;
+        let db = Db::open(&dir.path(DATABASE))?;
         let lost = db.lose_open_authorizations().map_err(internal)?;
+        let _ = db.prune_authorizations();
+        let enrollment = dir.read_json(ENROLLMENT)?;
+        if let Some(enrolled) = enrollment.as_ref().and_then(|e| e["na_url"].as_str()) {
+            if enrolled.trim_end_matches('/') != config.na_url {
+                return Err(Exit::Usage(format!(
+                    "the agent is enrolled with {enrolled}, not the configured {}: run `genesis-mesh-edge reset` to enrol with another NA",
+                    config.na_url
+                )));
+            }
+        }
         let agent = Arc::new(Self {
             slot: Arc::new(Semaphore::new(1)),
             config,
@@ -286,18 +344,23 @@ impl Agent {
             shared: Mutex::new(Shared {
                 enrollment: None,
                 client: None,
+                uploader: None,
                 identity: None,
                 recorder: None,
                 snapshot: json!({}),
                 na_keys: Vec::new(),
                 revoked: false,
                 last_contact: None,
+                heartbeat_ok: None,
+                last_answer: None,
+                last_na_error: None,
             }),
             holders: tokio::sync::Mutex::new(Holders::default()),
+            uploading: tokio::sync::Mutex::new(()),
             open: Mutex::new(HashMap::new()),
             lost: AtomicU64::new(lost),
         });
-        if let Some(enrollment) = agent.dir.read_json(ENROLLMENT)? {
+        if let Some(enrollment) = enrollment {
             agent.adopt(enrollment)?;
             agent.restore_holders()?;
         }
@@ -317,7 +380,7 @@ impl Agent {
         HttpTransport::new(self.client_options())
     }
 
-    /// Use an enrolment: the node identity, the client acting as the node,
+    /// Use an enrolment: the node identity, the clients acting as the node,
     /// the executor recorder, and the snapshot held.
     fn adopt(&self, enrollment: Value) -> Result<(), Exit> {
         let node_seed = self
@@ -339,14 +402,24 @@ impl Agent {
             &executor_seed,
         )
         .map_err(internal)?;
-        let client = GenesisMeshClient::new(
-            self.client_options()
-                .with_audience(audience)
-                .with_outbox(Arc::new(SqliteOutbox(self.db.clone())))
-                .with_record_outbox(Arc::new(SqliteRecordOutbox(self.db.clone()))),
-        )
-        .map_err(|e| Exit::Usage(e.to_string()))?
-        .with_node_identity(identity.clone());
+        let client_with = |outbox: SqliteOutbox, records: SqliteRecordOutbox| {
+            GenesisMeshClient::new(
+                self.client_options()
+                    .with_audience(audience)
+                    .with_outbox(Arc::new(outbox))
+                    .with_record_outbox(Arc::new(records)),
+            )
+            .map(|c| c.with_node_identity(identity.clone()))
+            .map_err(|e| Exit::Usage(e.to_string()))
+        };
+        let client = client_with(
+            SqliteOutbox::new(self.db.clone()),
+            SqliteRecordOutbox::new(self.db.clone()),
+        )?;
+        let uploader = client_with(
+            SqliteOutbox::windowed(self.db.clone(), UPLOAD_PAGE),
+            SqliteRecordOutbox::windowed(self.db.clone(), UPLOAD_PAGE),
+        )?;
         let snapshot = self.dir.read_json(SNAPSHOT)?.unwrap_or_else(|| json!({}));
         let na_keys = self.keys_of(&snapshot["key_history"]).unwrap_or_default();
         let revoked = self.db.meta("revoked").map_err(internal)?.is_some()
@@ -354,6 +427,7 @@ impl Agent {
         let mut shared = lock(&self.shared);
         shared.enrollment = Some(enrollment);
         shared.client = Some(client);
+        shared.uploader = Some(uploader);
         shared.identity = Some(identity);
         shared.recorder = Some(recorder);
         shared.na_keys = na_keys;
@@ -376,25 +450,50 @@ impl Agent {
         verified.history.map(|h| h.all_keys())
     }
 
-    /// Restore the grant holders, each advanced to the newest use of its
-    /// grant the agent made (in the record outbox, or admitted): a crash
-    /// between keeping a use and saving the holder never forks the chain.
+    fn resource_prefix(&self) -> Option<String> {
+        lock(&self.shared)
+            .enrollment
+            .as_ref()
+            .and_then(|e| e["executor_key"]["resource_prefix"].as_str())
+            .map(str::to_owned)
+    }
+
+    /// A holder's state advanced to the newest use of its grant the agent
+    /// made (in the record outbox, or admitted): a crash between keeping a
+    /// use and saving the holder never forks the chain.
+    fn advance(&self, grant_id: &str, state: &mut GrantHolderState, uses: &[Value]) {
+        let newest = uses
+            .iter()
+            .filter(|u| u["grant_id"].as_str() == Some(grant_id))
+            .max_by_key(|u| u["use_sequence"].as_u64().unwrap_or(0));
+        if let Some(newest) = newest {
+            let sequence = newest["use_sequence"].as_u64().unwrap_or(0);
+            if sequence > state.uses {
+                state.uses = sequence;
+                state.head_digest = use_digest(newest).ok();
+                state.head_executed_at = newest["executed_at"]
+                    .as_str()
+                    .and_then(|s| parse_timestamp(s).ok())
+                    .map(python_timestamp);
+                log::warn(
+                    "grant_holder_advanced",
+                    json!({"grant_id": grant_id, "uses": sequence}),
+                );
+            }
+        }
+    }
+
+    /// Restore the grant holders, each advanced to its newest use. A holder
+    /// that does not restore is rebuilt at the next sync, from its uses.
     fn restore_holders(&self) -> Result<(), Exit> {
-        let (recorder, keys, prefix) = {
+        let (recorder, keys) = {
             let shared = lock(&self.shared);
-            (
-                shared.recorder.clone(),
-                shared.na_keys.clone(),
-                shared
-                    .enrollment
-                    .as_ref()
-                    .and_then(|e| e["executor_key"]["resource_prefix"].as_str())
-                    .map(str::to_owned),
-            )
+            (shared.recorder.clone(), shared.na_keys.clone())
         };
         let Some(recorder) = recorder else {
             return Ok(());
         };
+        let prefix = self.resource_prefix();
         let uses = self.db.grant_uses().map_err(internal)?;
         let mut holders = BTreeMap::new();
         for (grant_id, state) in self.db.holders().map_err(internal)? {
@@ -408,25 +507,7 @@ impl Agent {
                     continue;
                 }
             };
-            let newest = uses
-                .iter()
-                .filter(|u| u["grant_id"].as_str() == Some(grant_id.as_str()))
-                .max_by_key(|u| u["use_sequence"].as_u64().unwrap_or(0));
-            if let Some(newest) = newest {
-                let sequence = newest["use_sequence"].as_u64().unwrap_or(0);
-                if sequence > state.uses {
-                    state.uses = sequence;
-                    state.head_digest = use_digest(newest).ok();
-                    state.head_executed_at = newest["executed_at"]
-                        .as_str()
-                        .and_then(|s| parse_timestamp(s).ok())
-                        .map(python_timestamp);
-                    log::warn(
-                        "grant_holder_advanced",
-                        json!({"grant_id": grant_id, "uses": sequence}),
-                    );
-                }
-            }
+            self.advance(&grant_id, &mut state, &uses);
             match GrantHolder::restore(state, recorder.clone(), keys.clone()) {
                 Ok(mut holder) => {
                     holder.set_resource_prefix(prefix.clone());
@@ -535,7 +616,9 @@ impl Agent {
 
     // ── State ───────────────────────────────────────────────────────────────
 
-    /// Where the agent stands now.
+    /// Where the agent stands now. A certificate the device's clock takes as
+    /// expired is still in force while the NA accepts the node's heartbeats
+    /// (the device's clock is ahead).
     pub fn state(&self) -> AgentState {
         let shared = lock(&self.shared);
         let Some(enrollment) = &shared.enrollment else {
@@ -544,21 +627,54 @@ impl Agent {
         if shared.revoked {
             return AgentState::Revoked;
         }
+        let now = Utc::now();
         match micros(&enrollment["cert"]["expires_at"]) {
-            Some(expires) if expires > Utc::now().timestamp_micros() => AgentState::Active,
+            Some(expires) if expires > now.timestamp_micros() => AgentState::Active,
+            _ if shared
+                .heartbeat_ok
+                .is_some_and(|at| now - at <= chrono(self.config.heartbeat_interval * 2)) =>
+            {
+                AgentState::Active
+            }
             _ => AgentState::CertificateExpired,
         }
     }
 
     fn connected(&self) -> bool {
         let last = lock(&self.shared).last_contact;
-        let window = chrono::Duration::from_std(self.config.heartbeat_interval * 2)
-            .unwrap_or(chrono::Duration::MAX);
-        self.state() == AgentState::Active && last.is_some_and(|at| Utc::now() - at <= window)
+        self.state() == AgentState::Active
+            && last.is_some_and(|at| Utc::now() - at <= chrono(self.config.heartbeat_interval * 2))
     }
 
-    fn contact(&self) {
-        lock(&self.shared).last_contact = Some(Utc::now());
+    /// Note an exchange with the NA: `Ok` or its error. Only the NA's own
+    /// answers (not a proxy's page, not a timeout) count as contact.
+    fn observe(&self, event: &str, result: Result<(), &GenesisMeshError>) {
+        let mut shared = lock(&self.shared);
+        let Err(err) = result else {
+            shared.last_contact = Some(Utc::now());
+            shared.last_answer = None;
+            return;
+        };
+        let answer = decision::classify(err);
+        if !matches!(answer, Answer::Unreachable(_)) {
+            shared.last_contact = Some(Utc::now());
+        }
+        shared.last_na_error = Some(json!({
+            "status": decision::status_of(err),
+            "code": err.code(),
+            "at": timestamp(Utc::now()),
+        }));
+        shared.last_answer = Some(answer);
+        drop(shared);
+        if revoked_code(err) {
+            self.mark_revoked(err.code());
+        } else if matches!(err.code(), "certificate_expired" | "node_auth_failed") {
+            // A clock off by more than the NA's 300 s window, or an expired
+            // certificate: the operator must see it.
+            log::warn(event, json!({"code": err.code()}));
+        } else {
+            log::debug(event, json!({"code": err.code()}));
+        }
     }
 
     fn mark_revoked(&self, why: &str) {
@@ -581,17 +697,17 @@ impl Agent {
         Some((Utc::now().timestamp_micros() - anchor) / 1_000_000)
     }
 
-    /// The device's clock is more than 300 s behind the time the NA signed
-    /// the snapshot: the clock cannot be trusted to age it.
-    fn clock_behind(&self) -> bool {
-        self.snapshot_age()
-            .is_some_and(|age| age < -CLOCK_SKEW_SECONDS)
+    /// `(fresh, clock_behind)`: see `decision::freshness`.
+    fn freshness(&self) -> (bool, bool) {
+        decision::freshness(
+            self.snapshot_age(),
+            self.config.max_snapshot_age.as_secs() as i64,
+            CLOCK_SKEW_SECONDS,
+        )
     }
 
     fn snapshot_fresh(&self) -> bool {
-        self.snapshot_age().is_some_and(|age| {
-            (-CLOCK_SKEW_SECONDS..=self.config.max_snapshot_age.as_secs() as i64).contains(&age)
-        })
+        self.freshness().0
     }
 
     // ── The schedule ────────────────────────────────────────────────────────
@@ -612,9 +728,13 @@ impl Agent {
         Some((shared.client.clone()?, shared.identity.clone()?))
     }
 
-    /// Send a heartbeat; true when the NA answered it.
+    /// Send a heartbeat (also with a certificate the device's clock takes as
+    /// expired: the NA decides); true when the NA itself answered.
     pub async fn heartbeat(&self) -> bool {
-        if self.state() != AgentState::Active {
+        if !matches!(
+            self.state(),
+            AgentState::Active | AgentState::CertificateExpired
+        ) {
             return false;
         }
         let Some((client, identity)) = self.node() else {
@@ -632,34 +752,26 @@ impl Agent {
             .await
         {
             Ok(_) => {
-                self.contact();
+                self.observe("heartbeat", Ok(()));
+                lock(&self.shared).heartbeat_ok = Some(Utc::now());
                 true
             }
             Err(err) => {
-                self.na_error("heartbeat_failed", &err);
-                // A refusal (a 429 included) is an answer: the NA is there.
-                answered(&err)
+                self.observe("heartbeat_failed", Err(&err));
+                !matches!(decision::classify(&err), Answer::Unreachable(_))
             }
         }
     }
 
-    fn na_error(&self, event: &str, err: &GenesisMeshError) {
-        if answered(err) {
-            self.contact();
-        }
-        if revoked_code(err) {
-            self.mark_revoked(err.code());
-        } else if err.code() == "certificate_expired" {
-            log::warn(event, json!({"code": err.code()}));
-        } else {
-            log::debug(event, json!({"code": err.code()}));
-        }
-    }
-
-    /// Renew the certificate when it expires within `renew_before`. The new
-    /// certificate is saved before it is used.
+    /// Renew the certificate when it expires within `renew_before`; keeps
+    /// trying once it has expired (the NA refuses an expired certificate:
+    /// docs/edge.md says how to recover). The new certificate is saved
+    /// before it is used.
     pub async fn maybe_renew(&self) {
-        if self.state() != AgentState::Active {
+        if !matches!(
+            self.state(),
+            AgentState::Active | AgentState::CertificateExpired
+        ) {
             return;
         }
         let (expires, node_public_key, executor_public_key, keys) = {
@@ -694,11 +806,11 @@ impl Agent {
         {
             Ok(cert) => cert,
             Err(err) => {
-                self.na_error("renewal_failed", &err);
+                self.observe("renewal_failed", Err(&err));
                 return;
             }
         };
-        self.contact();
+        self.observe("renewal", Ok(()));
         if let Err(err) = check_certificate(&cert, &keys, &node_public_key, &executor_public_key) {
             log::error("renewal_refused", json!({"reason": err.message()}));
             return;
@@ -723,11 +835,65 @@ impl Agent {
         );
     }
 
+    /// Upload the outboxes one page at a time, at most `pages` pages of
+    /// each: break-glass records and grant uses (in chain order), then
+    /// execution evidence. Records the NA asked to wait for
+    /// (`Retry-After`) stay pending unless `ignore_backoff` (on reconnecting,
+    /// once).
+    async fn upload(&self, ignore_backoff: bool, pages: usize) -> Result<(), GenesisMeshError> {
+        let Some(uploader) = lock(&self.shared).uploader.clone() else {
+            return Ok(());
+        };
+        let _uploading = self.uploading.lock().await;
+        let store = &uploader.evidence_store;
+        let options = FlushOptions { ignore_backoff };
+        let (mut admitted, mut quarantined, mut dead, mut first_error) = (0, 0, 0, None);
+        for _ in 0..pages {
+            match store.flush_records(options).await {
+                Ok(report) => {
+                    admitted += report.admitted.len();
+                    quarantined += report.quarantined.len();
+                    dead += report.dead_lettered.len();
+                    if report.admitted.len() + report.dead_lettered.len() == 0 {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    first_error = Some(err);
+                    break;
+                }
+            }
+        }
+        for _ in 0..pages {
+            match store.flush_pending(options).await {
+                Ok(report) => {
+                    admitted += report.admitted.len();
+                    dead += report.dead_lettered.len();
+                    if report.admitted.len() + report.dead_lettered.len() == 0 {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                    break;
+                }
+            }
+        }
+        if admitted + dead > 0 {
+            log::info(
+                "uploaded",
+                json!({"admitted": admitted, "quarantined": quarantined, "dead_lettered": dead}),
+            );
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Sync with the NA: the key history, the CRL, the revocation feed and
-    /// the node's state; new grants get a holder and a first time token;
-    /// then the uploads (break-glass, grant uses in chain order, execution
-    /// evidence) and a fresh time token for every usable holder.
-    pub async fn sync(&self) -> Result<(), GenesisMeshError> {
+    /// the node's state; new grants get a holder; then the uploads (they run
+    /// even when a read failed: records are signed with the executor key,
+    /// not the node key) and a fresh time token for every usable holder.
+    /// `reconnected` uploads past the NA's backoff once.
+    pub async fn sync(&self, reconnected: bool) -> Result<(), GenesisMeshError> {
         let state = self.state();
         if !matches!(state, AgentState::Active | AgentState::CertificateExpired) {
             return Ok(());
@@ -735,100 +901,22 @@ impl Agent {
         let Some((client, identity)) = self.node() else {
             return Ok(());
         };
-        let transport = self.transport()?;
-        let key_history: Value = transport.public_get("/na/key-history").await?;
-        let Some(na_keys) = self.keys_of(&key_history) else {
-            log::error("key_history_unverified", json!({}));
-            return Err(GenesisMeshError::Verification(
-                "the NA's key history does not verify".into(),
-            ));
-        };
-        let crl: Value = transport.public_get("/crl").await?;
-        let feed = client.grants.revocation_feed().await?;
-        if !verify_crl(&crl, &na_keys) {
-            log::error("crl_unverified", json!({}));
-            return Err(GenesisMeshError::Verification(
-                "the CRL does not verify".into(),
-            ));
+        let reads = self.read_snapshot(&client, &identity, state).await;
+        if self.state() == AgentState::Revoked {
+            return Ok(());
         }
-        if crl_names(&crl, identity.cert_id()) {
-            self.mark_revoked("certificate_in_crl");
-        }
-        let mut node_state = Value::Null;
-        if state == AgentState::Active && self.state() == AgentState::Active {
-            match client.node.state(&identity).await {
-                Ok(answer) => {
-                    self.contact();
-                    // An executor key retired another way than by revoking
-                    // the node: its records would be refused.
-                    if !answer["executor_key"]["retired_at"].is_null() {
-                        self.mark_revoked("executor_key_retired");
-                        return Ok(());
-                    }
-                    node_state = answer;
-                }
-                Err(err) => {
-                    self.na_error("node_state_failed", &err);
-                    if revoked_code(&err) {
-                        return Ok(());
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        let attestations = verified_attestations(&node_state, &na_keys, &identity);
-        if !node_state.is_null() {
-            node_state["attestations"] = Value::Array(attestations);
-        }
-        {
-            let mut shared = lock(&self.shared);
-            shared.na_keys = na_keys.clone();
-            if node_state.is_null() {
-                node_state = shared.snapshot["node_state"].clone();
-            }
-            shared.snapshot = json!({
-                "key_history": key_history,
-                "crl": crl,
-                "revocation_feed": feed,
-                "node_state": node_state,
-                "synced_at": timestamp(Utc::now()),
-            });
-            if let Err(err) = self.dir.write_json(SNAPSHOT, &shared.snapshot) {
-                log::error("snapshot_not_saved", json!({"error": err.to_string()}));
-            }
-        }
-        self.sync_grants(&client, &node_state, &feed, &na_keys)
-            .await;
-        let store = &client.evidence_store;
-        let uploads = store
-            .flush_records(FlushOptions {
-                ignore_backoff: true,
-            })
-            .await;
-        let pending = store
-            .flush_pending(FlushOptions {
-                ignore_backoff: true,
-            })
-            .await;
-        match (&uploads, &pending) {
-            (Ok(records), Ok(evidence)) => log::info(
-                "uploaded",
-                json!({
-                    "records_admitted": records.admitted.len(),
-                    "records_quarantined": records.quarantined.len(),
-                    "records_dead_lettered": records.dead_lettered.len(),
-                    "evidence_admitted": evidence.admitted.len(),
-                    "evidence_dead_lettered": evidence.dead_lettered.len(),
-                    "pending": records.pending.len() + evidence.pending.len(),
-                }),
-            ),
-            _ => log::debug("upload_incomplete", json!({})),
-        }
+        let uploaded = self.upload(reconnected, usize::MAX).await;
+        let _ = self.db.prune_authorizations();
+        let na_keys = lock(&self.shared).na_keys.clone();
         let mut holders = self.holders.lock().await;
-        let outbox = SqliteRecordOutbox(self.db.clone());
+        let outbox = SqliteRecordOutbox::new(self.db.clone());
         for holder in holders.map.values_mut() {
             let _ = holder.count_quarantined(&outbox).await;
-            if !holder.revoked() && holder.state().ended.is_none() && holder.remaining_uses() > 0 {
+            if reads.is_ok()
+                && !holder.revoked()
+                && holder.state().ended.is_none()
+                && holder.remaining_uses() > 0
+            {
                 if let Err(err) = holder.refresh_time_token(&client.grants).await {
                     log::debug(
                         "time_token_not_refreshed",
@@ -839,13 +927,94 @@ impl Agent {
             self.save_holder(holder);
         }
         drop(holders);
-        uploads?;
-        pending?;
-        Ok(())
+        if reads.is_ok() {
+            if let Ok(node_state) = &reads {
+                let feed = lock(&self.shared).snapshot["revocation_feed"].clone();
+                self.sync_grants(&client, node_state, &feed, &na_keys).await;
+            }
+        }
+        reads.map(drop)?;
+        uploaded
     }
 
-    /// Holders for new grants (with a first time token), the resource prefix
-    /// and the revocation feed for every holder.
+    /// The reads of a sync, verified, into the snapshot. Returns the node
+    /// state (the one held when the NA was not asked).
+    async fn read_snapshot(
+        &self,
+        client: &GenesisMeshClient,
+        identity: &NodeIdentity,
+        state: AgentState,
+    ) -> Result<Value, GenesisMeshError> {
+        let transport = self.transport()?;
+        let read = |result: Result<Value, GenesisMeshError>, event: &str| {
+            self.observe(event, result.as_ref().map(drop));
+            result
+        };
+        let key_history = read(
+            transport.public_get("/na/key-history").await,
+            "key_history_failed",
+        )?;
+        let Some(na_keys) = self.keys_of(&key_history) else {
+            log::error("key_history_unverified", json!({}));
+            return Err(GenesisMeshError::Verification(
+                "the NA's key history does not verify".into(),
+            ));
+        };
+        let crl = read(transport.public_get("/crl").await, "crl_failed")?;
+        let feed = read(client.grants.revocation_feed().await, "feed_failed")?;
+        if !verify_crl(&crl, &na_keys) {
+            log::error("crl_unverified", json!({}));
+            return Err(GenesisMeshError::Verification(
+                "the CRL does not verify".into(),
+            ));
+        }
+        if crl_names(&crl, identity.cert_id()) {
+            self.mark_revoked("certificate_in_crl");
+            return Ok(Value::Null);
+        }
+        let mut node_state = Value::Null;
+        if state == AgentState::Active {
+            let answer = read(client.node.state(identity).await, "node_state_failed");
+            match answer {
+                Ok(answer) => {
+                    // An executor key retired another way than by revoking
+                    // the node: its records would be refused.
+                    if decision::executor_key_retired(&answer) {
+                        self.mark_revoked("executor_key_retired");
+                        return Ok(Value::Null);
+                    }
+                    node_state = answer;
+                }
+                Err(err) if revoked_code(&err) => return Ok(Value::Null),
+                Err(err) => return Err(err),
+            }
+        }
+        if !node_state.is_null() {
+            node_state["attestations"] =
+                Value::Array(verified_attestations(&node_state, &na_keys, identity));
+        }
+        let mut shared = lock(&self.shared);
+        shared.na_keys = na_keys;
+        if node_state.is_null() {
+            node_state = shared.snapshot["node_state"].clone();
+        }
+        shared.snapshot = json!({
+            "key_history": key_history,
+            "crl": crl,
+            "revocation_feed": feed,
+            "node_state": node_state,
+            "synced_at": timestamp(Utc::now()),
+        });
+        if let Err(err) = self.dir.write_json(SNAPSHOT, &shared.snapshot) {
+            log::error("snapshot_not_saved", json!({"error": err.to_string()}));
+        }
+        Ok(node_state)
+    }
+
+    /// Holders for new grants: rebuilt from the uses the agent made of the
+    /// grant when it made any (never from use 0 again), with a time token
+    /// naming the newest; the resource prefix and the revocation feed for
+    /// every holder.
     async fn sync_grants(
         &self,
         client: &GenesisMeshClient,
@@ -859,13 +1028,8 @@ impl Agent {
         let prefix = node_state["executor_key"]["resource_prefix"]
             .as_str()
             .map(str::to_owned)
-            .or_else(|| {
-                lock(&self.shared)
-                    .enrollment
-                    .as_ref()
-                    .and_then(|e| e["executor_key"]["resource_prefix"].as_str())
-                    .map(str::to_owned)
-            });
+            .or_else(|| self.resource_prefix());
+        let uses = self.db.grant_uses().unwrap_or_default();
         let mut holders = self.holders.lock().await;
         for grant in node_state["grants"].as_array().into_iter().flatten() {
             let Some(grant_id) = grant["grant_id"].as_str() else {
@@ -874,7 +1038,20 @@ impl Agent {
             if holders.map.contains_key(grant_id) || holders.out.as_deref() == Some(grant_id) {
                 continue;
             }
-            let request = match recorder.sign_time_token_request(grant_id, 0, None, None) {
+            let mut state: GrantHolderState = match serde_json::from_value(json!({
+                "grant": grant, "time_token": {}, "uses": 0, "head_digest": null,
+                "head_executed_at": null, "feed": null, "ended": null,
+            })) {
+                Ok(state) => state,
+                Err(_) => continue,
+            };
+            self.advance(grant_id, &mut state, &uses);
+            let request = match recorder.sign_time_token_request(
+                grant_id,
+                state.uses,
+                state.head_digest.as_deref(),
+                None,
+            ) {
                 Ok(request) => request,
                 Err(err) => {
                     log::error(
@@ -894,11 +1071,12 @@ impl Agent {
                     continue;
                 }
             };
-            match GrantHolder::new(grant.clone(), token, recorder.clone(), na_keys.to_vec()) {
+            state.time_token = token;
+            match GrantHolder::restore(state, recorder.clone(), na_keys.to_vec()) {
                 Ok(holder) => {
                     log::info(
                         "grant_held",
-                        json!({"grant_id": grant_id, "capabilities": grant["capabilities"]}),
+                        json!({"grant_id": grant_id, "capabilities": grant["capabilities"], "uses": holder.uses()}),
                     );
                     holders.map.insert(grant_id.to_owned(), holder);
                 }
@@ -928,6 +1106,7 @@ impl Agent {
         let mut next_sync = tokio::time::Instant::now();
         let mut retry = self.config.retry_interval;
         let mut was_connected = false;
+        let mut reconnected = true;
         loop {
             let now = tokio::time::Instant::now();
             if now >= next_heartbeat {
@@ -935,13 +1114,14 @@ impl Agent {
                 let answered = self.heartbeat().await;
                 next_heartbeat = now + self.config.heartbeat_interval;
                 if answered && !was_connected {
-                    // Reconnected: sync now.
+                    // Reconnected: sync now, past the NA's backoff once.
                     next_sync = now;
+                    reconnected = true;
                 }
                 was_connected = answered;
             }
             if tokio::time::Instant::now() >= next_sync && self.enrolled() {
-                match self.sync().await {
+                match self.sync(reconnected).await {
                     Ok(()) => {
                         retry = self.config.retry_interval;
                         next_sync = tokio::time::Instant::now() + self.config.sync_interval;
@@ -952,6 +1132,7 @@ impl Agent {
                         retry = (retry * 2).min(Duration::from_secs(60)).max(retry);
                     }
                 }
+                reconnected = false;
             }
             let wake = next_heartbeat.min(next_sync);
             tokio::select! {
@@ -970,13 +1151,15 @@ impl Agent {
     pub async fn status(&self) -> Value {
         let state = self.state();
         let (pending, dead) = self.outbox_counts();
-        let fresh = self.snapshot_fresh();
-        let (enrollment, snapshot, last_contact) = {
+        let (fresh, clock_behind) = self.freshness();
+        let (enrollment, snapshot, last_contact, last_answer, last_na_error) = {
             let shared = lock(&self.shared);
             (
                 shared.enrollment.clone().unwrap_or(Value::Null),
                 shared.snapshot.clone(),
                 shared.last_contact,
+                shared.last_answer.clone(),
+                shared.last_na_error.clone(),
             )
         };
         let holders = self.holders.lock().await;
@@ -1006,11 +1189,13 @@ impl Agent {
             "cert_id": enrollment["cert"]["cert_id"],
             "cert_expires_at": enrollment["cert"]["expires_at"],
             "connected": self.connected(),
+            "na_state": decision::na_state(last_answer.as_ref()),
+            "last_na_error": last_na_error,
             "last_na_contact_at": last_contact.map(timestamp),
             "snapshot_synced_at": snapshot["synced_at"],
             "snapshot_age_seconds": self.snapshot_age().map(|age| age.max(0)),
             "snapshot_fresh": fresh,
-            "clock_behind": self.clock_behind(),
+            "clock_behind": clock_behind,
             "grants": grants,
             "pending_uploads": pending,
             "dead_letters": dead,
@@ -1018,9 +1203,13 @@ impl Agent {
         })
     }
 
-    /// `POST /v1/authorize`: decide, and when allowed hand the authority to
-    /// the caller and wait for its outcome.
-    pub async fn authorize(self: &Arc<Self>, request: AuthorizeRequest) -> Result<Value, ApiError> {
+    /// `POST /v1/authorize` from local `client`: decide, and when allowed
+    /// hand the authority to the caller and wait for its outcome.
+    pub async fn authorize(
+        self: &Arc<Self>,
+        request: AuthorizeRequest,
+        client: &str,
+    ) -> Result<Value, ApiError> {
         match self.state() {
             AgentState::Unenrolled => {
                 return Err(ApiError::new(
@@ -1038,12 +1227,7 @@ impl Agent {
             }
             _ => {}
         }
-        let prefix = lock(&self.shared)
-            .enrollment
-            .as_ref()
-            .and_then(|e| e["executor_key"]["resource_prefix"].as_str())
-            .unwrap_or_default()
-            .to_owned();
+        let prefix = self.resource_prefix().unwrap_or_default();
         if prefix.is_empty() || !request.resource_id.starts_with(&prefix) {
             return Err(ApiError::new(
                 400,
@@ -1078,12 +1262,13 @@ impl Agent {
             granted: Mutex::new(Some(granted_tx)),
             outcome: Mutex::new(Some(outcome_rx)),
             report_timeout: self.config.report_timeout,
-            expired: std::sync::atomic::AtomicBool::new(false),
+            expired: AtomicBool::new(false),
         });
         log::info(
             "authorization_requested",
             json!({
                 "authorization_id": id,
+                "client": client,
                 "capability": request.capability,
                 "resource_id": request.resource_id,
                 "resource_action": request.resource_action,
@@ -1093,6 +1278,9 @@ impl Agent {
         let agent = Arc::clone(self);
         let task_link = Arc::clone(&link);
         let mut task = tokio::spawn(async move { agent.decide(request, task_link, permit).await });
+        // If this request goes away before the action is handed over (the
+        // client disconnected), the decision is abandoned: nothing runs.
+        let mut guard = AbortOnDrop(Some(task.abort_handle()));
         let mut granted_rx = granted_rx;
         let (answer, done) = tokio::select! {
             biased;
@@ -1103,16 +1291,16 @@ impl Agent {
             },
             done = &mut task => (None, Some(done)),
         };
+        guard.0 = None;
         if let Some(granted) = answer {
-            let report_by = Utc::now()
-                + chrono::Duration::from_std(self.config.report_timeout)
-                    .unwrap_or(chrono::Duration::MAX);
+            let report_by = Utc::now() + chrono(self.config.report_timeout);
             let _ = self
                 .db
                 .set_authorization(&id, "open", Some(granted.authority), None);
             lock(&self.open).insert(
                 id.clone(),
                 Open {
+                    client: client.to_owned(),
                     outcome: Some(outcome_tx),
                     task,
                     link,
@@ -1189,11 +1377,31 @@ impl Agent {
         lock(&self.open).retain(|_, open| !open.task.is_finished() || open.outcome.is_some());
     }
 
-    /// `POST /v1/authorizations/{id}/outcome`.
-    pub async fn report(&self, id: &str, outcome: Outcome) -> Result<Value, ApiError> {
-        let open = lock(&self.open).remove(id);
+    /// `POST /v1/authorizations/{id}/outcome` from local `client`: only the
+    /// client that asked may report.
+    pub async fn report(
+        &self,
+        id: &str,
+        client: &str,
+        outcome: Outcome,
+    ) -> Result<Value, ApiError> {
+        let open = {
+            let mut open = lock(&self.open);
+            match open.get(id) {
+                Some(held) if held.client != client => None,
+                Some(_) => open.remove(id),
+                None => None,
+            }
+        };
         let Some(mut open) = open else {
             return Err(match self.authorization_state(id).as_deref() {
+                _ if lock(&self.open).contains_key(id) => {
+                    log::warn(
+                        "outcome_refused",
+                        json!({"authorization_id": id, "client": client}),
+                    );
+                    ApiError::new(404, "authorization_not_found", "no such authorization")
+                }
                 Some("reported") => {
                     ApiError::new(409, "outcome_already_reported", "the outcome was reported")
                 }
@@ -1261,19 +1469,20 @@ impl Agent {
         self.db.authorization_state(id).ok().flatten()
     }
 
-    /// On SIGTERM: wait up to `wait` for the open authorization, then record
-    /// it as not reported (a failure).
+    /// On SIGTERM: take no new authorization (the slot closes first, so a
+    /// queued request is refused, never decided), wait up to `wait` for the
+    /// open one, then record it as not reported (a failure).
     pub async fn shut_down(&self, wait: Duration) {
-        if tokio::time::timeout(wait, self.slot.acquire())
-            .await
-            .is_ok()
-        {
-            self.slot.close();
-            return;
-        }
         self.slot.close();
+        let start = tokio::time::Instant::now();
+        while self.slot.available_permits() == 0 && start.elapsed() < wait {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let open: Vec<(String, Open)> = lock(&self.open).drain().collect();
         for (id, mut open) in open {
+            if open.task.is_finished() {
+                continue;
+            }
             if let Some(sender) = open.outcome.take() {
                 let _ = sender.send(Outcome {
                     outcome: "failure".into(),
@@ -1304,18 +1513,18 @@ impl Agent {
         let Some((client, _)) = self.node() else {
             return Finished::Failed("not enrolled".into());
         };
-        let (recorder, na_keys, attestations) = {
+        let (recorder, na_keys, node_state) = {
             let shared = lock(&self.shared);
             (
                 shared.recorder.clone(),
                 shared.na_keys.clone(),
-                shared.snapshot["node_state"]["attestations"].clone(),
+                shared.snapshot["node_state"].clone(),
             )
         };
         let Some(recorder) = recorder else {
             return Finished::Failed("not enrolled".into());
         };
-        let attestation = match self.attestation(&request, &attestations) {
+        let attestation = match self.attestation(&request, &node_state["attestations"]) {
             Ok(attestation) => attestation,
             Err(refused) => return refused,
         };
@@ -1344,87 +1553,127 @@ impl Agent {
             verify: verify.clone(),
         };
 
-        // 1. Connected: the NA decides. Only a request that got no answer
-        // (no connection, a timeout) goes on; any answer of the NA, a 429 or
-        // a 5xx included, is final.
-        let mut unanswered = None;
+        // 1. Connected: the NA decides. Its refusal is final; when it
+        // throttles or fails, grants may still act; when it does not answer
+        // (or a proxy answers for it), grants then break-glass.
+        let mut asked = None;
         if state == AgentState::Active && self.connected() {
             if let Some(evaluate) = &evaluate {
                 match self
                     .ask(&client, &recorder, params(evaluate.clone()), &link)
                     .await
                 {
-                    Asked::Done(finished) => return finished,
-                    Asked::Unanswered(failure) => unanswered = Some(failure),
+                    Ok(finished) => return finished,
+                    Err(answer) => asked = Some(answer),
                 }
             }
         }
 
-        // 2. Grants. A request a held grant names but does not cover is
-        // refused, fresh snapshot or not; a covered one is acted on only
-        // while the snapshot is fresh.
-        let fresh = self.snapshot_fresh();
-        let grant_code = match self.choose_holder(&request, fresh).await {
-            Choice::Use(holder) => match self.act(&client, holder, &request, &link).await {
-                Ok(finished) => return finished,
-                Err(code) => code,
-            },
-            Choice::Outside(code) => return refused("outside_grant", json!({"grant_code": code})),
-            Choice::Covered | Choice::Ended(_) if !fresh => "snapshot_stale".to_owned(),
-            Choice::Ended(code) => code,
-            Choice::Covered | Choice::None => "no_grant".to_owned(),
+        // 2. Grants. A request a grant names but does not cover is refused,
+        // fresh snapshot or not; a covered one is acted on only while the
+        // snapshot is fresh.
+        let (fresh, clock_behind) = self.freshness();
+        let choice = self
+            .choose_holder(&request, &node_state, clock_behind)
+            .await;
+        if let (true, GrantChoice::Use(_)) = (fresh, &choice) {
+            if let Some(holder) = self.take_holder(&request, clock_behind).await {
+                match self.act(&client, holder, &request, &link).await {
+                    Ok(finished) => return finished,
+                    Err(code) => {
+                        return self
+                            .after_grants(
+                                &client, &recorder, &request, evaluate, asked, state, code, &link,
+                                params,
+                            )
+                            .await
+                    }
+                }
+            }
+        }
+        let Some(grant_code) = decision::grant_code(&choice, fresh) else {
+            let GrantChoice::Outside(code) = choice else {
+                unreachable!("only outside_grant has no grant code");
+            };
+            return refused("outside_grant", json!({"grant_code": code}));
         };
-
-        // 3. Break-glass, with a justification, when the NA does not answer.
-        let Some(justification) = request.justification.clone() else {
-            return refused("justification_required", json!({"grant_code": grant_code}));
-        };
-        let Some(evaluate) = evaluate else {
-            return refused("no_attestation", json!({"grant_code": grant_code}));
-        };
-        let failure = match (state, unanswered) {
-            // The NA refuses a node whose certificate has expired: it is not asked.
-            (AgentState::CertificateExpired, _) => EvaluationFailure::NetworkError,
-            (_, Some(failure)) => failure,
-            _ => match self
-                .ask(&client, &recorder, params(evaluate.clone()), &link)
-                .await
-            {
-                Asked::Done(finished) => return finished,
-                Asked::Unanswered(failure) => failure,
-            },
-        };
-        self.break_glass(
-            &client,
-            &recorder,
-            &request,
-            &evaluate,
-            BreakGlass {
-                justification,
-                grant_code,
-                failure,
-            },
-            &link,
+        self.after_grants(
+            &client, &recorder, &request, evaluate, asked, state, grant_code, &link, params,
         )
         .await
     }
 
-    /// Ask the NA to decide (`governed_action` through the node route).
+    /// Steps 3 and 4: refuse, ask the NA, or break the glass.
+    #[allow(clippy::too_many_arguments)]
+    async fn after_grants(
+        &self,
+        client: &GenesisMeshClient,
+        recorder: &ExecutionRecorder,
+        request: &AuthorizeRequest,
+        evaluate: Option<Value>,
+        mut asked: Option<Answer>,
+        state: AgentState,
+        grant_code: String,
+        link: &Arc<Link>,
+        params: impl Fn(Value) -> GovernedActionParams,
+    ) -> Finished {
+        loop {
+            let next = decision::after_grants(
+                asked.as_ref(),
+                &grant_code,
+                request.justification.is_some(),
+                evaluate.is_some(),
+                state == AgentState::CertificateExpired,
+            );
+            match next {
+                Next::Refuse(code, details) => return refused(code, details),
+                Next::BreakGlass(failure) => {
+                    let (Some(evaluate), Some(justification)) =
+                        (evaluate.as_ref(), request.justification.clone())
+                    else {
+                        unreachable!("break-glass needs an attestation and a justification");
+                    };
+                    return self
+                        .break_glass(
+                            client,
+                            recorder,
+                            request,
+                            evaluate,
+                            BreakGlass {
+                                justification,
+                                grant_code,
+                                failure,
+                            },
+                            link,
+                        )
+                        .await;
+                }
+                Next::Ask => {
+                    let evaluate = evaluate.clone().unwrap_or_default();
+                    match self.ask(client, recorder, params(evaluate), link).await {
+                        Ok(finished) => return finished,
+                        // Asked once: the next round refuses or breaks the glass.
+                        Err(answer) => asked = Some(answer),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ask the NA to decide (`governed_action` through the node route):
+    /// `Ok` when it decided or refused for good, `Err` with what its error
+    /// means otherwise.
     async fn ask(
         &self,
         client: &GenesisMeshClient,
         recorder: &ExecutionRecorder,
         params: GovernedActionParams,
         link: &Arc<Link>,
-    ) -> Asked {
+    ) -> Result<Finished, Answer> {
         // Uses and break-glass records still pending go first, so a decision's
-        // evidence follows them in the resource's chain.
-        let _ = client
-            .evidence_store
-            .flush_records(FlushOptions {
-                ignore_backoff: true,
-            })
-            .await;
+        // evidence follows them in the resource's chain (a few pages: the
+        // schedule uploads the rest).
+        let _ = self.upload(false, DECISION_PAGES).await;
         let decided = governed_action(
             &client.boundary,
             &client.evidence_store,
@@ -1444,21 +1693,22 @@ impl Agent {
         .await;
         match decided {
             Ok(result) => {
-                self.contact();
-                Asked::Done(evaluated(result))
+                self.observe("decision", Ok(()));
+                Ok(evaluated(result))
             }
-            Err(err) => match unanswered(&err) {
-                Some(failure) => {
-                    log::info("na_unreachable", json!({"failure": failure.as_str()}));
-                    Asked::Unanswered(failure)
-                }
-                None => {
-                    if answered(&err) {
-                        self.contact();
+            Err(err) => {
+                self.observe("evaluate_failed", Err(&err));
+                match decision::classify(&err) {
+                    Answer::Refused => Ok(self.decision_error(err)),
+                    answer => {
+                        log::info(
+                            "na_not_deciding",
+                            json!({"code": err.code(), "status": decision::status_of(&err)}),
+                        );
+                        Err(answer)
                     }
-                    Asked::Done(self.decision_error(err))
                 }
-            },
+            }
         }
     }
 
@@ -1532,62 +1782,99 @@ impl Agent {
             GenesisMeshError::EvidenceNotKept { .. }
             | GenesisMeshError::ActionFailed { .. }
             | GenesisMeshError::ActionUnrecorded { .. } => Finished::Failed(err.to_string()),
-            _ => refused("na_refused", json!({"na_code": err.code()})),
+            _ => refused(
+                "na_refused",
+                json!({"na_code": err.code(), "na_status": decision::status_of(&err)}),
+            ),
         }
     }
 
-    /// The holder to use for a request, soonest `valid_until` first.
-    async fn choose_holder(&self, request: &AuthorizeRequest, take: bool) -> Choice {
-        let mut holders = self.holders.lock().await;
+    /// The candidates for a request, soonest end first: every held grant,
+    /// and every grant the node state lists without a holder (by its
+    /// capabilities and envelope only).
+    fn candidates<'a>(
+        holders: &'a Holders,
+        request: &AuthorizeRequest,
+        node_state: &Value,
+    ) -> Vec<(Option<&'a String>, Candidate)> {
         let now = Utc::now();
-        let mut ordered: Vec<(&String, &GrantHolder)> = holders.map.iter().collect();
-        ordered.sort_by_key(|(_, h)| micros(&h.grant()["valid_until"]).unwrap_or(i64::MAX));
-        let mut ended: Option<String> = None;
-        let mut outside: Option<String> = None;
-        let mut usable: Option<String> = None;
-        for (id, holder) in ordered {
-            match holder.check(
-                &request.capability,
-                &request.request_parameters,
-                Some(&request.resource_id),
-                now,
-            ) {
-                None => {
-                    usable = Some(id.clone());
-                    break;
-                }
-                // Spent tokens: the holder asks for a fresh one when it can.
-                Some(check) if check.code == "grant_time_token_exhausted" => {
-                    if usable.is_none() && ended.is_none() {
-                        usable = Some(id.clone());
-                    }
-                }
-                Some(check) if check.code == "grant_capability_mismatch" => {}
-                Some(check) if check.ends_use() => {
-                    ended.get_or_insert(check.code);
-                }
-                Some(check) => {
-                    outside.get_or_insert(check.code);
-                }
+        let mut ordered: Vec<(i64, Option<&String>, Candidate)> = holders
+            .map
+            .iter()
+            .map(|(id, holder)| {
+                let code = holder
+                    .check(
+                        &request.capability,
+                        &request.request_parameters,
+                        Some(&request.resource_id),
+                        now,
+                    )
+                    .map(|check| check.code);
+                (
+                    micros(&holder.grant()["valid_until"]).unwrap_or(i64::MAX),
+                    Some(id),
+                    Candidate { held: true, code },
+                )
+            })
+            .collect();
+        for grant in node_state["grants"].as_array().into_iter().flatten() {
+            let id = grant["grant_id"].as_str().unwrap_or_default();
+            if holders.map.contains_key(id) || holders.out.as_deref() == Some(id) {
+                continue;
             }
+            let named = grant["capabilities"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|c| c == request.capability.as_str()));
+            let code = if !named {
+                Some("grant_capability_mismatch".to_owned())
+            } else {
+                envelope_problem(&grant["parameter_envelope"], &request.request_parameters)
+                    .map(|_| "grant_envelope_mismatch".to_owned())
+            };
+            ordered.push((
+                micros(&grant["valid_until"]).unwrap_or(i64::MAX),
+                None,
+                Candidate { held: false, code },
+            ));
         }
-        if let Some(id) = usable {
-            if !take {
-                return Choice::Covered;
-            }
-            let holder = holders.map.remove(&id).expect("held");
-            holders.out = Some(id);
-            return Choice::Use(Box::new(holder));
-        }
-        match (ended, outside) {
-            (Some(code), _) => Choice::Ended(code),
-            (None, Some(code)) => Choice::Outside(code),
-            (None, None) => Choice::None,
-        }
+        ordered.sort_by_key(|(until, _, _)| *until);
+        ordered.into_iter().map(|(_, id, c)| (id, c)).collect()
+    }
+
+    /// Which grant decides the request (`decision::choose`).
+    async fn choose_holder(
+        &self,
+        request: &AuthorizeRequest,
+        node_state: &Value,
+        clock_behind: bool,
+    ) -> GrantChoice {
+        let holders = self.holders.lock().await;
+        let candidates = Self::candidates(&holders, request, node_state);
+        let plain: Vec<Candidate> = candidates.into_iter().map(|(_, c)| c).collect();
+        decision::choose(&plain, clock_behind)
+    }
+
+    /// Take the holder `decision::choose` picks out of the map while it acts.
+    async fn take_holder(
+        &self,
+        request: &AuthorizeRequest,
+        clock_behind: bool,
+    ) -> Option<Box<GrantHolder>> {
+        let node_state = lock(&self.shared).snapshot["node_state"].clone();
+        let mut holders = self.holders.lock().await;
+        let candidates = Self::candidates(&holders, request, &node_state);
+        let plain: Vec<Candidate> = candidates.iter().map(|(_, c)| c.clone()).collect();
+        let GrantChoice::Use(index) = decision::choose(&plain, clock_behind) else {
+            return None;
+        };
+        let id = candidates[index].0?.clone();
+        let holder = holders.map.remove(&id)?;
+        holders.out = Some(id);
+        Some(Box::new(holder))
     }
 
     /// Act within a grant; `Err` is the grant code when the grant could not
-    /// be used and no fallback ran.
+    /// be used.
     async fn act(
         &self,
         client: &GenesisMeshClient,
@@ -1733,51 +2020,6 @@ struct BreakGlass {
     failure: EvaluationFailure,
 }
 
-/// What asking the NA gave.
-enum Asked {
-    /// Its decision (the action ran or did not), or its refusal.
-    Done(Finished),
-    /// No answer: the NA could not be reached or did not answer in time.
-    Unanswered(EvaluationFailure),
-}
-
-/// How a request that got no answer failed: no connection or a timeout.
-/// Anything the NA answered (a `429`, a `5xx`, a refusal) is not this.
-fn unanswered(err: &GenesisMeshError) -> Option<EvaluationFailure> {
-    match err {
-        GenesisMeshError::Network(_) => evaluation_failure(err),
-        _ => None,
-    }
-}
-
-/// Whether the NA answered (with an HTTP status).
-fn answered(err: &GenesisMeshError) -> bool {
-    matches!(
-        err,
-        GenesisMeshError::BadRequest { .. }
-            | GenesisMeshError::Unauthorized { .. }
-            | GenesisMeshError::NotFound { .. }
-            | GenesisMeshError::Validation { .. }
-            | GenesisMeshError::RateLimit { .. }
-            | GenesisMeshError::Http { .. }
-            | GenesisMeshError::ResponseBodyUnreadable { .. }
-    )
-}
-
-/// What the decision order does with the grants.
-enum Choice {
-    /// Act within this holder's grant.
-    Use(Box<GrantHolder>),
-    /// A grant names the capability but does not cover the request.
-    Outside(String),
-    /// A grant covers the request (not taken: the snapshot is stale).
-    Covered,
-    /// A covering grant can no longer be used.
-    Ended(String),
-    /// No grant names the capability.
-    None,
-}
-
 fn refused(code: &str, details: Value) -> Finished {
     Finished::Refused {
         code: code.to_owned(),
@@ -1788,7 +2030,7 @@ fn refused(code: &str, details: Value) -> Finished {
 fn refusal_detail(code: &str) -> &'static str {
     match code {
         "na_denied" => "the NA decided DENY",
-        "na_refused" => "the NA refused the request",
+        "na_refused" => "the NA refused the request, or is throttling or failing",
         "decision_unverifiable" => "the NA's decision did not verify",
         "outside_grant" => "a grant names the capability but does not cover this request",
         "justification_required" => "no grant can be used; break-glass needs a justification",
@@ -1821,9 +2063,14 @@ fn evaluated<T>(result: genesis_mesh_sdk::GovernedActionResult<T>) -> Finished {
 
 /// The SDK's action: hand the authority to the caller, then wait for the
 /// outcome it reports; one not reported in time is recorded as a failure.
+/// When the caller is gone before the authority reaches it, nothing runs:
+/// the action never returns, and the abandoned decision task is aborted
+/// before anything is signed.
 async fn action(link: Arc<Link>, granted: Granted) -> Result<ActionReport<()>, ActionError> {
-    if let Some(sender) = lock(&link.granted).take() {
-        let _ = sender.send(granted);
+    let sender = lock(&link.granted).take();
+    if sender.is_none_or(|sender| sender.send(granted).is_err()) {
+        log::warn("authorization_abandoned", json!({}));
+        std::future::pending::<()>().await;
     }
     let receiver = lock(&link.outcome).take();
     let reported = match receiver {
@@ -1969,5 +2216,29 @@ fn unreachable_or_refused(err: &GenesisMeshError, doing: &str) -> Exit {
         Exit::Unreachable(format!("the NA could not be reached while {doing}: {err}"))
     } else {
         Exit::Refused(format!("the NA refused the enrolment while {doing}: {err}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_closed_slot_decides_no_queued_request() {
+        // shut_down closes the slot first: the request queued behind the
+        // open authorization is refused, never handed the permit.
+        let slot = Arc::new(Semaphore::new(1));
+        let open = Arc::clone(&slot).acquire_owned().await.unwrap();
+        let queued = tokio::spawn({
+            let slot = Arc::clone(&slot);
+            async move { slot.acquire_owned().await.is_ok() }
+        });
+        tokio::task::yield_now().await;
+        slot.close();
+        assert!(!queued.await.unwrap(), "a queued request got the slot");
+        assert_eq!(slot.available_permits(), 0);
+        drop(open);
+        // The open authorization's end is still seen while stopping.
+        assert_eq!(slot.available_permits(), 1);
     }
 }
