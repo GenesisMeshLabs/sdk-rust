@@ -15,6 +15,11 @@ genesis-mesh-sdk = { git = "https://github.com/GenesisMeshLabs/sdk-rust" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
+The default feature `client` is the HTTP client. Without it
+(`default-features = false`, 1.7.0) the crate is its offline modules only:
+verification, canonical forms, signing, the outboxes, the grant rules, audit
+packs and node request signatures, with no HTTP, async or TLS dependency.
+
 ## Quick start: read the active policy
 
 This public route requires a running Network Authority with an active data usage
@@ -715,6 +720,42 @@ gains *Grants* and *Grant revocations* sections when it holds them. Turn grants 
 every verifier that reads your exports, packs and feed runs 1.6: a 1.5
 verifier refuses the new kinds and the feed's field.
 
+## Edge nodes
+
+*Unreleased.*
+
+From Genesis Mesh 1.7.0 (beta) a device enrolled with an edge invite acts
+with its own node key instead of an operator key. `node_auth` signs node
+requests as the NA verifies them (`node_signing_payload`,
+`sign_node_request`, the executor key's proof of possession at `/join`,
+`executor_key_id`); `verify::verify_join_certificate` and
+`verify::verify_crl` verify what the NA signs for nodes; `client.node`
+(`NodeClient`) joins, heartbeats, renews and reads the node's state.
+`GenesisMeshClient::with_node_identity` makes `governed_action`, break-glass
+and the grant holder work on the device: decisions come from
+`POST /node/boundary/evaluate` and resource heads from
+`POST /node/evidence/resource-head`, both signed by the node key. A device
+holds no policies, so it verifies decisions with
+`GovernedVerification { any_bound_policies: true, .. }`.
+
+```no_run
+use genesis_mesh_sdk::{ClientOptions, GenesisMeshClient, NodeIdentity};
+
+# fn main() -> genesis_mesh_sdk::Result<()> {
+let node = NodeIdentity::new("cert-id", "BASE64_NODE_SEED", "NA_PUBLIC_KEY")?;
+let client = GenesisMeshClient::new(ClientOptions::new("https://na.example.org"))?
+    .with_node_identity(node);
+# let _ = client;
+# Ok(())
+# }
+```
+
+`genesis-mesh-edge`, the edge agent built on this crate, does all of this
+for a device: enrolment, renewal, heartbeats, the trust snapshot, grants
+offline, break-glass and ordered uploads, behind a local API. It is released
+with the crate as static Linux binaries and a container image; see
+[docs/edge.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/docs/edge.md).
+
 ## Independent verification
 
 From Genesis Mesh 1.5.0 an auditor verifies records, evidence exports and
@@ -837,12 +878,18 @@ cargo doc --locked --workspace --no-deps
 cargo package --locked
 ```
 
-The workspace holds the crate and `genesis-mesh-verify` (`verifier/`, not
-published to crates.io). CI tests stable Rust on Linux, Windows, and macOS plus
+The workspace holds the crate, `genesis-mesh-verify` (`verifier/`) and
+`genesis-mesh-edge` (`edge/`), neither published to crates.io; the edge
+agent's tests and builds are Unix only. `cargo test --locked -p
+genesis-mesh-sdk --no-default-features` checks the crate without its HTTP
+client. CI tests stable Rust on Linux, Windows, and macOS plus
 Rust 1.85 on Linux, checks release metadata and packaging, and audits
 dependencies with `cargo audit`. The `Verifier` workflow builds the static
 binaries twice and compares them, checks they need no shared library, and runs
-the verifier's tests against them without a network.
+the verifier's tests against them without a network. The `Edge agent`
+workflow builds the agent's static binaries, checks their size and the
+agent's memory over a scenario with the NA stopped against the core, and on a
+tag signs and attaches them and publishes the image.
 See [CONTRIBUTING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/CONTRIBUTING.md), [RELEASING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/RELEASING.md), and
 [SECURITY.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/SECURITY.md).
 

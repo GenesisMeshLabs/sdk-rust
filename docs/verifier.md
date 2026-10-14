@@ -26,9 +26,9 @@ value. This is enforced, not only intended:
   `-D warnings`.
 - A test refuses any mention of an HTTP or network crate, a socket, a signing
   key, or an `allow` of those clippy rules in the binary's sources.
-- The released binary is checked to link no HTTP or network crate (the SDK's
-  HTTP client is a dependency of the library, never called by the binary,
-  and left out at link time).
+- The verifier depends on the SDK without its `client` feature (1.7.0), so
+  no HTTP, async or TLS crate is even compiled into it (CI checks its
+  dependency tree), and the released binary is checked to link none.
 - CI runs the verifier's tests against each released binary inside a network
   namespace with no network.
 
