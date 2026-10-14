@@ -624,10 +624,12 @@ stands, one at or after it is refused.
 
 A `GrantHolder` holds one grant for the device whose `ExecutionRecorder`
 signs with the bearer key. `act` checks each use offline, in the NA's order:
-the capability, the envelope (`grants::envelope_problem`: closed, numbers
-compared exactly, booleans never numbers, `true` is not `1`), revocation (the
-feed the holder last read), the validity, the budget, and the uses its latest
-time token may still anchor. It then runs the action, signs a
+the bearer key's resource prefix (`set_resource_prefix`, when the key was
+registered with one), the capability, the envelope
+(`grants::envelope_problem`: closed, numbers compared exactly, booleans never
+numbers, `true` is not `1`), revocation (the feed the holder last read), the
+validity, the budget, and at most `max_uses_per_time_token` uses after the
+use its latest time token names. It then runs the action, signs a
 `GrantExecutionEvidence` chained to the previous use and citing the time
 token, keeps it in the record outbox and submits it:
 
@@ -657,9 +659,9 @@ async fn rotate(gm: &GenesisMeshClient, holder: &mut GrantHolder, na_key: String
 }
 ```
 
-A request the grant does not cover (`grant_capability_mismatch`,
-`grant_envelope_mismatch`), a grant not valid yet, and secret material in the
-parameters are refused before anything runs (`GrantRefused`,
+A request the grant does not cover (`grant_use_out_of_scope`,
+`grant_capability_mismatch`, `grant_envelope_mismatch`), a grant not valid
+yet, and secret material in the parameters are refused before anything runs (`GrantRefused`,
 `OutOfBandRecord` with `grant_use_secret_material`). A use is dated no
 earlier than its time token and the previous use. Metadata the secret guard
 refuses after the action ran is left out of the use and named in `dropped`;
@@ -674,10 +676,15 @@ On reconnecting, `holder.sync` reads and verifies the revocation feed
 (`revoked_grant_ids`), uploads the record outbox (the grant's uses one at a
 time in their chain's order, before observations; the NA gives each use the
 next position of its resource's chain) and asks for a new time token naming
-the head of the holder's chain. A use behind one the NA refused for good is a
-dead letter (`evidence_predecessor_dead_lettered`); the NA's final refusals
-are `GRANT_USE_PERMANENT_REFUSALS`. Execution evidence made online afterwards
-links to the last use, which the NA's resource head names.
+the head of the holder's chain. A use the NA refuses for good is a dead letter
+(`GRANT_USE_PERMANENT_REFUSALS`); the NA keeps it as a quarantine entry, and
+when it continues the chain it still takes its place in it, so the holder's
+later uses are submitted and judged on their own. An earlier use not uploaded
+yet (`grant_use_chain_gap`) and a use dated ahead of the NA's clock
+(`grant_use_in_future`) are retried. Execution evidence made online
+afterwards links to the last use, which the NA's resource head names
+(`resource_head_entry`). `grants.uses` lists a grant's use chain, each use
+admitted or quarantined, and `grants.get` its `chain_length`.
 
 When the grant has ended, its budget or its time token is spent (and no new
 one came), it is revoked or its bearer key is retired, `act` falls back with
@@ -693,15 +700,18 @@ an agreement needs `GrantFallback::evaluate`.
 `verify_evidence_events`, `verify_record` and `verify_audit_pack` check the
 three new entry kinds (`grant`, `grant_execution`, `grant_revocation`) and a
 time token: each record's signature (a use by its grant's bearer key, its
-time token by the NA), the store's grant rules (`grant_missing`,
-`grant_bearer_mismatch`, `grant_mismatch`, `grant_use_chain_break`,
-`duplicate_grant_revocation`; in a pack a missing grant is
-`cited_record_missing`), then the use rules with the NA's codes
+time token by the NA), the store's grant rules (`grant_use_chain_break`, a
+quarantined use that continues the chain being its head; `grant_missing`,
+also for a grant whose signature fails; `grant_bearer_mismatch`,
+`grant_use_out_of_scope`, `grant_mismatch`, `duplicate_grant_revocation`,
+`duplicate_record` for a `use_id` another record holds; in a pack a missing
+grant is `cited_record_missing`), then the use rules with the NA's codes
 (`grants::use_problem`), the resource position the NA assigned
 (`resource_chain_break`, `envelope_mismatch`), a judgement `governed_by:
 grant`, a quarantined use, and the revocation feed's `revoked_grant_ids`
-(`verify::verify_revocation_feed`). An audit pack's report gains *Grants* and
-*Grant revocations* sections when it holds them. Turn grants on only once
+(`verify::verify_revocation_feed`). An audit pack checks a grant's basis (its
+attestation, or the agreement in `trust/agreements.jsonl`), and its report
+gains *Grants* and *Grant revocations* sections when it holds them. Turn grants on only once
 every verifier that reads your exports, packs and feed runs 1.6: a 1.5
 verifier refuses the new kinds and the feed's field.
 

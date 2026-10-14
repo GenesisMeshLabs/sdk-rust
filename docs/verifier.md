@@ -305,19 +305,21 @@ observation chains; judgements, matches, remediations and reviews against
 what they cite; retention checkpoints. The reason codes are the reference's
 (`verify_evidence_events`).
 
-Pre-issued grants (1.6.0): a grant use and a grant revocation name a grant the
-export holds from its start (`grant_missing`) with its digest
-(`grant_mismatch`); a use is signed by the grant's bearer key
-(`grant_bearer_mismatch`), takes its place in the grant's use chain
-(`grant_use_chain_break`) and the position the NA gave it in its resource's
-chain (`resource_chain_break`; a position without a resource is
-`envelope_mismatch`), and is checked by the use rules with the NA's codes, in
-its order (`grant_capability_mismatch`, `grant_envelope_mismatch`,
-`grant_budget_exhausted`, the time token's `grant_time_token_*`, the times'
-`grant_use_*` and `grant_revoked`); a grant is revoked once
-(`duplicate_grant_revocation`). A judgement may match a use (`governed_by:
-grant`) and a quarantine entry may hold a refused one. The readable output
-counts grants, uses and revocations.
+Pre-issued grants (1.6.0): a grant use and a grant revocation name an
+authentic grant the export holds from its start (`grant_missing`) with its
+digest (`grant_mismatch`); a use takes its place in the grant's use chain
+(`grant_use_chain_break`; a quarantined use that continued the chain is its
+head), is signed by the grant's bearer key (`grant_bearer_mismatch`), within
+the key's `resource_prefix` (`grant_use_out_of_scope`), at the position the
+NA gave it in its resource's chain (`resource_chain_break`; a position
+without a resource is `envelope_mismatch`), with a `use_id` no execution or
+break-glass record holds (`duplicate_record`), and is checked by the use
+rules with the NA's codes, in its order (`grant_capability_mismatch`,
+`grant_envelope_mismatch`, `grant_budget_exhausted` over the admitted uses,
+the time token's `grant_time_token_*`, the times' `grant_use_*` and
+`grant_revoked`); a grant is revoked once (`duplicate_grant_revocation`). A
+judgement may match a use (`governed_by: grant`) and a quarantine entry may
+hold a refused one. The readable output counts grants, uses and revocations.
 
 With `--known-anchors` the export is also checked against anchors held
 outside the NA: the anchors' signatures, chain and positions
@@ -355,7 +357,11 @@ outside the NA: the anchors' signatures, chain and positions
    `treaty_invalid_signature`, `attestation_invalid_signature`,
    `feed_invalid_signature`, `cited_policy_missing`, `cited_policy_mismatch`,
    `cited_attestation_missing`, `cited_attestation_mismatch`; 1.6.0: a
-   grant's policy binding and its basis attestation, as a decision's);
+   grant's policy binding and its basis, an attestation as a decision's, or
+   an agreement in the optional `trust/agreements.jsonl`, the one the grant
+   names, between its parties and signed by both with keys the pack vouches
+   for: `cited_agreement_missing`, `cited_agreement_mismatch`,
+   `agreement_invalid_signature`);
 6. the report (`report_mismatch`; 1.6.0: with *Grants* and *Grant
    revocations* sections when the pack holds them, a grant use listed as a
    change `governed_by: grant`);
