@@ -33,8 +33,8 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       # The SDK, genesis-mesh-verify (verifier/) and genesis-mesh-edge (edge/,
-      # 1.7.0: Unix only; its live scenarios run in edge.yml).
-      - run: cargo test --locked --workspace --all-targets ${{ runner.os == 'Windows' && '--exclude genesis-mesh-edge' || '' }}
+      # 1.7.0: Unix only, Rust 1.89 or newer; its live scenarios run in edge.yml).
+      - run: cargo test --locked --workspace --all-targets ${{ (runner.os == 'Windows' || matrix.rust == '1.85.0') && '--exclude genesis-mesh-edge' || '' }}
       - run: cargo test --locked --doc
 
   # 1.7.0: the SDK without its default `client` feature is the offline

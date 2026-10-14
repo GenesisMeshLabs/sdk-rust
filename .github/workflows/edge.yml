@@ -120,12 +120,31 @@ jobs:
           if [ "$rss" -gt "$budget" ]; then
             echo "::error::the agent's maximum RSS was $rss KiB, over its budget of $budget"; exit 1
           fi
-      - name: The other scenarios, with the static binary (C1, C2, C4; a blackholed network, a throttling NA, a stale snapshot)
+      - name: A backlog of 2000 records, measured
+        env:
+          GM_E2E_PYTHON: python
+          GM_EDGE_BACKLOG: "2000"
+        run: |
+          set -eu
+          export GM_EDGE_BINARY="$BINARY"
+          export GM_EDGE_WRAP="/usr/bin/time -v -o $RUNNER_TEMP/backlog-time.txt"
+          cargo test --locked -p genesis-mesh-edge --test scenario -- --nocapture --exact backlog
+          rss="$(sed -n 's/^[[:space:]]*Maximum resident set size (kbytes): //p' "$RUNNER_TEMP/backlog-time.txt")"
+          budget="$(jq -r --arg t "$TARGET" '.[$t].max_rss_kib' edge/footprint-budgets.json)"
+          echo "maximum RSS with a backlog of $GM_EDGE_BACKLOG records: $rss KiB (budget $budget)"
+          jq --argjson rss "$rss" --argjson records "$GM_EDGE_BACKLOG" \
+            '. + {backlog_records: $records, backlog_max_rss_kib: $rss}' "footprint-$TARGET.json" > footprint.tmp
+          mv footprint.tmp "footprint-$TARGET.json"
+          cat "footprint-$TARGET.json"
+          if [ "$rss" -gt "$budget" ]; then
+            echo "::error::the agent's maximum RSS with a backlog was $rss KiB, over its budget of $budget"; exit 1
+          fi
+      - name: The other scenarios, with the static binary (C1, C2, C4; a proxy's 502, a blackholed network, a throttling NA, a stale snapshot, a disconnected client, the local API under load)
         env:
           GM_E2E_PYTHON: python
         run: |
           export GM_EDGE_BINARY="$BINARY"
-          cargo test --locked -p genesis-mesh-edge --test scenario -- --nocapture --skip offline
+          cargo test --locked -p genesis-mesh-edge --test scenario -- --nocapture --skip offline --skip backlog
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: edge-${{ matrix.target }}
@@ -203,7 +222,9 @@ jobs:
           cp dist/genesis-mesh-edge-"$version"-aarch64-unknown-linux-musl image/genesis-mesh-edge-arm64
           chmod 0755 image/genesis-mesh-edge-*
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker buildx create --use --name edge
+          # BuildKit pinned by digest: the job holds packages: write and id-token: write.
+          docker buildx create --use --name edge \
+            --driver-opt image=moby/buildkit:v0.34.0@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c
           docker buildx build image --platform linux/amd64,linux/arm64 \
             --build-arg VERSION="$version" --provenance=false \
             --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \

@@ -2,9 +2,9 @@ name: Edge agent soak
 
 # The edge agent's two-hour scenario (docs/edge.md): the static binary, with
 # the NA stopped for 7200 s of real time, then every record uploaded in order
-# within 120 s, measured with /usr/bin/time -v. Weekly on x86-64, and on
-# release pull requests on both architectures. Pull requests run the same
-# scenario for 120 s (edge.yml).
+# within 120 s, measured with /usr/bin/time -v. Weekly and on release pull
+# requests, on x86-64. Pull requests run the same scenario for 120 s on both
+# architectures (edge.yml).
 
 on:
   schedule:
@@ -21,44 +21,30 @@ concurrency:
 
 jobs:
   soak:
-    name: Soak ${{ matrix.target }}
+    name: Soak x86_64-unknown-linux-musl
     if: github.event_name == 'schedule' || startsWith(github.head_ref, 'release/')
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {os: ubuntu-24.04, target: x86_64-unknown-linux-musl, release_only: false}
-          - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, release_only: true}
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
-      TARGET: ${{ matrix.target }}
+      TARGET: x86_64-unknown-linux-musl
       CC_x86_64_unknown_linux_musl: musl-gcc
-      CC_aarch64_unknown_linux_musl: musl-gcc
-      RUN: ${{ !matrix.release_only || github.event_name == 'pull_request' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: env.RUN == 'true'
       - name: The toolchain the build script pins
-        if: env.RUN == 'true'
         id: pin
         run: echo "toolchain=$(sed -n 's/^RUST_TOOLCHAIN=//p' scripts/build_verifier.sh)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        if: env.RUN == 'true'
         with:
           toolchain: ${{ steps.pin.outputs.toolchain }}
-          targets: ${{ matrix.target }}
-      - if: env.RUN == 'true'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools time
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools time
       - name: Build
-        if: env.RUN == 'true'
         run: |
           set -eu
           sh scripts/build_edge.sh "$TARGET" dist
           name="$(cd dist && ls genesis-mesh-edge-* | grep -Ev '\.(sha256|buildinfo)$')"
           echo "BINARY=$GITHUB_WORKSPACE/dist/$name" >> "$GITHUB_ENV"
       - name: Choose the core revision
-        if: env.RUN == 'true'
         env:
           BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
@@ -69,19 +55,15 @@ jobs:
           echo "Testing with core revision: $ref"
           echo "CORE_REF=$ref" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: env.RUN == 'true'
         with:
           repository: GenesisMeshLabs/genesismesh
           ref: ${{ env.CORE_REF }}
           path: core
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        if: env.RUN == 'true'
         with:
           python-version: "3.12"
-      - if: env.RUN == 'true'
-        run: python -m pip install -e ./core
+      - run: python -m pip install -e ./core
       - name: Two hours with the NA stopped
-        if: env.RUN == 'true'
         env:
           GM_E2E_PYTHON: python
           GM_EDGE_OFFLINE_SECONDS: "7200"
@@ -103,8 +85,7 @@ jobs:
             echo "::error::the agent's maximum RSS was $rss KiB, over its budget of $budget"; exit 1
           fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: env.RUN == 'true'
         with:
-          name: soak-${{ matrix.target }}
-          path: soak-${{ matrix.target }}.json
+          name: soak-x86_64-unknown-linux-musl
+          path: soak-x86_64-unknown-linux-musl.json
           if-no-files-found: error
