@@ -16,6 +16,8 @@ mod evidence;
 mod evidence_store;
 mod execution;
 mod governance;
+mod grant_client;
+mod grant_holder;
 pub mod grants;
 mod health;
 pub mod key_history;
@@ -58,6 +60,12 @@ pub use governance::{
     rotate_forward_then_disable, urgent_action, EmergencyOptions, RotateForwardParams,
     RotateForwardResult, RotatedVersion, UrgentActionResult, UrgentPath,
 };
+pub use grant_client::{GrantClient, GrantQuery};
+pub use grant_holder::{
+    GrantActionOutcome, GrantAuthority, GrantCheck, GrantFallback, GrantHolder, GrantHolderState,
+    GrantRequest, GrantSync, GrantUseResult,
+};
+pub use grants::GrantUseInput;
 pub use health::HealthClient;
 #[doc(hidden)]
 pub use out_of_band::record_metadata_problem;
@@ -69,8 +77,8 @@ pub use outbox::{
     classify_record_submission_error, classify_submission_error, retry_delay, Delivery,
     EvidenceOutbox, FileOutbox, FileRecordOutbox, FlushReport, MemoryOutbox, MemoryRecordOutbox,
     OutboxEntry, OutboxFuture, OutboxState, RecordDelivery, RecordFlushReport, RecordKind,
-    RecordOutbox, RecordOutboxEntry, SubmissionFailure, PERMANENT_REFUSALS,
-    PREDECESSOR_DEAD_LETTERED, RECORD_PERMANENT_REFUSALS,
+    RecordOutbox, RecordOutboxEntry, SubmissionFailure, GRANT_USE_PERMANENT_REFUSALS,
+    PERMANENT_REFUSALS, PREDECESSOR_DEAD_LETTERED, RECORD_PERMANENT_REFUSALS,
 };
 pub use policy::PolicyClient;
 pub use remediation::{

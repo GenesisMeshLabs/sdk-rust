@@ -627,6 +627,10 @@ impl EvidenceStoreClient {
             RecordKind::Remediation => {
                 ("/evidence/remediations", json!({ "record": entry.record }))
             }
+            RecordKind::GrantExecution => (
+                "/evidence/grant-executions",
+                json!({ "evidence": entry.record }),
+            ),
         };
         self.http.public_post_waiting(path, body).await
     }
@@ -668,7 +672,8 @@ impl EvidenceStoreClient {
     }
 
     /// Keep a signed observation or break-glass record (1.4.0: or remediation
-    /// record) in the record outbox and submit it (v1.3.0). A failed
+    /// record; 1.6.0: or grant use) in the record outbox and submit it
+    /// (v1.3.0). A failed
     /// submission is not an error: a
     /// transient one leaves the record pending for
     /// [`flush_records`](Self::flush_records), and a refusal no retry can
@@ -681,7 +686,8 @@ impl EvidenceStoreClient {
         let fresh = RecordOutboxEntry::new(record);
         if fresh.id.is_empty() {
             return Err(GenesisMeshError::Configuration(
-                "a record needs an observation_id, a break_glass_id or a remediation_id".into(),
+                "a record needs an observation_id, a break_glass_id, a remediation_id or a use_id"
+                    .into(),
             ));
         }
         let entries = outbox.list().await.map_err(outbox_error)?;
@@ -711,7 +717,10 @@ impl EvidenceStoreClient {
     }
 
     /// Submit the record outbox's pending records (v1.3.0): break-glass
-    /// records first, one at a time (1.3.1), then observations, consecutive
+    /// records first, one at a time (1.3.1), then grant uses one at a time in
+    /// the order they were made (1.6.0: their chain's order; a use behind one
+    /// the NA refused for good is a dead letter,
+    /// `evidence_predecessor_dead_lettered`), then observations, consecutive
     /// ones up to 100 per request, then remediation records one at a time
     /// (1.4.0: the changes they remediate are judged by then), each in the
     /// order they were added.
@@ -742,11 +751,14 @@ impl EvidenceStoreClient {
             .into_iter()
             .filter(|e| e.state == OutboxState::Pending)
             .collect();
-        // Stable: each kind keeps the order its records were added in.
+        // Stable: each kind keeps the order its records were added in (a
+        // grant's uses in their chain's order). Grant uses (1.6.0) go before
+        // observations, which the NA matches to them.
         entries.sort_by_key(|e| match e.kind {
             RecordKind::BreakGlass => 0,
-            RecordKind::Observation => 1,
-            RecordKind::Remediation => 2,
+            RecordKind::GrantExecution => 1,
+            RecordKind::Observation => 2,
+            RecordKind::Remediation => 3,
         });
         // A record `enqueue_record` is submitting is left to it, as pending.
         let due = |e: &RecordOutboxEntry| {
@@ -871,6 +883,24 @@ impl EvidenceStoreClient {
                 // resubmits it, gets a duplicate and removes it.
                 let _ = outbox.remove(&entry.id).await;
                 RecordDelivery::admitted(ack)
+            }
+            // 1.6.0: a grant use behind a dead letter of its chain waits for
+            // a use that never comes: final, as an execution record's gap.
+            (Err(err), _)
+                if entry.kind == RecordKind::GrantExecution
+                    && err.code() == "grant_use_chain_gap"
+                    && use_behind_dead_letter(outbox, &entry).await =>
+            {
+                let (failure, _) = classify_record_submission_error(&err);
+                let refused = RecordOutboxEntry {
+                    attempts: entry.attempts + 1,
+                    state: OutboxState::DeadLetter,
+                    next_attempt_at: None,
+                    last_error: Some(predecessor_refused(failure)),
+                    ..entry
+                };
+                let _ = outbox.update(&refused).await;
+                RecordDelivery::queued(refused)
             }
             (Err(err), wait) => {
                 self.pause_records(&err, wait);
@@ -1313,6 +1343,33 @@ async fn record_failed(
     };
     let _ = outbox.update(&next).await;
     next
+}
+
+/// Whether a grant use chains from a dead letter of the record outbox (its
+/// previous use, or one before that), so the NA's chain never reaches it.
+async fn use_behind_dead_letter(outbox: &dyn RecordOutbox, entry: &RecordOutboxEntry) -> bool {
+    let Ok(entries) = outbox.list().await else {
+        return false;
+    };
+    let uses: Vec<&RecordOutboxEntry> = entries
+        .iter()
+        .filter(|e| {
+            e.kind == RecordKind::GrantExecution && e.record["grant_id"] == entry.record["grant_id"]
+        })
+        .collect();
+    let mut link = entry.record["prev_use_digest"].as_str().map(str::to_owned);
+    while let Some(digest) = link {
+        let Some(before) = uses.iter().find(|e| {
+            crate::grants::use_digest(&e.record).ok().as_deref() == Some(digest.as_str())
+        }) else {
+            return false;
+        };
+        if before.state == OutboxState::DeadLetter {
+            return true;
+        }
+        link = before.record["prev_use_digest"].as_str().map(str::to_owned);
+    }
+    false
 }
 
 /// A request larger than the NA (or a proxy before it) takes.

@@ -2185,7 +2185,7 @@ fn fail(result: &mut EvidenceVerification, seq: Option<i64>, reason: &str, detai
 ///   is signed by the grant's bearer key (`grant_bearer_mismatch`), and a
 ///   grant is revoked once (`duplicate_grant_revocation`);
 /// * the uses of a grant form a chain (`grant_use_chain_break`), and each use
-///   is checked by [`use_problem`](crate::grants::use_problem) with what the
+///   is checked by [`use_problem`] with what the
 ///   run holds (envelope, budget, time token, times, revocation; its reason
 ///   codes);
 /// * a use takes the next position of its resource's chain, assigned by the

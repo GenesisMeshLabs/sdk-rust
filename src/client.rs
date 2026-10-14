@@ -18,6 +18,7 @@ use crate::{
     errors::{from_http_error, GenesisMeshError, Result},
     evidence::EvidenceClient,
     evidence_store::EvidenceStoreClient,
+    grant_client::GrantClient,
     health::HealthClient,
     outbox::{EvidenceOutbox, RecordOutbox},
     policy::PolicyClient,
@@ -511,6 +512,9 @@ pub struct GenesisMeshClient {
     /// executor keys, retention and resource heads; observations,
     /// break-glass records and their judgements (v1.3.0).
     pub evidence_store: EvidenceStoreClient,
+    /// Pre-issued grants (1.6.0): issue, list, read and revoke them; a
+    /// holder's time tokens and uses; the revocation feed.
+    pub grants: GrantClient,
     /// Liveness, readiness and health.
     pub health: HealthClient,
     /// Boundary policy lifecycle: validate, publish, activate, history, verify.
@@ -533,6 +537,7 @@ impl GenesisMeshClient {
             disclosure: DisclosureClient::new(Arc::clone(&transport)),
             evidence: EvidenceClient::new(Arc::clone(&transport)),
             evidence_store: EvidenceStoreClient::new(Arc::clone(&transport), outbox, record_outbox),
+            grants: GrantClient::new(Arc::clone(&transport)),
             health: HealthClient::new(Arc::clone(&transport)),
             policy: PolicyClient::new(transport),
         })

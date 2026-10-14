@@ -23,7 +23,7 @@
 //!   NA's revocation of a grant from `revoked_at`.
 //!
 //! Each signs every field but `signature`; an absent optional field is left
-//! out ([`received_canonical`](crate::canonical::received_canonical) with the
+//! out ([`received_canonical`] with the
 //! field registry). A time token's absent `use_head_digest` is left out of
 //! every form, also when the token is nested in a use. The forms are frozen
 //! from 1.6.0 on and match the Python reference byte for byte (conformance
@@ -902,4 +902,212 @@ pub fn use_secret_problem(use_record: &Value) -> Option<String> {
 pub fn grant_horizon(grant: &Value) -> Option<DateTime<Utc>> {
     let (from, until) = (time(grant, "valid_from"), time(grant, "valid_until"));
     DateTime::from_timestamp_micros(until + (until - from) + SKEW_MICROS)
+}
+
+// ── Signing (the bearer key's records) ───────────────────────────────────────
+
+/// One use of a grant, as
+/// [`ExecutionRecorder::sign_grant_use`](crate::ExecutionRecorder::sign_grant_use)
+/// signs it with the grant's bearer key.
+#[derive(Debug, Clone)]
+pub struct GrantUseInput {
+    /// The grant: its `grant_id` and digest are recorded.
+    pub grant: Value,
+    /// The latest time token the holder holds for the grant, as the NA
+    /// signed it.
+    pub time_token: Value,
+    /// The use's place in the grant's chain, from 1.
+    pub use_sequence: u64,
+    /// The previous use's digest ([`use_digest`]); `None` for the first.
+    pub prev_use_digest: Option<String>,
+    /// The capability used, one of the grant's.
+    pub capability: String,
+    /// The request's parameters, inside the grant's envelope. Defaults to
+    /// `{}`.
+    pub request_parameters: Option<Value>,
+    /// The resource acted on; with `resource_action`.
+    pub resource_id: Option<String>,
+    /// `create`, `rotate`, `revoke`, `update` or `delete`.
+    pub resource_action: Option<String>,
+    /// Defaults to now.
+    pub executed_at: Option<DateTime<Utc>>,
+    /// `success` (the default), `failure` or `partial`.
+    pub outcome: Option<String>,
+    /// Short outcome detail, at most 1024 characters.
+    pub outcome_detail: Option<String>,
+    /// Identifiers and versions only. Defaults to `{}`.
+    pub execution_parameters: Option<Value>,
+    /// Defaults to a random UUID.
+    pub use_id: Option<String>,
+}
+
+impl GrantUseInput {
+    /// A use of `grant` under `time_token`, at `use_sequence` after
+    /// `prev_use_digest`, of `capability`; the rest defaults.
+    pub fn new(
+        grant: Value,
+        time_token: Value,
+        use_sequence: u64,
+        prev_use_digest: Option<String>,
+        capability: impl Into<String>,
+    ) -> Self {
+        Self {
+            grant,
+            time_token,
+            use_sequence,
+            prev_use_digest,
+            capability: capability.into(),
+            request_parameters: None,
+            resource_id: None,
+            resource_action: None,
+            executed_at: None,
+            outcome: None,
+            outcome_detail: None,
+            execution_parameters: None,
+            use_id: None,
+        }
+    }
+}
+
+fn object_or_empty(value: Option<Value>, name: &str) -> Result<Value> {
+    let value = value.unwrap_or_else(|| json!({}));
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(crate::out_of_band::refused(
+            "grant_use_malformed",
+            format!("{name} must be a JSON object"),
+        ))
+    }
+}
+
+/// Sign a record's signed form as received under `model` and add the
+/// signature, unless no reader would take it.
+fn sign_as(
+    model: &str,
+    mut record: Value,
+    key_id: &str,
+    key: &ed25519_dalek::SigningKey,
+) -> Result<Value> {
+    crate::out_of_band::check_nesting(&record)?;
+    let canonical = received_canonical(model, &record)?;
+    record["signature"] = crate::auth::sign_canonical(&canonical, key_id, key);
+    Ok(record)
+}
+
+/// Build and sign a use with the bearer key.
+pub(crate) fn sign_grant_use(
+    executor_sovereign_id: &str,
+    key_id: &str,
+    key: &ed25519_dalek::SigningKey,
+    input: GrantUseInput,
+) -> Result<Value> {
+    use crate::out_of_band::{action_problem, length_problem, refused, time_problem};
+    let executed_at = input.executed_at.unwrap_or_else(Utc::now);
+    let outcome = input.outcome.unwrap_or_else(|| "success".into());
+    let grant_id = input.grant["grant_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let sequence_ok = (1..=GRANT_MAX_USES).contains(&input.use_sequence);
+    let chain_ok = (input.use_sequence == 1) == input.prev_use_digest.is_none();
+    let problem = [
+        (!sequence_ok).then(|| format!("use_sequence must be 1 to {GRANT_MAX_USES}")),
+        (!chain_ok).then(|| "prev_use_digest is given exactly from the second use on".into()),
+        length_problem("grant_id", &grant_id, 1, 128),
+        length_problem("executor_sovereign_id", executor_sovereign_id, 1, 256),
+        length_problem("capability", &input.capability, 1, 256),
+        (input.resource_id.is_some() != input.resource_action.is_some())
+            .then(|| "resource_id and resource_action go together".into()),
+        input
+            .resource_id
+            .as_deref()
+            .and_then(|id| length_problem("resource_id", id, 1, 256)),
+        input
+            .resource_action
+            .as_deref()
+            .and_then(|action| action_problem("resource_action", action)),
+        (!USE_OUTCOMES.contains(&outcome.as_str()))
+            .then(|| format!("outcome must be success, failure or partial, not {outcome:?}")),
+        input
+            .outcome_detail
+            .as_deref()
+            .and_then(|detail| length_problem("outcome_detail", detail, 0, 1024)),
+        time_problem("executed_at", Some(executed_at)),
+        (!input.time_token.is_object()).then(|| "time_token must be the NA's token".into()),
+    ]
+    .into_iter()
+    .flatten()
+    .next();
+    if let Some(problem) = problem {
+        return Err(refused("grant_use_malformed", problem));
+    }
+    let request_parameters = object_or_empty(input.request_parameters, "request_parameters")?;
+    let execution_parameters = object_or_empty(input.execution_parameters, "execution_parameters")?;
+    let mut record = Map::new();
+    record.insert(
+        "use_id".into(),
+        json!(input
+            .use_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())),
+    );
+    record.insert("grant_id".into(), json!(grant_id));
+    record.insert("grant_digest".into(), json!(grant_digest(&input.grant)?));
+    record.insert("use_sequence".into(), json!(input.use_sequence));
+    if let Some(prev) = input.prev_use_digest {
+        record.insert("prev_use_digest".into(), json!(prev));
+    }
+    record.insert("executor_sovereign_id".into(), json!(executor_sovereign_id));
+    record.insert("capability".into(), json!(input.capability));
+    record.insert("request_parameters".into(), request_parameters);
+    if let (Some(id), Some(action)) = (input.resource_id, input.resource_action) {
+        record.insert("resource_id".into(), json!(id));
+        record.insert("resource_action".into(), json!(action));
+    }
+    record.insert("executed_at".into(), json!(python_timestamp(executed_at)));
+    record.insert("time_token".into(), input.time_token);
+    record.insert("outcome".into(), json!(outcome));
+    if let Some(detail) = input.outcome_detail {
+        record.insert("outcome_detail".into(), json!(detail));
+    }
+    record.insert("execution_parameters".into(), execution_parameters);
+    let record = Value::Object(record);
+    // The NA refuses a use carrying secret material and never stores it:
+    // it is refused before it is signed.
+    if let Some(secret) = use_secret_problem(&record) {
+        return Err(refused("grant_use_secret_material", secret));
+    }
+    sign_as("GrantExecutionEvidence", record, key_id, key)
+}
+
+/// Build and sign a time token request with the bearer key.
+pub(crate) fn sign_time_token_request(
+    key_id: &str,
+    key: &ed25519_dalek::SigningKey,
+    grant_id: &str,
+    use_sequence: u64,
+    use_head_digest: Option<&str>,
+    requested_at: DateTime<Utc>,
+) -> Result<Value> {
+    use crate::out_of_band::{length_problem, refused};
+    let problem = length_problem("grant_id", grant_id, 1, 128)
+        .or_else(|| {
+            (use_sequence > GRANT_MAX_USES)
+                .then(|| format!("use_sequence must be 0 to {GRANT_MAX_USES}"))
+        })
+        .or_else(|| {
+            ((use_sequence == 0) != use_head_digest.is_none())
+                .then(|| "use_head_digest is given exactly when use_sequence is 1 or more".into())
+        });
+    if let Some(problem) = problem {
+        return Err(refused("time_token_request_malformed", problem));
+    }
+    let mut record = Map::new();
+    record.insert("grant_id".into(), json!(grant_id));
+    record.insert("use_sequence".into(), json!(use_sequence));
+    if let Some(head) = use_head_digest {
+        record.insert("use_head_digest".into(), json!(head));
+    }
+    record.insert("requested_at".into(), json!(python_timestamp(requested_at)));
+    sign_as("TimeTokenRequest", Value::Object(record), key_id, key)
 }
