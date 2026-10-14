@@ -1,0 +1,33 @@
+[package]
+name = "genesis-mesh-edge"
+# The SDK's version: scripts/check_release.py checks that they agree.
+version = "1.6.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Genesis Mesh edge agent: governed actions on a device, online and offline (beta)."
+repository = "https://github.com/GenesisMeshLabs/sdk-rust"
+publish = false
+
+[[bin]]
+name = "genesis-mesh-edge"
+path = "src/main.rs"
+
+# No operator key on the device: clippy.toml refuses the SDK's admin signing
+# here, and the agent calls only the node-signed and public routes.
+[dependencies]
+base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ed25519-dalek = "3"
+genesis-mesh-sdk = { path = ".." }
+getrandom = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = { version = "0.11", default-features = false }
+tokio = { version = "1", features = ["rt", "net", "time", "signal", "sync", "macros", "io-util"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+uuid = { version = "1", features = ["v4"] }

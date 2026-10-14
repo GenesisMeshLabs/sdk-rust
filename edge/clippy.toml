@@ -1,0 +1,13 @@
+# No operator key on the device (docs/edge.md): the agent signs with its node
+# and executor keys only and calls the node-scoped and public routes.
+# clippy -D warnings refuses any use of the SDK's admin signing here; the
+# SDK's own clippy run is unaffected.
+disallowed-methods = [
+    { path = "genesis_mesh_sdk::build_admin_headers", reason = "the edge agent holds no operator key" },
+    { path = "genesis_mesh_sdk::build_admin_headers_at", reason = "the edge agent holds no operator key" },
+    { path = "genesis_mesh_sdk::ClientOptions::with_signing_key", reason = "the edge agent holds no operator key" },
+    { path = "genesis_mesh_sdk::ClientOptions::with_key_id", reason = "the edge agent holds no operator key" },
+]
+disallowed-types = [
+    { path = "genesis_mesh_sdk::AdminHeaders", reason = "the edge agent holds no operator key" },
+]
