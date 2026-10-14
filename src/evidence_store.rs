@@ -8,14 +8,14 @@ use std::{
 };
 
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
     canonical::{execution_digest, out_of_band_digest},
     client::{query_pairs, resource_path, segment, HttpTransport},
     errors::{GenesisMeshError, Result},
-    execution::ensure_metadata_only,
+    execution::{ensure_metadata_only, ResourceHead},
+    node::{NodeClient, NodeIdentity},
     outbox::{
         classify_record_submission_error, classify_submission_error, next_attempt, next_attempt_at,
         Delivery, EvidenceOutbox, FlushReport, OutboxEntry, OutboxState, RecordDelivery,
@@ -39,15 +39,6 @@ const OBSERVATION_BATCH: usize = 100;
 /// that predecessor may still be admitted, final once it is a dead letter
 /// (1.3.1).
 const CHAIN_GAPS: [&str; 2] = ["evidence_chain_gap", "resource_chain_gap"];
-
-/// The head of a resource chain: what the next record must link to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceHead {
-    /// Sequence of the latest record of the resource.
-    pub resource_sequence: u64,
-    /// `ExecutionEvidence.digest()` of that record.
-    pub record_digest: String,
-}
 
 /// Options for [`EvidenceStoreClient::flush_pending`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -79,6 +70,7 @@ fn predecessor_refused(failure: SubmissionFailure) -> SubmissionFailure {
             "a record this one chains from was refused; the NA answered {}: {}",
             failure.code, failure.message
         ),
+        quarantine_id: None,
     }
 }
 
@@ -140,6 +132,8 @@ pub struct EvidenceStoreClient {
     /// No record is due before this time (Unix milliseconds): the NA asked
     /// the client to wait (`Retry-After`, 1.3.1).
     records_paused_until: Arc<AtomicI64>,
+    /// The edge node reading resource heads (1.7.0).
+    node: Option<(NodeClient, Arc<NodeIdentity>)>,
 }
 
 impl EvidenceStoreClient {
@@ -158,7 +152,15 @@ impl EvidenceStoreClient {
             records_in_flight: Arc::default(),
             observation_batch: Arc::new(AtomicUsize::new(OBSERVATION_BATCH)),
             records_paused_until: Arc::new(AtomicI64::new(0)),
+            node: None,
         }
+    }
+
+    /// Read resource heads as this node (1.7.0):
+    /// `POST /node/evidence/resource-head`.
+    pub(crate) fn with_node(mut self, client: NodeClient, identity: Arc<NodeIdentity>) -> Self {
+        self.node = Some((client, identity));
+        self
     }
 
     /// The configured evidence outbox (v1.2.0).
@@ -571,6 +573,9 @@ impl EvidenceStoreClient {
     /// the head may be a grant use: [`resource_head_entry`](Self::resource_head_entry)
     /// says which.
     pub async fn resource_head(&self, resource_id: &str) -> Result<Option<ResourceHead>> {
+        if let Some((node, identity)) = &self.node {
+            return node.resource_head(identity, resource_id).await;
+        }
         let path = format!(
             "/admin/evidence/resource-heads/{}",
             resource_path(resource_id)?
@@ -595,6 +600,9 @@ impl EvidenceStoreClient {
     /// its `record_id` (an execution's `evidence_id`, a use's `use_id`).
     /// `None` for a resource with no history.
     pub async fn resource_head_entry(&self, resource_id: &str) -> Result<Option<Value>> {
+        if let Some((node, identity)) = &self.node {
+            return node.resource_head_entry(identity, resource_id).await;
+        }
         let path = format!(
             "/admin/evidence/resource-heads/{}",
             resource_path(resource_id)?
@@ -640,7 +648,7 @@ impl EvidenceStoreClient {
     async fn submit_record_waiting(
         &self,
         entry: &RecordOutboxEntry,
-    ) -> (Result<Value>, Option<Duration>) {
+    ) -> (Result<Value>, Option<Duration>, Option<String>) {
         let (path, body) = match entry.kind {
             RecordKind::Observation => (
                 "/evidence/observations",
@@ -655,7 +663,7 @@ impl EvidenceStoreClient {
                 json!({ "evidence": entry.record }),
             ),
         };
-        self.http.public_post_waiting(path, body).await
+        self.http.public_post_answered(path, body).await
     }
 
     /// Submit up to 100 signed observations in one request (v1.3.0); the NA
@@ -854,7 +862,7 @@ impl EvidenceStoreClient {
                             .fetch_min((part.len() / 2).max(1), Ordering::AcqRel);
                     }
                     for e in part {
-                        let failed = record_failed(outbox, e.clone(), &err, wait).await;
+                        let failed = record_failed(outbox, e.clone(), &err, wait, None).await;
                         settle(report, e, RecordDelivery::queued(failed));
                     }
                     stopped = true;
@@ -880,7 +888,11 @@ impl EvidenceStoreClient {
                     None => report.pending.push(e.clone()),
                     Some(answer) if answer["status"] == "refused" => {
                         let refusal = batch_refusal(&answer["error"]);
-                        let failed = record_failed(outbox, e.clone(), &refusal, None).await;
+                        let quarantine_id = answer["error"]["details"]["quarantine_id"]
+                            .as_str()
+                            .map(str::to_owned);
+                        let failed =
+                            record_failed(outbox, e.clone(), &refusal, None, quarantine_id).await;
                         settle(report, e, RecordDelivery::queued(failed));
                     }
                     Some(answer) => {
@@ -901,15 +913,17 @@ impl EvidenceStoreClient {
         entry: RecordOutboxEntry,
     ) -> RecordDelivery {
         match self.submit_record_waiting(&entry).await {
-            (Ok(ack), _) => {
+            (Ok(ack), _, _) => {
                 // The NA holds the record even if this fails: the next flush
                 // resubmits it, gets a duplicate and removes it.
                 let _ = outbox.remove(&entry.id).await;
                 RecordDelivery::admitted(ack)
             }
-            (Err(err), wait) => {
+            (Err(err), wait, quarantine_id) => {
                 self.pause_records(&err, wait);
-                RecordDelivery::queued(record_failed(outbox, entry, &err, wait).await)
+                RecordDelivery::queued(
+                    record_failed(outbox, entry, &err, wait, quarantine_id).await,
+                )
             }
         }
     }
@@ -1319,7 +1333,8 @@ impl ReviewDecision {
 }
 
 /// A record outbox entry after a failed submission: pending with a backoff,
-/// or a dead letter. Once the NA has answered, the answer stands even if the
+/// or a dead letter, naming the quarantine entry the NA kept it as, if any
+/// (1.7.0). Once the NA has answered, the answer stands even if the
 /// outbox cannot store it: the entry keeps its previous state and the next
 /// flush settles it.
 async fn record_failed(
@@ -1327,8 +1342,10 @@ async fn record_failed(
     entry: RecordOutboxEntry,
     err: &GenesisMeshError,
     wait: Option<Duration>,
+    quarantine_id: Option<String>,
 ) -> RecordOutboxEntry {
-    let (failure, transient) = classify_record_submission_error(err);
+    let (mut failure, transient) = classify_record_submission_error(err);
+    failure.quarantine_id = quarantine_id;
     let attempts = entry.attempts + 1;
     let next = if transient {
         RecordOutboxEntry {

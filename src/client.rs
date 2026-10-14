@@ -20,6 +20,7 @@ use crate::{
     evidence_store::EvidenceStoreClient,
     grant_client::GrantClient,
     health::HealthClient,
+    node::{NodeClient, NodeIdentity},
     outbox::{EvidenceOutbox, RecordOutbox},
     policy::PolicyClient,
 };
@@ -347,18 +348,38 @@ impl HttpTransport {
     where
         T: DeserializeOwned,
     {
+        let (result, wait, _) = self.public_post_answered(path, body).await;
+        (result, wait)
+    }
+
+    /// [`public_post_waiting`](Self::public_post_waiting), with the
+    /// quarantine entry the NA names when it refused a record and kept it as
+    /// one (`error.details.quarantine_id`, 1.7.0).
+    pub(crate) async fn public_post_answered<T>(
+        &self,
+        path: &str,
+        body: impl Serialize,
+    ) -> (Result<T>, Option<Duration>, Option<String>)
+    where
+        T: DeserializeOwned,
+    {
         let sent = match serde_json::to_value(body) {
             Ok(body) => self.send_post(path, body, HeaderMap::new()).await,
             Err(err) => Err(err.into()),
         };
         let response = match sent {
             Ok(response) => response,
-            Err(err) => return (Err(err), None),
+            Err(err) => return (Err(err), None, None),
         };
         let wait = retry_after(response.headers(), Utc::now());
-        match self.parse(response).await {
-            Ok(value) => (Ok(value), None),
-            Err(err) => (Err(err), wait),
+        let status = response.status().as_u16();
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => return (Err(unreadable(status, err)), wait, None),
+        };
+        match self.parse_bytes(status, &bytes) {
+            Ok(value) => (Ok(value), None, None),
+            Err(err) => (Err(err), wait, quarantine_id(&bytes)),
         }
     }
 
@@ -390,13 +411,17 @@ impl HttpTransport {
     where
         T: DeserializeOwned,
     {
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| unreadable(status.as_u16(), e))?;
-        if !status.is_success() {
-            return Err(error_from_body(status.as_u16(), &bytes));
+        let status = response.status().as_u16();
+        let bytes = response.bytes().await.map_err(|e| unreadable(status, e))?;
+        self.parse_bytes(status, &bytes)
+    }
+
+    fn parse_bytes<T>(&self, status: u16, bytes: &[u8]) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        if !(200..300).contains(&status) {
+            return Err(error_from_body(status, bytes));
         }
         // Deserialize directly into the caller's type instead of building an
         // intermediate JSON tree for every successful response.
@@ -404,12 +429,12 @@ impl HttpTransport {
             Ok(serde_json::from_slice(b"{}")?)
         } else {
             // v1.2.0: refuse JSON every implementation would not read alike.
-            let text = std::str::from_utf8(&bytes).map_err(|_| GenesisMeshError::StrictJson {
+            let text = std::str::from_utf8(bytes).map_err(|_| GenesisMeshError::StrictJson {
                 reason: "invalid_json".into(),
                 detail: "text that is not UTF-8".into(),
             })?;
             crate::strict_json::check_strict_json(text)?;
-            Ok(serde_json::from_slice(&bytes)?)
+            Ok(serde_json::from_slice(bytes)?)
         }
     }
 
@@ -439,6 +464,14 @@ pub(crate) fn retry_after(headers: &HeaderMap, now: DateTime<Utc>) -> Option<Dur
 /// is not a request that never arrived.
 fn unreadable(status: u16, source: reqwest::Error) -> GenesisMeshError {
     GenesisMeshError::ResponseBodyUnreadable { status, source }
+}
+
+/// The quarantine entry an error body names (`error.details.quarantine_id`).
+fn quarantine_id(bytes: &[u8]) -> Option<String> {
+    let body: Value = serde_json::from_slice(bytes).ok()?;
+    body.pointer("/error/details/quarantine_id")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn error_from_body(status: u16, bytes: &[u8]) -> GenesisMeshError {
@@ -517,6 +550,10 @@ pub struct GenesisMeshClient {
     pub grants: GrantClient,
     /// Liveness, readiness and health.
     pub health: HealthClient,
+    /// A node's own routes, signed by its node key (1.7.0, beta): join,
+    /// heartbeat, renew, and an edge node's state, decisions and resource
+    /// heads.
+    pub node: NodeClient,
     /// Boundary policy lifecycle: validate, publish, activate, history, verify.
     pub policy: PolicyClient,
 }
@@ -539,8 +576,26 @@ impl GenesisMeshClient {
             evidence_store: EvidenceStoreClient::new(Arc::clone(&transport), outbox, record_outbox),
             grants: GrantClient::new(Arc::clone(&transport)),
             health: HealthClient::new(Arc::clone(&transport)),
+            node: NodeClient::new(Arc::clone(&transport)),
             policy: PolicyClient::new(transport),
         })
+    }
+
+    /// The same client acting as an enrolled edge node (1.7.0, beta):
+    /// [`BoundaryClient::evaluate`](crate::BoundaryClient::evaluate) calls
+    /// `POST /node/boundary/evaluate`, and
+    /// [`EvidenceStoreClient::resource_head`](crate::EvidenceStoreClient::resource_head)
+    /// and `resource_head_entry` call `POST /node/evidence/resource-head`,
+    /// signed by the node key instead of an operator key. The outboxes are
+    /// kept. [`governed_action`](crate::governed_action) and the grant
+    /// holder then need no operator key.
+    pub fn with_node_identity(mut self, identity: NodeIdentity) -> Self {
+        let identity = Arc::new(identity);
+        self.boundary = self
+            .boundary
+            .with_node(self.node.clone(), Arc::clone(&identity));
+        self.evidence_store = self.evidence_store.with_node(self.node.clone(), identity);
+        self
     }
 }
 

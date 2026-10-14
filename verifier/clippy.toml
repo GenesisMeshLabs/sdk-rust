@@ -1,13 +1,16 @@
 # genesis-mesh-verify never contacts a network and never needs a private key
 # (docs/verifier.md). clippy -D warnings refuses any use of these in the
 # binary; the SDK's own clippy run is unaffected.
+# The HTTP client types exist only with the SDK's `client` feature, which the
+# verifier does not enable (1.7.0): refused when a workspace build enables it,
+# absent otherwise (allow-invalid).
 disallowed-types = [
     { path = "std::net::TcpStream", reason = "the verifier never contacts a network" },
     { path = "std::net::TcpListener", reason = "the verifier never contacts a network" },
     { path = "std::net::UdpSocket", reason = "the verifier never contacts a network" },
-    { path = "genesis_mesh_sdk::GenesisMeshClient", reason = "the verifier never contacts a network" },
-    { path = "genesis_mesh_sdk::HttpTransport", reason = "the verifier never contacts a network" },
-    { path = "genesis_mesh_sdk::ClientOptions", reason = "the verifier never contacts a network" },
+    { path = "genesis_mesh_sdk::GenesisMeshClient", reason = "the verifier never contacts a network", allow-invalid = true },
+    { path = "genesis_mesh_sdk::HttpTransport", reason = "the verifier never contacts a network", allow-invalid = true },
+    { path = "genesis_mesh_sdk::ClientOptions", reason = "the verifier never contacts a network", allow-invalid = true },
     { path = "genesis_mesh_sdk::ExecutionRecorder", reason = "the verifier never signs" },
     { path = "genesis_mesh_sdk::ObservationRecorder", reason = "the verifier never signs" },
 ]

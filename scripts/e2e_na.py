@@ -60,7 +60,9 @@ def main():
         config = {"baseUrl": f"http://127.0.0.1:{server.server_port}",
                   "signingKeyBase64": operator.private_key_b64, "keyId": "ops",
                   "naPublicKey": root.public_key_b64, "outOfBand": "evidence_out_of_band" in options,
-                  "remediation": remediation, "grants": "evidence_grants" in options}
+                  "remediation": remediation, "grants": "evidence_grants" in options,
+                  # 1.7.0: edge invites and the node-scoped routes (/node/state, ...).
+                  "edge": hasattr(service, "edge_service")}
         if remediation:
             config.update({"reviewerKeyId": "reviewer", "reviewerSigningKeyBase64": reviewer.private_key_b64})
         print(json.dumps(config), flush=True)

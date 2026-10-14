@@ -37,6 +37,8 @@ sdk-rust/
     grants.rs      # pre-issued grants: envelopes, number rules, use rules, signing (1.6.0, pure)
     grant_client.rs # GrantClient: grant routes, time tokens, uses, the revocation feed (1.6.0)
     grant_holder.rs # GrantHolder: acts within a grant offline, uploads, falls back (1.6.0)
+    node_auth.rs   # node request signatures, the edge join co-signature (1.7.0, pure)
+    node.rs        # NodeClient, NodeIdentity, NodeJoin: a node's routes (1.7.0)
     outbox.rs      # evidence and record outboxes
     governance.rs  # governed_action, governed_action_with_break_glass, rotate_forward_then_disable, summarize_decision
     lib.rs         # public exports
@@ -44,7 +46,13 @@ sdk-rust/
     src/           # command line only; verification is the crate's verify module
     clippy.toml    # refuses network and signing code in the binary
     tests/         # CLI tests and the differential harness (adapter/ reads reference vectors)
+  edge/            # genesis-mesh-edge (1.7.0, beta): the edge agent, a workspace member
+    src/           # config, state files, SQLite outboxes, the decision order, the local API
+    clippy.toml    # refuses the SDK's admin signing: no operator key on the device
+    tests/         # scenario.rs against a live NA (enrolment, offline, stale, local auth)
+    packaging/     # the systemd unit and the example configuration
   scripts/build_verifier.sh  # the reproducible static release build
+  scripts/build_edge.sh      # the edge agent's static release build
   Cargo.toml
 ```
 
@@ -92,6 +100,12 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
 cargo test --locked --doc
 ```
+
+The default feature `client` (1.7.0) gates the HTTP client and every module
+that calls the NA; the offline modules (`verify`, `canonical`, `strict`,
+`auth`, `execution`, `out_of_band`, `outbox`, `grants`, `key_history`,
+`audit_pack`, `remediation`, `node_auth`) build without it. Check both:
+`cargo test --locked -p genesis-mesh-sdk --no-default-features`.
 
 `genesis-mesh-verify` never needs a private key and never contacts a network:
 keep the binary's code to the crate's offline modules (`verify`, `canonical`,

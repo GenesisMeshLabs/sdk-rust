@@ -34,6 +34,11 @@ verifier = tomllib.loads((root / "verifier" / "Cargo.toml").read_text())
 assert verifier["package"]["version"] == version, "verifier/Cargo.toml and VERSION differ"
 locked_verifier = next(p for p in lock["package"] if p["name"] == verifier["package"]["name"])
 assert locked_verifier["version"] == version, "Cargo.lock verifier version differs"
+# genesis-mesh-edge (edge/, 1.7.0) is released with the crate, at its version.
+edge = tomllib.loads((root / "edge" / "Cargo.toml").read_text())
+assert edge["package"]["version"] == version, "edge/Cargo.toml and VERSION differ"
+locked_edge = next(p for p in lock["package"] if p["name"] == edge["package"]["name"])
+assert locked_edge["version"] == version, "Cargo.lock edge version differs"
 tag_build = os.environ.get("GITHUB_REF_TYPE") == "tag"
 if tag_build:
     assert os.environ["GITHUB_REF_NAME"] == f"v{version}", "Release tag and VERSION differ"

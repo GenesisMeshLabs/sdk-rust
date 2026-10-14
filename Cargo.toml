@@ -14,20 +14,69 @@ resolver = "3"
 
 # The independent verifier, genesis-mesh-verify (1.5.0): a binary built on this
 # crate's offline modules, never published to crates.io (docs/verifier.md).
+# The edge agent, genesis-mesh-edge (1.7.0, beta): a device's agent over the
+# SDK, never published to crates.io (docs/edge.md).
 [workspace]
-members = ["verifier"]
+members = ["verifier", "edge"]
+
+# `client` (default, 1.7.0): the HTTP client and everything that calls the NA.
+# Without it the crate is its offline modules only: verification, canonical
+# forms, signing, the outboxes and the grant rules, with no HTTP stack.
+[features]
+default = ["client"]
+client = ["dep:reqwest", "dep:percent-encoding"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 ed25519-dalek = "3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
-percent-encoding = "2"
+percent-encoding = { version = "2", optional = true }
 sha2 = { version = "0.11", default-features = false }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+
+# These call the NA (a live one or a local test server): the `client` feature.
+[[test]]
+name = "governance_http"
+required-features = ["client"]
+
+[[test]]
+name = "grant_holder"
+required-features = ["client"]
+
+[[test]]
+name = "http_contract"
+required-features = ["client"]
+
+[[test]]
+name = "live_na"
+required-features = ["client"]
+
+[[test]]
+name = "record_outbox"
+required-features = ["client"]
+
+[[test]]
+name = "remediation_http"
+required-features = ["client"]
+
+[[test]]
+name = "node_client"
+required-features = ["client"]
+
+[[example]]
+name = "get_policy"
+required-features = ["client"]
+
+[[example]]
+name = "issue_attestation"
+required-features = ["client"]
