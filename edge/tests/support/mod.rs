@@ -171,8 +171,17 @@ impl Na {
     }
 }
 
-/// A TCP proxy between the agent and the NA.
+/// How the proxy treats a connection.
+const FORWARD: u8 = 0;
+const THROTTLE: u8 = 1;
+const BLACKHOLE: u8 = 2;
+
+/// A TCP proxy between the agent and the NA: it forwards, refuses
+/// connections (the NA is stopped), answers every request `429` (the NA
+/// throttles the device), or accepts connections and never answers (a
+/// blackholed network).
 pub struct Proxy {
+    mode: Arc<std::sync::atomic::AtomicU8>,
     /// The URL the agent is given.
     pub url: String,
     address: std::net::SocketAddr,
@@ -196,6 +205,7 @@ impl Proxy {
             address,
             upstream,
             serving: Mutex::new(None),
+            mode: Arc::default(),
             connections: Arc::default(),
             admin_seen: Arc::default(),
         });
@@ -207,10 +217,22 @@ impl Proxy {
         let upstream = self.upstream;
         let connections = Arc::clone(&self.connections);
         let admin_seen = Arc::clone(&self.admin_seen);
+        let mode = Arc::clone(&self.mode);
         let task = tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
                 let admin_seen = Arc::clone(&admin_seen);
+                let mode = mode.load(Ordering::SeqCst);
                 let connection = tokio::spawn(async move {
+                    if mode == THROTTLE {
+                        return throttle(client).await;
+                    }
+                    if mode == BLACKHOLE {
+                        let mut client = client;
+                        let mut sink = vec![0_u8; 4096];
+                        while matches!(client.read(&mut sink).await, Ok(n) if n > 0) {}
+                        // Never answered; held until the proxy cuts it.
+                        return std::future::pending::<()>().await;
+                    }
                     let Ok(server) = TcpStream::connect(upstream).await else {
                         return;
                     };
@@ -262,6 +284,30 @@ impl Proxy {
         }
     }
 
+    /// The NA answers every request `429 rate_limit_exceeded`.
+    pub fn throttle(&self) {
+        self.cut_connections();
+        self.mode.store(THROTTLE, Ordering::SeqCst);
+    }
+
+    /// The network swallows every request: connections open, nothing answers.
+    pub fn blackhole(&self) {
+        self.cut_connections();
+        self.mode.store(BLACKHOLE, Ordering::SeqCst);
+    }
+
+    /// Forward again (after `throttle` or `blackhole`).
+    pub fn forward(&self) {
+        self.cut_connections();
+        self.mode.store(FORWARD, Ordering::SeqCst);
+    }
+
+    fn cut_connections(&self) {
+        for connection in self.connections.lock().unwrap().drain(..) {
+            connection.abort();
+        }
+    }
+
     /// The NA is back.
     pub async fn restore(&self) {
         let mut tries = 0;
@@ -282,6 +328,42 @@ impl Proxy {
     /// Whether any request carried an `X-Admin-` header.
     pub fn admin_headers_seen(&self) -> bool {
         self.admin_seen.load(Ordering::SeqCst)
+    }
+}
+
+/// Answer each request on a connection `429`, as a throttling NA does.
+async fn throttle(mut client: TcpStream) {
+    let mut buffer = Vec::new();
+    let mut chunk = vec![0_u8; 8192];
+    loop {
+        let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+            match client.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            }
+            continue;
+        };
+        let head = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+        let length: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        while buffer.len() < end + 4 + length {
+            match client.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            }
+        }
+        buffer.drain(..end + 4 + length);
+        let body = r#"{"error":{"code":"rate_limit_exceeded","message":"Rate limit exceeded"}}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = client.write_all(response.as_bytes()).await;
+        let _ = client.shutdown().await;
+        return;
     }
 }
 

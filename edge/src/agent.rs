@@ -14,17 +14,17 @@ use std::{
 use chrono::{DateTime, Utc};
 use genesis_mesh_sdk::{
     canonical::{parse_timestamp, python_timestamp},
-    check_metadata_only, evaluation_failure, governed_action, governed_action_with_break_glass,
+    check_metadata_only, evaluation_failure, governed_action,
     grants::use_digest,
     json,
     key_history::verify_key_history,
     node_auth::executor_key_id,
     verify::{verify_attestation_signature, verify_crl, verify_join_certificate},
-    ActionError, ActionReport, BreakGlassInput, BreakGlassOptions, ClientOptions,
+    without_refused_metadata, ActionError, ActionReport, BreakGlassInput, ClientOptions,
     EvaluationFailure, ExecutionRecorder, FlushOptions, GenesisMeshClient, GenesisMeshError,
     GovernedActionOutcome, GovernedActionParams, GovernedVerification, GrantActionOutcome,
-    GrantAuthority, GrantFallback, GrantHolder, GrantHolderState, GrantRequest, HttpTransport,
-    NodeIdentity, NodeJoin, Value,
+    GrantAuthority, GrantHolder, GrantHolderState, GrantRequest, HttpTransport, NodeIdentity,
+    NodeJoin, Value,
 };
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
@@ -34,6 +34,9 @@ use crate::{
     log,
     state::{StateDir, StateError, DATABASE, ENROLLMENT, EXECUTOR_KEY, NODE_KEY, SNAPSHOT},
 };
+
+/// How far the device's clock may be behind the NA's signing time.
+const CLOCK_SKEW_SECONDS: i64 = 300;
 
 /// The agent's version (the SDK's).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -460,6 +463,14 @@ impl Agent {
 
     /// Enrol with an invite token (docs/edge.md, "Enrolment").
     pub async fn enroll(&self, invite_token: &str) -> Result<(), Exit> {
+        // The invite token is a bearer secret for a privileged act: never in
+        // clear text over a network (allow_insecure_http covers `run` only).
+        if crate::config::insecure_remote(&self.config.na_url) {
+            return Err(Exit::Usage(
+                "enrolment needs https (or a loopback NA): the invite token would cross the network in clear text"
+                    .into(),
+            ));
+        }
         let transport = self.transport().map_err(|e| Exit::Usage(e.to_string()))?;
         let key_history: Value = transport
             .public_get("/na/key-history")
@@ -560,18 +571,27 @@ impl Agent {
     }
 
     /// The snapshot's age in seconds, from the time the NA signed what it
-    /// holds: `now - min(synced_at, feed.issued_at)`.
+    /// holds: `now - min(synced_at, feed.issued_at)`. Negative when the
+    /// device's clock is behind that time.
     fn snapshot_age(&self) -> Option<i64> {
         let shared = lock(&self.shared);
         let synced = micros(&shared.snapshot["synced_at"])?;
         let anchor = micros(&shared.snapshot["revocation_feed"]["issued_at"])
             .map_or(synced, |issued| issued.min(synced));
-        Some(((Utc::now().timestamp_micros() - anchor) / 1_000_000).max(0))
+        Some((Utc::now().timestamp_micros() - anchor) / 1_000_000)
+    }
+
+    /// The device's clock is more than 300 s behind the time the NA signed
+    /// the snapshot: the clock cannot be trusted to age it.
+    fn clock_behind(&self) -> bool {
+        self.snapshot_age()
+            .is_some_and(|age| age < -CLOCK_SKEW_SECONDS)
     }
 
     fn snapshot_fresh(&self) -> bool {
-        self.snapshot_age()
-            .is_some_and(|age| age <= self.config.max_snapshot_age.as_secs() as i64)
+        self.snapshot_age().is_some_and(|age| {
+            (-CLOCK_SKEW_SECONDS..=self.config.max_snapshot_age.as_secs() as i64).contains(&age)
+        })
     }
 
     // ── The schedule ────────────────────────────────────────────────────────
@@ -581,7 +601,7 @@ impl Agent {
         let (pending, dead) = self.outbox_counts();
         json!({
             "version": VERSION,
-            "snapshot_age_seconds": self.snapshot_age(),
+            "snapshot_age_seconds": self.snapshot_age().map(|age| age.max(0)),
             "pending_uploads": pending,
             "dead_letters": dead,
         })
@@ -617,12 +637,16 @@ impl Agent {
             }
             Err(err) => {
                 self.na_error("heartbeat_failed", &err);
-                false
+                // A refusal (a 429 included) is an answer: the NA is there.
+                answered(&err)
             }
         }
     }
 
     fn na_error(&self, event: &str, err: &GenesisMeshError) {
+        if answered(err) {
+            self.contact();
+        }
         if revoked_code(err) {
             self.mark_revoked(err.code());
         } else if err.code() == "certificate_expired" {
@@ -735,6 +759,12 @@ impl Agent {
             match client.node.state(&identity).await {
                 Ok(answer) => {
                     self.contact();
+                    // An executor key retired another way than by revoking
+                    // the node: its records would be refused.
+                    if !answer["executor_key"]["retired_at"].is_null() {
+                        self.mark_revoked("executor_key_retired");
+                        return Ok(());
+                    }
                     node_state = answer;
                 }
                 Err(err) => {
@@ -978,8 +1008,9 @@ impl Agent {
             "connected": self.connected(),
             "last_na_contact_at": last_contact.map(timestamp),
             "snapshot_synced_at": snapshot["synced_at"],
-            "snapshot_age_seconds": self.snapshot_age(),
+            "snapshot_age_seconds": self.snapshot_age().map(|age| age.max(0)),
             "snapshot_fresh": fresh,
+            "clock_behind": self.clock_behind(),
             "grants": grants,
             "pending_uploads": pending,
             "dead_letters": dead,
@@ -1313,129 +1344,121 @@ impl Agent {
             verify: verify.clone(),
         };
 
-        // 1. Connected: the NA decides.
+        // 1. Connected: the NA decides. Only a request that got no answer
+        // (no connection, a timeout) goes on; any answer of the NA, a 429 or
+        // a 5xx included, is final.
+        let mut unanswered = None;
         if state == AgentState::Active && self.connected() {
             if let Some(evaluate) = &evaluate {
-                // Uses and break-glass records still pending go first, so a
-                // decision's evidence follows them in the resource's chain.
-                let _ = client
-                    .evidence_store
-                    .flush_records(FlushOptions {
-                        ignore_backoff: true,
-                    })
-                    .await;
-                let decided = governed_action(
-                    &client.boundary,
-                    &client.evidence_store,
-                    &recorder,
-                    params(evaluate.clone()),
-                    |decision: Value| {
-                        action(
-                            Arc::clone(&link),
-                            Granted {
-                                authority: "decision",
-                                decision_id: decision["decision_id"].as_str().map(str::to_owned),
-                                ..Granted::default()
-                            },
-                        )
-                    },
-                )
-                .await;
-                match decided {
-                    Ok(result) => {
-                        self.contact();
-                        return evaluated(result);
-                    }
-                    Err(err) if evaluation_failure(&err).is_some() => {
-                        log::info("na_unreachable", json!({"code": err.code()}));
-                    }
-                    Err(err) => return self.decision_error(err),
+                match self
+                    .ask(&client, &recorder, params(evaluate.clone()), &link)
+                    .await
+                {
+                    Asked::Done(finished) => return finished,
+                    Asked::Unanswered(failure) => unanswered = Some(failure),
                 }
             }
         }
 
-        // 2. Grants, while the snapshot is fresh.
-        let mut grant_code = "no_grant".to_owned();
-        if !self.snapshot_fresh() {
-            grant_code = "snapshot_stale".into();
-        } else {
-            match self.choose_holder(&request).await {
-                Choice::Use(holder) => {
-                    let fallback = request.justification.clone().zip(evaluate.clone()).map(
-                        |(justification, evaluate)| GrantFallback {
-                            attributes: Some(request.attributes.clone()),
-                            evaluate: Some(evaluate),
-                            ..GrantFallback::new(justification, verify.clone())
-                        },
-                    );
-                    match self.act(&client, holder, &request, fallback, &link).await {
-                        Ok(finished) => return finished,
-                        Err(code) => grant_code = code,
-                    }
-                }
-                Choice::Outside(code) => {
-                    return refused("outside_grant", json!({"grant_code": code}))
-                }
-                Choice::Ended(code) => grant_code = code,
-                Choice::None => {}
-            }
-        }
+        // 2. Grants. A request a held grant names but does not cover is
+        // refused, fresh snapshot or not; a covered one is acted on only
+        // while the snapshot is fresh.
+        let fresh = self.snapshot_fresh();
+        let grant_code = match self.choose_holder(&request, fresh).await {
+            Choice::Use(holder) => match self.act(&client, holder, &request, &link).await {
+                Ok(finished) => return finished,
+                Err(code) => code,
+            },
+            Choice::Outside(code) => return refused("outside_grant", json!({"grant_code": code})),
+            Choice::Covered | Choice::Ended(_) if !fresh => "snapshot_stale".to_owned(),
+            Choice::Ended(code) => code,
+            Choice::Covered | Choice::None => "no_grant".to_owned(),
+        };
 
-        // 3. Break-glass, with a justification.
+        // 3. Break-glass, with a justification, when the NA does not answer.
         let Some(justification) = request.justification.clone() else {
             return refused("justification_required", json!({"grant_code": grant_code}));
         };
         let Some(evaluate) = evaluate else {
             return refused("no_attestation", json!({"grant_code": grant_code}));
         };
-        if state == AgentState::CertificateExpired {
-            return self
-                .local_break_glass(
-                    &client,
-                    &recorder,
-                    &request,
-                    &evaluate,
-                    justification,
-                    grant_code,
-                    &link,
-                )
-                .await;
-        }
-        let outcome = governed_action_with_break_glass(
+        let failure = match (state, unanswered) {
+            // The NA refuses a node whose certificate has expired: it is not asked.
+            (AgentState::CertificateExpired, _) => EvaluationFailure::NetworkError,
+            (_, Some(failure)) => failure,
+            _ => match self
+                .ask(&client, &recorder, params(evaluate.clone()), &link)
+                .await
+            {
+                Asked::Done(finished) => return finished,
+                Asked::Unanswered(failure) => failure,
+            },
+        };
+        self.break_glass(
+            &client,
+            &recorder,
+            &request,
+            &evaluate,
+            BreakGlass {
+                justification,
+                grant_code,
+                failure,
+            },
+            &link,
+        )
+        .await
+    }
+
+    /// Ask the NA to decide (`governed_action` through the node route).
+    async fn ask(
+        &self,
+        client: &GenesisMeshClient,
+        recorder: &ExecutionRecorder,
+        params: GovernedActionParams,
+        link: &Arc<Link>,
+    ) -> Asked {
+        // Uses and break-glass records still pending go first, so a decision's
+        // evidence follows them in the resource's chain.
+        let _ = client
+            .evidence_store
+            .flush_records(FlushOptions {
+                ignore_backoff: true,
+            })
+            .await;
+        let decided = governed_action(
             &client.boundary,
             &client.evidence_store,
-            &recorder,
-            params(evaluate),
-            BreakGlassOptions::new(justification),
-            |decision: Option<Value>| {
-                let granted = match &decision {
-                    Some(decision) => Granted {
+            recorder,
+            params,
+            |decision: Value| {
+                action(
+                    Arc::clone(link),
+                    Granted {
                         authority: "decision",
                         decision_id: decision["decision_id"].as_str().map(str::to_owned),
                         ..Granted::default()
                     },
-                    None => Granted {
-                        authority: "break_glass",
-                        code: Some(grant_code.clone()),
-                        ..Granted::default()
-                    },
-                };
-                action(Arc::clone(&link), granted)
+                )
             },
         )
         .await;
-        match outcome {
-            Ok(GovernedActionOutcome::Evaluated(result)) => {
+        match decided {
+            Ok(result) => {
                 self.contact();
-                evaluated(result)
+                Asked::Done(evaluated(result))
             }
-            Ok(GovernedActionOutcome::BrokeGlass(glass)) => Finished::Ran {
-                record_kind: "break_glass",
-                record_id: glass.record["break_glass_id"].as_str().map(str::to_owned),
-                queued: glass.queued.is_some(),
-                dropped: glass.dropped,
+            Err(err) => match unanswered(&err) {
+                Some(failure) => {
+                    log::info("na_unreachable", json!({"failure": failure.as_str()}));
+                    Asked::Unanswered(failure)
+                }
+                None => {
+                    if answered(&err) {
+                        self.contact();
+                    }
+                    Asked::Done(self.decision_error(err))
+                }
             },
-            Err(err) => self.decision_error(err),
         }
     }
 
@@ -1514,7 +1537,7 @@ impl Agent {
     }
 
     /// The holder to use for a request, soonest `valid_until` first.
-    async fn choose_holder(&self, request: &AuthorizeRequest) -> Choice {
+    async fn choose_holder(&self, request: &AuthorizeRequest, take: bool) -> Choice {
         let mut holders = self.holders.lock().await;
         let now = Utc::now();
         let mut ordered: Vec<(&String, &GrantHolder)> = holders.map.iter().collect();
@@ -1549,6 +1572,9 @@ impl Agent {
             }
         }
         if let Some(id) = usable {
+            if !take {
+                return Choice::Covered;
+            }
             let holder = holders.map.remove(&id).expect("held");
             holders.out = Some(id);
             return Choice::Use(Box::new(holder));
@@ -1567,13 +1593,13 @@ impl Agent {
         client: &GenesisMeshClient,
         mut holder: Box<GrantHolder>,
         request: &AuthorizeRequest,
-        fallback: Option<GrantFallback>,
         link: &Arc<Link>,
     ) -> Result<Finished, String> {
-        let mut grant_request =
+        // No fallback: when the grant cannot be used, the decision order
+        // goes on (the NA, then break-glass, only when it does not answer).
+        let grant_request =
             GrantRequest::new(&request.capability, request.request_parameters.clone())
                 .on(&request.resource_id, &request.resource_action);
-        grant_request.fallback = fallback;
         let acted = holder
             .act(client, grant_request, |authority: GrantAuthority| {
                 let granted = match authority {
@@ -1626,31 +1652,20 @@ impl Agent {
         }
     }
 
-    /// Break-glass while the certificate has expired: the NA cannot be asked
-    /// (it refuses the node's requests), so the change runs at once and its
-    /// record says the evaluation could not be made.
-    #[allow(clippy::too_many_arguments)]
-    async fn local_break_glass(
+    /// Break-glass: the NA gave no answer (or, with an expired certificate,
+    /// cannot be asked). The change runs at once, and its record, signed with
+    /// the executor key, names how the evaluation failed; the NA judges it
+    /// when it arrives.
+    async fn break_glass(
         &self,
         client: &GenesisMeshClient,
         recorder: &ExecutionRecorder,
         request: &AuthorizeRequest,
         evaluate: &Value,
-        justification: String,
-        grant_code: String,
+        glass: BreakGlass,
         link: &Arc<Link>,
     ) -> Finished {
-        let report = action(
-            Arc::clone(link),
-            Granted {
-                authority: "break_glass",
-                code: Some(grant_code),
-                ..Granted::default()
-            },
-        )
-        .await
-        .unwrap_or_default();
-        let input = BreakGlassInput {
+        let input = |report: ActionReport<()>| BreakGlassInput {
             attestation_id: evaluate["attestation_id"].as_str().map(str::to_owned),
             request_parameters: Some(request.request_parameters.clone()),
             attributes: Some(request.attributes.clone()),
@@ -1661,25 +1676,92 @@ impl Agent {
                 &request.resource_id,
                 &request.resource_action,
                 &request.capability,
-                justification,
+                glass.justification.clone(),
                 evaluate.clone(),
-                EvaluationFailure::NetworkError,
+                glass.failure,
             )
         };
-        let record = match recorder.sign_break_glass(input) {
-            Ok(record) => record,
-            Err(err) => return Finished::Failed(err.to_string()),
+        // Everything but the action's report is checked before it runs.
+        if let Err(err) = recorder.sign_break_glass(input(ActionReport::default())) {
+            return refused(err.code(), json!({"detail": err.to_string()}));
+        }
+        let report = action(
+            Arc::clone(link),
+            Granted {
+                authority: "break_glass",
+                code: Some(glass.grant_code.clone()),
+                ..Granted::default()
+            },
+        )
+        .await
+        .unwrap_or_default();
+        let (record, dropped) = match recorder.sign_break_glass(input(report.clone())) {
+            Ok(record) => (record, Vec::new()),
+            Err(_) => {
+                // Reported metadata the secret guard refuses is left out.
+                let cleaned = without_refused_metadata(
+                    report.execution_parameters.as_ref().unwrap_or(&json!({})),
+                    report.outcome_detail.as_deref(),
+                );
+                let report = ActionReport {
+                    execution_parameters: Some(cleaned.execution_parameters),
+                    outcome_detail: Some(cleaned.outcome_detail),
+                    ..report
+                };
+                match recorder.sign_break_glass(input(report)) {
+                    Ok(record) => (record, cleaned.dropped),
+                    Err(err) => return Finished::Failed(err.to_string()),
+                }
+            }
         };
         match client.evidence_store.enqueue_record(record.clone()).await {
             Ok(delivery) => Finished::Ran {
                 record_kind: "break_glass",
                 record_id: record["break_glass_id"].as_str().map(str::to_owned),
                 queued: delivery.queued.is_some(),
-                dropped: Vec::new(),
+                dropped,
             },
             Err(err) => Finished::Failed(err.to_string()),
         }
     }
+}
+
+/// Break-glass for one request.
+struct BreakGlass {
+    justification: String,
+    grant_code: String,
+    failure: EvaluationFailure,
+}
+
+/// What asking the NA gave.
+enum Asked {
+    /// Its decision (the action ran or did not), or its refusal.
+    Done(Finished),
+    /// No answer: the NA could not be reached or did not answer in time.
+    Unanswered(EvaluationFailure),
+}
+
+/// How a request that got no answer failed: no connection or a timeout.
+/// Anything the NA answered (a `429`, a `5xx`, a refusal) is not this.
+fn unanswered(err: &GenesisMeshError) -> Option<EvaluationFailure> {
+    match err {
+        GenesisMeshError::Network(_) => evaluation_failure(err),
+        _ => None,
+    }
+}
+
+/// Whether the NA answered (with an HTTP status).
+fn answered(err: &GenesisMeshError) -> bool {
+    matches!(
+        err,
+        GenesisMeshError::BadRequest { .. }
+            | GenesisMeshError::Unauthorized { .. }
+            | GenesisMeshError::NotFound { .. }
+            | GenesisMeshError::Validation { .. }
+            | GenesisMeshError::RateLimit { .. }
+            | GenesisMeshError::Http { .. }
+            | GenesisMeshError::ResponseBodyUnreadable { .. }
+    )
 }
 
 /// What the decision order does with the grants.
@@ -1688,6 +1770,8 @@ enum Choice {
     Use(Box<GrantHolder>),
     /// A grant names the capability but does not cover the request.
     Outside(String),
+    /// A grant covers the request (not taken: the snapshot is stale).
+    Covered,
     /// A covering grant can no longer be used.
     Ended(String),
     /// No grant names the capability.

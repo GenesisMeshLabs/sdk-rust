@@ -120,7 +120,7 @@ jobs:
           if [ "$rss" -gt "$budget" ]; then
             echo "::error::the agent's maximum RSS was $rss KiB, over its budget of $budget"; exit 1
           fi
-      - name: The other scenarios, with the static binary (C1, C2, C4)
+      - name: The other scenarios, with the static binary (C1, C2, C4; a blackholed network, a throttling NA, a stale snapshot)
         env:
           GM_E2E_PYTHON: python
         run: |

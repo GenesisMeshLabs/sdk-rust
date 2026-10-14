@@ -87,6 +87,7 @@ struct FileLocalApi {
     tokens: Option<Vec<TokenEntry>>,
     report_timeout_seconds: Option<u64>,
     queue_timeout_seconds: Option<u64>,
+    rate_limit_per_minute: Option<u32>,
 }
 
 /// `socket_mode` as an octal string (`"0660"`) or a number.
@@ -200,6 +201,8 @@ pub struct Config {
     pub report_timeout: Duration,
     /// How long a request waits for the open authorization to finish.
     pub queue_timeout: Duration,
+    /// Authorizations per minute per local client (uid or token name).
+    pub rate_limit_per_minute: u32,
     /// The least severe level logged.
     pub log_level: Level,
 }
@@ -276,6 +279,11 @@ fn loopback_host(host: &str) -> bool {
         || host
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+/// Whether a URL is plain `http://` to a host that is not loopback.
+pub fn insecure_remote(url: &str) -> bool {
+    matches!(url_host(url), Some(("http", host)) if !loopback_host(host))
 }
 
 /// The host of an `http://` or `https://` URL, or `None`.
@@ -480,6 +488,14 @@ impl Config {
             number(env, "GM_EDGE_QUEUE_TIMEOUT_SECONDS")?.or(file.local_api.queue_timeout_seconds),
             30,
         );
+        let rate_limit_per_minute = number(env, "GM_EDGE_RATE_LIMIT_PER_MINUTE")?
+            .or(file.local_api.rate_limit_per_minute)
+            .unwrap_or(60);
+        if rate_limit_per_minute == 0 {
+            return Err(bad(
+                "local_api.rate_limit_per_minute must be greater than zero",
+            ));
+        }
         if report_timeout.is_zero() {
             return Err(bad(
                 "local_api.report_timeout_seconds must be greater than zero",
@@ -511,6 +527,7 @@ impl Config {
             tokens,
             report_timeout,
             queue_timeout,
+            rate_limit_per_minute,
             log_level,
         })
     }
@@ -548,6 +565,7 @@ impl Config {
                 "tokens": self.tokens.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
                 "report_timeout_seconds": self.report_timeout.as_secs(),
                 "queue_timeout_seconds": self.queue_timeout.as_secs(),
+                "rate_limit_per_minute": self.rate_limit_per_minute,
             },
             "log": {"level": self.log_level.name()},
         })
@@ -624,6 +642,10 @@ allowed_uids = [1000]
         ));
         // Plain http to a remote host.
         assert!(refused(BASE, &[("GM_EDGE_NA_URL", "http://na.example")]));
+        assert!(insecure_remote("http://na.example:9443"));
+        assert!(!insecure_remote("http://127.0.0.1:9443"));
+        assert!(!insecure_remote("http://[::1]:9443"));
+        assert!(!insecure_remote("https://na.example"));
         assert!(!refused(
             BASE,
             &[

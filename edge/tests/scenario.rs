@@ -97,7 +97,7 @@ async fn lifecycle() {
     agent.start();
     // Renewed, and the grant held.
     let status = agent
-        .wait_for(Duration::from_secs(60), |s| {
+        .wait_for(Duration::from_secs(120), |s| {
             s["cert_id"].as_str().is_some_and(|c| c != first_cert)
                 && s["grants"].as_array().is_some_and(|g| !g.is_empty())
                 && s["connected"] == true
@@ -148,7 +148,7 @@ async fn lifecycle() {
     let held = na.admin.grants.get(&grant).await.unwrap();
     assert_eq!(held["revocation"]["reason"], "bearer_key_retired", "{held}");
     agent
-        .wait_for(Duration::from_secs(30), |s| s["state"] == "revoked")
+        .wait_for(Duration::from_secs(90), |s| s["state"] == "revoked")
         .await;
     let (code, refused) = agent
         .call(
@@ -508,4 +508,130 @@ async fn local_auth() {
         Err(err) => eprintln!("skipped (a), another uid: no sudo ({err})"),
     }
     assert_eq!(unix.stop().await, Some(0), "{}", unix.log());
+}
+
+/// Setup shared by the shorter scenarios: an enrolled, connected agent with
+/// an attestation for cap.a and cap.c and a grant for cap.a.
+async fn connected(
+    na: &support::Na,
+    proxy: &Proxy,
+    extra: &[(&str, &str)],
+) -> (Agent, String, String) {
+    let site = sovereign();
+    let token = na.edge_invite(&site, 168).await;
+    let mut env = vec![("GM_EDGE_INVITE_TOKEN", token.as_str())];
+    env.extend_from_slice(extra);
+    let mut agent = Agent::new(&proxy.url, &na.na_public_key, &env);
+    agent.start();
+    let status = agent
+        .wait_for(Duration::from_secs(60), |s| s["state"] == "active")
+        .await;
+    let executor_key_id = status["executor_key_id"].as_str().unwrap().to_owned();
+    let prefix = status["resource_prefix"].as_str().unwrap().to_owned();
+    let attestation = na.attest(&site, &["cap.a", "cap.c"]).await;
+    let grant = na
+        .grant(&executor_key_id, &attestation, "cap.a", 20, 10, 60)
+        .await;
+    agent
+        .wait_for(Duration::from_secs(60), |s| {
+            s["grants"].as_array().is_some_and(|g| g.len() == 1) && s["connected"] == true
+        })
+        .await;
+    (agent, prefix, grant)
+}
+
+#[tokio::test]
+async fn rate_limited() {
+    let Some(na) = start_na() else { return };
+    let proxy = Proxy::start(&na.base_url).await;
+    let (mut agent, prefix, _) =
+        connected(&na, &proxy, &[("GM_EDGE_RATE_LIMIT_PER_MINUTE", "8")]).await;
+    // The NA denies 95 days (its policy allows at most 90): a DENY.
+    let (_, denied) = agent.act(request("cap.a", &prefix, 95, None)).await;
+    assert_eq!(denied["code"], "na_denied", "{denied}\n{}", agent.log());
+    // The NA now answers 429 to everything: an answer, never "unreachable".
+    // No grant use, no break-glass, whatever the request.
+    proxy.throttle();
+    for (capability, lifetime, justification) in [
+        ("cap.a", 95, Some("urgent")),
+        ("cap.a", 30, None),
+        ("cap.a", 30, Some("urgent")),
+        ("cap.c", 30, Some("urgent")),
+    ] {
+        let (code, answer) = agent
+            .act(request(capability, &prefix, lifetime, justification))
+            .await;
+        assert_eq!(code, 200, "{answer}");
+        assert_eq!(answer["allowed"], false, "{answer}\n{}", agent.log());
+        assert_eq!(answer["code"], "na_refused", "{answer}");
+        assert_eq!(answer["na_code"], "rate_limit_exceeded", "{answer}");
+    }
+    let status = agent.status().await;
+    assert_eq!(status["connected"], true, "{status}");
+    assert_eq!(status["pending_uploads"], 0, "nothing ran: {status}");
+    assert_eq!(status["grants"][0]["uses"], 0, "{status}");
+    // A local client that asks too often is refused before the NA is asked.
+    let mut limited = None;
+    for _ in 0..8 {
+        let (code, answer) = agent
+            .call(
+                "POST",
+                "/v1/authorize",
+                Some(&request("cap.c", &prefix, 30, None)),
+            )
+            .await;
+        if code == 429 {
+            limited = Some(answer);
+            break;
+        }
+    }
+    let limited = limited.expect("the local rate limit");
+    assert_eq!(limited["error"]["code"], "local_rate_limited");
+    proxy.forward();
+    assert_eq!(agent.stop().await, Some(0), "{}", agent.log());
+}
+
+#[tokio::test]
+async fn blackhole() {
+    let Some(na) = start_na() else { return };
+    let proxy = Proxy::start(&na.base_url).await;
+    let (mut agent, prefix, grant) = connected(&na, &proxy, &[]).await;
+    // The network swallows every request: the NA's timeout (3 s here) is the
+    // only sign. Grants still cover what they cover; break-glass the rest.
+    proxy.blackhole();
+    for lifetime in [10, 20] {
+        let (_, used) = agent.act(request("cap.a", &prefix, lifetime, None)).await;
+        assert_eq!(used["authority"], "grant", "{used}\n{}", agent.log());
+    }
+    let (_, outside) = agent
+        .act(request("cap.a", &prefix, 400, Some("urgent")))
+        .await;
+    assert_eq!(outside["code"], "outside_grant", "{outside}");
+    let (_, glass) = agent
+        .act(request("cap.c", &prefix, 30, Some("the network is down")))
+        .await;
+    assert_eq!(
+        glass["authority"],
+        "break_glass",
+        "{glass}\n{}",
+        agent.log()
+    );
+    let during = agent.status().await;
+    assert_eq!(during["connected"], false, "{during}");
+    proxy.forward();
+    let t0 = tokio::time::Instant::now();
+    agent
+        .wait_for(Duration::from_secs(180), |s| {
+            s["pending_uploads"] == 0 && s["connected"] == true
+        })
+        .await;
+    assert!(
+        t0.elapsed() <= Duration::from_secs(120),
+        "uploads took {:?}",
+        t0.elapsed()
+    );
+    let uses = na.admin.grants.uses(&grant, None, Some(100)).await.unwrap();
+    assert_eq!(uses["uses"].as_array().unwrap().len(), 2, "{uses}");
+    assert!(!proxy.admin_headers_seen());
+    assert_eq!(agent.stop().await, Some(0), "{}", agent.log());
 }

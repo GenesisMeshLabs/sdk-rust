@@ -32,8 +32,32 @@ pub const MAX_BODY: usize = 64 * 1024;
 const ACTIONS: [&str; 5] = ["create", "rotate", "revoke", "update", "delete"];
 const OUTCOMES: [&str; 3] = ["success", "failure", "partial"];
 
+/// Authorizations per minute per local client: a client that asks too often
+/// gets `429 local_rate_limited`, before the agent asks the NA anything.
+#[derive(Debug, Default)]
+pub struct RateLimiter {
+    windows: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u32)>>,
+}
+
+impl RateLimiter {
+    /// Count one request of `client`; false when it is over `per_minute`.
+    pub fn allow(&self, client: &str, per_minute: u32) -> bool {
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        let minute = std::time::Duration::from_secs(60);
+        windows.retain(|_, window| now.duration_since(window.0) < minute);
+        let window = windows.entry(client.to_owned()).or_insert((now, 0));
+        window.1 += 1;
+        window.1 <= per_minute
+    }
+}
+
 /// Whether a Unix socket peer may use the API: its uid or gid is allowed.
-/// Root is not implied.
+/// Root is not implied, and only the peer's primary gid is checked (the
+/// kernel reports no supplementary groups).
 pub fn peer_allowed(uid: u32, gid: u32, allowed_uids: &[u32], allowed_gids: &[u32]) -> bool {
     allowed_uids.contains(&uid) || allowed_gids.contains(&gid)
 }
@@ -180,11 +204,24 @@ pub fn outcome_of(body: &Value) -> Result<Outcome, ApiError> {
     })
 }
 
-async fn route(agent: Arc<Agent>, request: Request<Incoming>) -> Result<Value, ApiError> {
+async fn route(
+    agent: Arc<Agent>,
+    request: Request<Incoming>,
+    client: &str,
+    limiter: &RateLimiter,
+) -> Result<Value, ApiError> {
     let path = request.uri().path().to_owned();
     match (request.method().clone(), path.as_str()) {
         (Method::GET, "/v1/status") => Ok(agent.status().await),
         (Method::POST, "/v1/authorize") => {
+            if !limiter.allow(client, agent.config.rate_limit_per_minute) {
+                log::warn("local_rate_limited", json!({"client": client}));
+                return Err(ApiError::new(
+                    429,
+                    "local_rate_limited",
+                    "too many authorizations from this client; try again in a minute",
+                ));
+            }
             let body = body_of(request).await?;
             agent.authorize(authorize_request(&body)?).await
         }
@@ -210,26 +247,31 @@ async fn route(agent: Arc<Agent>, request: Request<Incoming>) -> Result<Value, A
 async fn handle(
     agent: Arc<Agent>,
     request: Request<Incoming>,
-    authenticated: bool,
+    peer: Option<String>,
+    limiter: Arc<RateLimiter>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    if !authenticated
-        && token_name(
+    // A socket peer is known by its uid; a loopback client by its token.
+    let client = match peer {
+        Some(peer) => peer,
+        None => match token_name(
             request
                 .headers()
                 .get(AUTHORIZATION)
                 .and_then(|h| h.to_str().ok()),
             &agent.config.tokens,
-        )
-        .is_none()
-    {
-        log::warn("local_client_refused", json!({"reason": "token"}));
-        return Ok(error(&ApiError::new(
-            401,
-            "local_auth_required",
-            "a valid bearer token is required",
-        )));
-    }
-    Ok(match route(agent, request).await {
+        ) {
+            Some(name) => format!("token:{name}"),
+            None => {
+                log::warn("local_client_refused", json!({"reason": "token"}));
+                return Ok(error(&ApiError::new(
+                    401,
+                    "local_auth_required",
+                    "a valid bearer token is required",
+                )));
+            }
+        },
+    };
+    Ok(match route(agent, request, &client, &limiter).await {
         Ok(body) => respond(200, &body),
         Err(err) => error(&err),
     })
@@ -261,11 +303,22 @@ fn group_id(group: &str) -> Option<u32> {
         })
 }
 
-async fn serve_connection<S>(agent: Arc<Agent>, stream: S, authenticated: bool)
-where
+async fn serve_connection<S>(
+    agent: Arc<Agent>,
+    stream: S,
+    peer: Option<String>,
+    limiter: Arc<RateLimiter>,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let service = service_fn(move |request| handle(Arc::clone(&agent), request, authenticated));
+    let service = service_fn(move |request| {
+        handle(
+            Arc::clone(&agent),
+            request,
+            peer.clone(),
+            Arc::clone(&limiter),
+        )
+    });
     let _ = hyper::server::conn::http1::Builder::new()
         .serve_connection(TokioIo::new(stream), service)
         .await;
@@ -273,6 +326,7 @@ where
 
 /// Serve the local API until `stop` fires.
 pub async fn serve(agent: Arc<Agent>, mut stop: watch::Receiver<bool>) -> std::io::Result<()> {
+    let limiter = Arc::new(RateLimiter::default());
     match agent.config.listen.clone() {
         Listen::Unix(path) => {
             if let Some(parent) = path.parent() {
@@ -313,7 +367,13 @@ pub async fn serve(agent: Arc<Agent>, mut stop: watch::Receiver<bool>) -> std::i
                     });
                     continue;
                 }
-                tokio::spawn(serve_connection(Arc::clone(&agent), stream, true));
+                let peer = credentials.ok().map(|c| format!("uid:{}", c.uid()));
+                tokio::spawn(serve_connection(
+                    Arc::clone(&agent),
+                    stream,
+                    peer,
+                    Arc::clone(&limiter),
+                ));
             }
             let _ = std::fs::remove_file(&path);
         }
@@ -328,7 +388,12 @@ pub async fn serve(agent: Arc<Agent>, mut stop: watch::Receiver<bool>) -> std::i
                     accepted = listener.accept() => accepted?,
                     _ = stop.changed() => break,
                 };
-                tokio::spawn(serve_connection(Arc::clone(&agent), stream, false));
+                tokio::spawn(serve_connection(
+                    Arc::clone(&agent),
+                    stream,
+                    None,
+                    Arc::clone(&limiter),
+                ));
             }
         }
     }
@@ -346,6 +411,14 @@ mod tests {
         assert!(!peer_allowed(0, 0, &[1000], &[50]));
         assert!(!peer_allowed(65534, 65534, &[1000], &[]));
         assert!(!peer_allowed(1000, 1000, &[], &[]));
+    }
+
+    #[test]
+    fn a_client_is_limited_per_minute() {
+        let limiter = RateLimiter::default();
+        assert!((0..3).all(|_| limiter.allow("uid:1000", 3)));
+        assert!(!limiter.allow("uid:1000", 3));
+        assert!(limiter.allow("token:ops", 3));
     }
 
     #[test]

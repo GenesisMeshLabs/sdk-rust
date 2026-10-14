@@ -32,6 +32,7 @@ use crate::{
 const USAGE: &str = "usage: genesis-mesh-edge [--config <file>] <command>
 
 commands:
+  init [--json]
   enroll [--invite-token-file <file>] [--reset [--discard-pending]]
   run [--invite-token-file <file>]
   status [--json]
@@ -148,6 +149,29 @@ async fn enroll(agent: &Arc<Agent>, token: &str) -> Result<(), Exit> {
     // A first sync; a failure here is not fatal.
     if let Err(err) = agent.sync().await {
         log::warn("first_sync_failed", json!({"code": err.code()}));
+    }
+    Ok(())
+}
+
+/// Create the state directory and the keys if absent, and print the node's
+/// public key: an operator can then bind the edge invite to it
+/// (`recipient_public_key`). `enroll` uses these keys.
+fn command_init(args: &Args) -> Result<(), Exit> {
+    let config = load_config(args)?;
+    let dir = StateDir::open(&config.state_dir)?;
+    let node = dir.key(state::NODE_KEY)?;
+    let executor = dir.key(state::EXECUTOR_KEY)?;
+    let public = |seed: &str| {
+        genesis_mesh_sdk::public_key_from_seed(seed).map_err(|e| Exit::Internal(e.to_string()))
+    };
+    let (node, executor) = (public(&node)?, public(&executor)?);
+    if args.json {
+        println!(
+            "{}",
+            json!({"node_public_key": node, "executor_public_key": executor})
+        );
+    } else {
+        println!("{node}");
     }
     Ok(())
 }
@@ -315,6 +339,7 @@ fn main() -> ExitCode {
     let result = parse(arguments).and_then(|args| {
         let words: Vec<&str> = args.command.iter().map(String::as_str).collect();
         match words.as_slice() {
+            ["init"] => command_init(&args),
             ["enroll"] => command_enroll(&args),
             ["run"] => command_run(&args),
             ["status"] => command_status(&args),
