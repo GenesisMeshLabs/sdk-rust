@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "genesis-mesh-sdk"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "genesis-mesh-verify"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "base64 0.23.1",
  "genesis-mesh-sdk",
