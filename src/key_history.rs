@@ -58,11 +58,15 @@ pub const MAX_DECISION_LIFETIME_SECONDS: i64 = 300;
 /// placed at in the key history, by model: the reference's
 /// `NA_RECORD_TIME_FIELDS` (1.5.0 review fixes). In the store every entry is
 /// placed at its `recorded_at`.
-pub const NA_RECORD_TIME_FIELDS: [(&str, &str); 13] = [
+pub const NA_RECORD_TIME_FIELDS: [(&str, &str); 16] = [
     ("ArchiveRecord", "archived_at"),
     ("AuditPackManifest", "created_at"),
     ("BoundaryDecision", "decision_made_at"),
     ("BoundaryPolicy", "issued_at"),
+    // v1.6.0: a grant, its revocation, and a time token (read alone, or
+    // nested in a use).
+    ("CapabilityGrant", "issued_at"),
+    ("GrantRevocationRecord", "revoked_at"),
     ("JudgementRecord", "judged_at"),
     ("JustificationProof", "proof_issued_at"),
     ("MembershipAttestation", "issued_at"),
@@ -72,6 +76,7 @@ pub const NA_RECORD_TIME_FIELDS: [(&str, &str); 13] = [
     ("RetentionCheckpoint", "created_at"),
     ("ReviewRecord", "decided_at"),
     ("StoreAnchor", "anchored_at"),
+    ("TimeToken", "issued_at"),
 ];
 
 /// The field an NA-signed record of `model` is placed at when read alone.

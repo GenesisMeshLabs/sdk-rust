@@ -45,8 +45,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     auth::{canonical_json, verify_canonical},
     canonical::{
-        entry_digest, micros, parse_timestamp, policy_digest, policy_set_digest, python_timestamp,
-        received_canonical,
+        attestation_digest, entry_digest, micros, parse_timestamp, policy_digest,
+        policy_set_digest, python_timestamp, received_canonical,
     },
     key_history::{verify_key_history, NaKeyHistory, NaKeys},
     strict::{non_canonical_fields, unknown_fields},
@@ -1418,6 +1418,28 @@ fn check_cited_trust(
                 }
                 &event["payload"]["policy_binding"]
             }
+            // v1.6.0: the policy versions a grant is bound to, and the
+            // attestation it rests on.
+            "grant" => {
+                let grant = &event["payload"];
+                if !reads_as("CapabilityGrant", grant) {
+                    continue;
+                }
+                if field(grant, "basis_kind") == Some("attestation") {
+                    let id = field(grant, "basis_id").unwrap_or_default();
+                    match by_attestation.get(id) {
+                        None => result.fail(file, Some(seq), "cited_attestation_missing", id),
+                        Some(held) => {
+                            if attestation_digest(held).ok().as_deref()
+                                != field(grant, "basis_digest")
+                            {
+                                result.fail(file, Some(seq), "cited_attestation_mismatch", id);
+                            }
+                        }
+                    }
+                }
+                &grant["policy_binding"]
+            }
             _ => continue,
         };
         if binding.is_null() {
@@ -1705,6 +1727,8 @@ pub fn render_report(
     let (mut changes, mut denials, mut remediations, mut reviews) =
         (vec![], vec![], vec![], vec![]);
     let (mut break_glass, mut quarantined, mut others) = (vec![], vec![], vec![]);
+    // v1.6.0: grants and their revocations.
+    let (mut grants, mut grant_revocations) = (vec![], vec![]);
     let null = Value::Null;
     for e in entries {
         let p = &e["payload"];
@@ -1725,6 +1749,29 @@ pub fn render_report(
                     at("executor_sovereign_id"),
                 ]);
             }
+            // v1.6.0: a change made under a grant, governed by it.
+            "grant_execution" => changes.push(vec![
+                seq,
+                json!(kind),
+                at("resource_id"),
+                at("resource_action"),
+                at("executed_at"),
+                json!("grant"),
+                json!("recorded"),
+                at("executor_sovereign_id"),
+            ]),
+            "grant" => grants.push(vec![
+                seq,
+                at("grant_id"),
+                at("bearer_sovereign_id"),
+                at("capabilities"),
+                at("valid_from"),
+                at("valid_until"),
+                at("max_uses"),
+            ]),
+            "grant_revocation" => {
+                grant_revocations.push(vec![seq, at("grant_id"), at("reason"), at("revoked_at")])
+            }
             "observation" | "break_glass" => {
                 let record_id = py_str(or(&at("observation_id"), &at("break_glass_id")));
                 let judgement = judgements.get(&(kind.to_owned(), record_id)).copied();
@@ -1732,8 +1779,11 @@ pub fn render_report(
                 if state.is_null() {
                     state = json!(match judgement {
                         None => "observed",
+                        // v1.6.0: or matched to a grant use.
                         Some(j)
-                            if j["governed_by"] == "prior_decision" && j["verdict"] != "deny" =>
+                            if (j["governed_by"] == "prior_decision"
+                                || j["governed_by"] == "grant")
+                                && j["verdict"] != "deny" =>
                             "matched",
                         Some(j) => match py_str(&j["verdict"]).as_str() {
                             "allow" => "judged_allowed",
@@ -1840,7 +1890,7 @@ pub fn render_report(
             ]
         })
         .collect();
-    let sections: [Section<'_>; 8] = [
+    let mut sections: Vec<Section<'_>> = vec![
         (
             "Changes",
             &[
@@ -1907,6 +1957,30 @@ pub fn render_report(
             &others,
         ),
     ];
+    // v1.6.0: grants and their revocations, only in a pack that holds them
+    // (a pack without them renders as in 1.5).
+    if !grants.is_empty() {
+        sections.push((
+            "Grants",
+            &[
+                "Entry",
+                "Grant",
+                "Bearer",
+                "Capabilities",
+                "Valid from",
+                "Valid until",
+                "Budget",
+            ],
+            &grants,
+        ));
+    }
+    if !grant_revocations.is_empty() {
+        sections.push((
+            "Grant revocations",
+            &["Entry", "Grant", "Reason", "Revoked at"],
+            &grant_revocations,
+        ));
+    }
     for (title, headers, rows) in sections {
         lines.extend([format!("## {title}"), String::new()]);
         lines.extend(table(headers, rows));
@@ -2182,8 +2256,8 @@ pub fn parse_changes(text: &str, csv: bool) -> std::result::Result<Vec<Change>, 
     Ok(out)
 }
 
-/// A change as the pack records it: an observation, a break-glass record or
-/// execution evidence.
+/// A change as the pack records it: an observation, a break-glass record,
+/// execution evidence or (1.6.0) a grant use.
 #[derive(Debug, Clone)]
 struct Recorded {
     kind: &'static str,
@@ -2241,22 +2315,19 @@ fn records(entries: &[Value], cited: &[Value]) -> Vec<Recorded> {
                     group: String::new(),
                 })
             })(),
-            Some(kind @ ("break_glass" | "execution")) => (|| {
-                if kind == "execution" && field(p, "resource_id").is_none_or(str::is_empty) {
+            // v1.6.0: a grant use is a change made under a grant.
+            Some(kind @ ("break_glass" | "execution" | "grant_execution")) => (|| {
+                if kind != "break_glass" && field(p, "resource_id").is_none_or(str::is_empty) {
                     return None;
                 }
                 let at = when("executed_at")?;
-                let id = if kind == "execution" {
-                    "evidence_id"
-                } else {
-                    "break_glass_id"
+                let (kind, id) = match kind {
+                    "execution" => ("execution", "evidence_id"),
+                    "grant_execution" => ("grant_execution", "use_id"),
+                    _ => ("break_glass", "break_glass_id"),
                 };
                 Some(Recorded {
-                    kind: if kind == "execution" {
-                        "execution"
-                    } else {
-                        "break_glass"
-                    },
+                    kind,
                     record_id: text(id)?,
                     store_sequence: seq,
                     resource_id: text("resource_id")?,

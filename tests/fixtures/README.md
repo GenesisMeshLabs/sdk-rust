@@ -28,3 +28,8 @@ time, packs and the completeness check), copied unchanged; so is
 `audit-pack-1.5.0/`, the frozen 1.5.0 pack with its root key and the anchors an
 auditor holds. Its files are byte-exact (`.gitattributes`): its manifest holds
 their digests.
+
+`grants.json` (1.6.0) is the core's `grants` conformance suite (the grant
+records' signed forms, envelopes, the issuance check, the use rules and stores
+holding grants), copied unchanged. `tests/grants.rs` runs every vector but the
+58 issuance vectors, which the suite leaves to the NA.

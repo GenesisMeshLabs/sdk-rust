@@ -287,5 +287,6 @@ fn every_vector_gives_the_reference_outcome() {
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
-    assert_eq!(vectors.len(), 105);
+    // 1.6.0: three record-time vectors (a grant, a revocation, a time token).
+    assert_eq!(vectors.len(), 108);
 }

@@ -16,6 +16,7 @@ mod evidence;
 mod evidence_store;
 mod execution;
 mod governance;
+pub mod grants;
 mod health;
 pub mod key_history;
 mod out_of_band;

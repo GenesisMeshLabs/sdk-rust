@@ -319,6 +319,22 @@ pub fn non_canonical_fields(model: &str, data: &Value) -> Vec<String> {
     }
     let mut found = non_canonical_timestamps(model, data);
     walk(model, data, "", true, &mut found);
+    // v1.6.0: what else the reference writes back differently for a grant
+    // record: an envelope's integral numbers as integers (`5`, never `5.0`),
+    // and a nested time token without `use_head_digest` when it has none.
+    match model {
+        "CapabilityGrant" => found.extend(crate::grants::envelope_number_problems(
+            &data["parameter_envelope"],
+        )),
+        "GrantExecutionEvidence"
+            if data["time_token"]
+                .get("use_head_digest")
+                .is_some_and(Value::is_null) =>
+        {
+            found.push("time_token.use_head_digest".into());
+        }
+        _ => {}
+    }
     found.sort();
     found.dedup();
     found

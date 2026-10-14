@@ -18,14 +18,18 @@ use crate::common::{Run, Scratch};
 /// A key that verifies nothing: given where a vector names no key.
 const NO_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
-/// The counts an export result carries when nonzero.
-const COUNTS: [&str; 6] = [
+/// The counts an export result carries when nonzero (1.6.0: and the grant
+/// kinds'). A count the vector names is compared too.
+const COUNTS: [&str; 9] = [
     "observations",
     "break_glass",
     "judgements",
     "quarantined",
     "remediations",
     "reviews",
+    "grants",
+    "grant_executions",
+    "grant_revocations",
 ];
 
 /// How a run is read back.
@@ -105,6 +109,14 @@ fn record_kind(model: &str) -> Option<(&'static str, Option<(&'static str, &'sta
         "BoundaryDecision" => ("decision", None),
         "BoundaryPolicy" => ("policy", None),
         "MembershipAttestation" => ("attestation", None),
+        // 1.6.0: a grant use is signed by its grant's bearer key, an executor key.
+        "CapabilityGrant" => ("grant", None),
+        "GrantExecutionEvidence" => (
+            "grant_execution",
+            Some(("executor", "executor_sovereign_id")),
+        ),
+        "GrantRevocationRecord" => ("grant_revocation", None),
+        "TimeToken" => ("time_token", None),
         _ => return None,
     })
 }
@@ -161,6 +173,24 @@ fn decision_case(v: &Value, scratch: &Scratch) -> Adapted {
 fn record_case(v: &Value, scratch: &Scratch) -> Adapted {
     let record = &v["record"];
     let model = v["model"].as_str().unwrap_or_default();
+    // 1.6.0: a holder's time token request and the revocation feed are no
+    // record the binary reads; the library verifies them.
+    let key = || vec![v["public_key"].as_str().unwrap_or(NO_KEY).to_owned()];
+    match model {
+        "TimeTokenRequest" => {
+            return Adapted::Computed {
+                got: json!({"valid": genesis_mesh_sdk::grants::signed_as_received(model, record, &key())}),
+                expected: v["expected"].clone(),
+            }
+        }
+        "SovereignRevocationFeed" => {
+            return Adapted::Computed {
+                got: json!({"valid": genesis_mesh_sdk::verify::verify_revocation_feed(record, &key())}),
+                expected: v["expected"].clone(),
+            }
+        }
+        _ => {}
+    }
     let Some((kind, signer)) = record_kind(model) else {
         return Adapted::Skip(format!("no record kind for model {model}"));
     };
@@ -618,9 +648,12 @@ pub fn project(case: &Case, run: &Run) -> Value {
     let out = run.json();
     match case.projection {
         Projection::Export => {
+            let named = case.expected["counts"].as_object();
             let counts: Map<String, Value> = COUNTS
                 .iter()
-                .filter_map(|k| Some((k.to_string(), out.get(*k)?.clone())))
+                .map(|k| k.to_string())
+                .chain(named.into_iter().flat_map(|c| c.keys().cloned()))
+                .filter_map(|k| Some((k.clone(), out.get(&k)?.clone())))
                 .collect();
             json!({
                 "verified": out["verified"],

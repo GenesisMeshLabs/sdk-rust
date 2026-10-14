@@ -98,6 +98,7 @@ fn the_binary_gives_the_reference_verdicts_on_the_shared_vectors() {
         "remediation",
         "anchors",
         "audit",
+        "grants",
     ] {
         run_suite(&fixture(name), &mut tally);
     }
@@ -105,10 +106,12 @@ fn the_binary_gives_the_reference_verdicts_on_the_shared_vectors() {
     // Every decision, export and record vector, every anchored export, and
     // the audit suite's key histories, exports and packs; the canonical-JSON,
     // timestamp, agreement, anchor-chain, key-window and completeness vectors
-    // are the SDK's own tests (tests/anchors.rs, tests/audit.rs).
+    // are the SDK's own tests (tests/anchors.rs, tests/audit.rs). 1.6.0: the
+    // grants suite's records and stores; its envelopes, issuance and use
+    // rules are the SDK's own tests (tests/grants.rs).
     assert_eq!(
         tally.ran,
-        10 + 6 + 41 + 31 + 8 + (19 + 13 + 22 + 2 + 13),
+        10 + 6 + 41 + 31 + 8 + (19 + 13 + 22 + 2 + 13) + (12 + 20),
         "{:#?}",
         tally.skipped
     );
@@ -157,6 +160,7 @@ fn the_core_corpus_when_given() {
             "out_of_band",
             "remediation",
             "audit",
+            "grants",
         ] {
             let theirs = std::fs::read(path.join("vectors").join(format!("{name}.json")))
                 .expect("the corpus copies the suite");
