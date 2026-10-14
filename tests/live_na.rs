@@ -1273,6 +1273,38 @@ async fn act_within_grants_offline_and_upload_on_reconnect(na: &LiveNa) {
     let held = gm.grants.get(holder.grant_id()).await.unwrap();
     assert_eq!(held["uses"], 3);
     assert_eq!(held["remaining_uses"], 0);
+    assert_eq!(held["chain_length"], 3);
+    // The use chain, newest first, page by page.
+    let page = gm
+        .grants
+        .uses(holder.grant_id(), None, Some(2))
+        .await
+        .unwrap();
+    let listed = page["uses"].as_array().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0]["use_sequence"], 3);
+    assert_eq!(listed[0]["state"], "admitted");
+    let rest = gm
+        .grants
+        .uses(holder.grant_id(), page["next_before"].as_u64(), Some(2))
+        .await
+        .unwrap();
+    assert_eq!(rest["uses"][0]["use_sequence"], 1);
+    // The resource's head is the last use; the grant's entries by its id.
+    let head = gm
+        .evidence_store
+        .resource_head_entry(&resource)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head["entry_kind"], "grant_execution");
+    assert_eq!(head["record_id"], third.record["use_id"]);
+    let entries = gm
+        .evidence_store
+        .search_all(json!({"grant_id": holder.grant_id()}))
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 3);
     // The budget is spent: refused offline, without a fallback.
     let spent = holder
         .act(&offline, rotate(30), |_| report("x"))

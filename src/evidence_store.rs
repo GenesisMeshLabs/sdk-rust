@@ -401,8 +401,9 @@ impl EvidenceStoreClient {
 
     /// Search stored entries (admin). Filters: `vendor_id`, `attestation_id`,
     /// `capability`, `resource_id`, `outcome`, `entry_kind`, `decision_id`,
-    /// `since`, `until`, `after_sequence`, `limit` (1..1000). Use
-    /// `next_after_sequence` as the next `after_sequence`.
+    /// `grant_id` (1.6.0: a grant's uses and revocation), `since`, `until`,
+    /// `after_sequence`, `limit` (1..1000). Use `next_after_sequence` as the
+    /// next `after_sequence`.
     pub async fn search(&self, params: Value) -> Result<Value> {
         self.http
             .admin_get("/admin/evidence", &query_pairs(&params)?)
@@ -566,7 +567,9 @@ impl EvidenceStoreClient {
     /// The head of a resource chain, or `None` for a resource with no history
     /// (admin). One indexed lookup on the NA (`/admin/evidence/resource-heads`,
     /// v0.63.1), which also covers chains whose records retention removed.
-    /// Against an older NA it falls back to the resource history.
+    /// Against an older NA it falls back to the resource history. Since 1.6.0
+    /// the head may be a grant use: [`resource_head_entry`](Self::resource_head_entry)
+    /// says which.
     pub async fn resource_head(&self, resource_id: &str) -> Result<Option<ResourceHead>> {
         let path = format!(
             "/admin/evidence/resource-heads/{}",
@@ -580,6 +583,26 @@ impl EvidenceStoreClient {
             // Route missing: an NA older than v0.63.1.
             Err(GenesisMeshError::NotFound { .. }) => {
                 self.resource_head_from_history(resource_id).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The head of a resource chain as the NA answers it (admin, 1.6.0):
+    /// `resource_sequence`, `record_digest`, and what the head is,
+    /// `entry_kind` (`execution`, `grant_execution`, or
+    /// `retention_checkpoint` once retention removed every stored record) and
+    /// its `record_id` (an execution's `evidence_id`, a use's `use_id`).
+    /// `None` for a resource with no history.
+    pub async fn resource_head_entry(&self, resource_id: &str) -> Result<Option<Value>> {
+        let path = format!(
+            "/admin/evidence/resource-heads/{}",
+            resource_path(resource_id)?
+        );
+        match self.http.admin_get::<Value>(&path, &[]).await {
+            Ok(head) => Ok(Some(head)),
+            Err(GenesisMeshError::NotFound { code, .. }) if code == "resource_not_found" => {
+                Ok(None)
             }
             Err(err) => Err(err),
         }
@@ -718,9 +741,9 @@ impl EvidenceStoreClient {
 
     /// Submit the record outbox's pending records (v1.3.0): break-glass
     /// records first, one at a time (1.3.1), then grant uses one at a time in
-    /// the order they were made (1.6.0: their chain's order; a use behind one
-    /// the NA refused for good is a dead letter,
-    /// `evidence_predecessor_dead_lettered`), then observations, consecutive
+    /// the order they were made (1.6.0: their chain's order; a use the NA
+    /// quarantines still takes its place in the chain, so the next is
+    /// submitted and judged on its own), then observations, consecutive
     /// ones up to 100 per request, then remediation records one at a time
     /// (1.4.0: the changes they remediate are judged by then), each in the
     /// order they were added.
@@ -883,24 +906,6 @@ impl EvidenceStoreClient {
                 // resubmits it, gets a duplicate and removes it.
                 let _ = outbox.remove(&entry.id).await;
                 RecordDelivery::admitted(ack)
-            }
-            // 1.6.0: a grant use behind a dead letter of its chain waits for
-            // a use that never comes: final, as an execution record's gap.
-            (Err(err), _)
-                if entry.kind == RecordKind::GrantExecution
-                    && err.code() == "grant_use_chain_gap"
-                    && use_behind_dead_letter(outbox, &entry).await =>
-            {
-                let (failure, _) = classify_record_submission_error(&err);
-                let refused = RecordOutboxEntry {
-                    attempts: entry.attempts + 1,
-                    state: OutboxState::DeadLetter,
-                    next_attempt_at: None,
-                    last_error: Some(predecessor_refused(failure)),
-                    ..entry
-                };
-                let _ = outbox.update(&refused).await;
-                RecordDelivery::queued(refused)
             }
             (Err(err), wait) => {
                 self.pause_records(&err, wait);
@@ -1343,33 +1348,6 @@ async fn record_failed(
     };
     let _ = outbox.update(&next).await;
     next
-}
-
-/// Whether a grant use chains from a dead letter of the record outbox (its
-/// previous use, or one before that), so the NA's chain never reaches it.
-async fn use_behind_dead_letter(outbox: &dyn RecordOutbox, entry: &RecordOutboxEntry) -> bool {
-    let Ok(entries) = outbox.list().await else {
-        return false;
-    };
-    let uses: Vec<&RecordOutboxEntry> = entries
-        .iter()
-        .filter(|e| {
-            e.kind == RecordKind::GrantExecution && e.record["grant_id"] == entry.record["grant_id"]
-        })
-        .collect();
-    let mut link = entry.record["prev_use_digest"].as_str().map(str::to_owned);
-    while let Some(digest) = link {
-        let Some(before) = uses.iter().find(|e| {
-            crate::grants::use_digest(&e.record).ok().as_deref() == Some(digest.as_str())
-        }) else {
-            return false;
-        };
-        if before.state == OutboxState::DeadLetter {
-            return true;
-        }
-        link = before.record["prev_use_digest"].as_str().map(str::to_owned);
-    }
-    false
 }
 
 /// A request larger than the NA (or a proxy before it) takes.

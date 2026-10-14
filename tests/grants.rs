@@ -12,7 +12,7 @@ use genesis_mesh_sdk::{
         envelope_problem, grant_digest, normalize_parameter, signed_as_received, use_problem,
         PreviousUse, UseContext,
     },
-    json,
+    json, parse_strict_json,
     verify::{
         parse_export_lines, valid_grant_record, verify_evidence_events, verify_record,
         verify_revocation_feed, VerifyEvidenceOptions, VerifyRecordOptions,
@@ -49,11 +49,10 @@ const COUNTS: [&str; 7] = [
 ];
 
 /// What this crate makes of one vector, in the form the reference's
-/// `evaluate` returns; `None` for an issuance vector (the NA decides those:
-/// the suite says an SDK may skip them).
-fn evaluate(v: &Value) -> Option<Value> {
+/// `evaluate` returns.
+fn evaluate(v: &Value) -> Value {
     let input = &v["input"];
-    Some(match v["kind"].as_str().unwrap() {
+    match v["kind"].as_str().unwrap() {
         "canonical_form" => {
             let body = received_canonical(v["model"].as_str().unwrap(), &v["record"]).unwrap();
             let digest: String = Sha256::digest(body.as_bytes())
@@ -67,27 +66,32 @@ fn evaluate(v: &Value) -> Option<Value> {
             &v["record"],
             &[v["public_key"].as_str().unwrap().to_owned()],
         )}),
-        "envelope_parameter" => match normalize_parameter(&input["parameter"]) {
-            Ok(normalized) => json!({"valid": true, "normalized": normalized}),
-            Err(_) => json!({"valid": false}),
-        },
+        "envelope_parameter" => {
+            // JSON text for an input a strict reader refuses (an integer
+            // beyond 64 bits): refused either way.
+            let parameter = match input.get("parameter_json").and_then(Value::as_str) {
+                Some(text) => parse_strict_json(text),
+                None => Ok(input["parameter"].clone()),
+            };
+            match parameter.map(|p| normalize_parameter(&p)) {
+                Ok(Ok(normalized)) => json!({"valid": true, "normalized": normalized}),
+                _ => json!({"valid": false}),
+            }
+        }
         "envelope" => json!({
             "within": envelope_problem(&input["envelope"], &input["request_parameters"]).is_none()
         }),
-        "issuance" => return None,
         "use" => {
             let previous = input["previous"].as_object().map(|p| PreviousUse {
-                digest: p["digest"].as_str().unwrap().to_owned(),
                 executed_at: at(&p["executed_at"]).unwrap(),
-                time_token_id: p["time_token_id"].as_str().unwrap().to_owned(),
                 time_token_issued_at: at(&p["time_token_issued_at"]).unwrap(),
-                token_uses: p["token_uses"].as_u64().unwrap(),
             });
             let head = &input["token_head"];
             let keys = strings(&input["na_public_keys"]);
             let context = UseContext {
                 grant: Some(&input["grant"]).filter(|g| !g.is_null()),
                 previous: previous.as_ref(),
+                admitted: input["admitted"].as_u64(),
                 token_head: head["digest"]
                     .as_str()
                     .map(|d| (d, at(&head["executed_at"]).unwrap())),
@@ -132,7 +136,7 @@ fn evaluate(v: &Value) -> Option<Value> {
             })
         }
         other => panic!("unknown vector kind {other}"),
-    })
+    }
 }
 
 #[test]
@@ -140,20 +144,21 @@ fn every_vector_gives_the_reference_outcome() {
     let suite = suite();
     assert_eq!(suite["suite"], "grants");
     let vectors = suite["vectors"].as_array().unwrap();
-    assert_eq!(vectors.len(), 143);
+    assert_eq!(vectors.len(), 158);
+    // The kinds only the NA runs (its issuance check, over the policy
+    // engine): an SDK skips them.
+    let na_only = &suite["na_only_kinds"];
+    assert_eq!(*na_only, json!(["issuance"]));
     let (mut ran, mut skipped) = (0, 0);
     for v in vectors {
-        match evaluate(v) {
-            Some(got) => {
-                assert_eq!(got, v["expected"], "{}", v["id"]);
-                ran += 1;
-            }
-            None => skipped += 1,
+        if na_only.as_array().unwrap().contains(&v["kind"]) {
+            skipped += 1;
+            continue;
         }
+        assert_eq!(evaluate(v), v["expected"], "{}", v["id"]);
+        ran += 1;
     }
-    // Every kind but the NA's issuance check (58 vectors), which the suite
-    // leaves to the NA.
-    assert_eq!((ran, skipped), (85, 58));
+    assert_eq!((ran, skipped), (99, 59));
 }
 
 fn vector(id: &str) -> Value {

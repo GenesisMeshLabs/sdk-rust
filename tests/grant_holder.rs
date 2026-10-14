@@ -15,7 +15,6 @@ use genesis_mesh_sdk::{
     GenesisMeshError, GovernedActionOutcome, GovernedVerification, GrantActionOutcome,
     GrantAuthority, GrantFallback, GrantHolder, GrantHolderState, GrantRequest, GrantUseInput,
     MemoryRecordOutbox, OutboxState, RecordKind, RecordOutbox, RecordOutboxEntry, Value,
-    PREDECESSOR_DEAD_LETTERED,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -88,7 +87,8 @@ fn grant(from: i64, until: i64) -> Value {
             "basis_checks": [],
             "policy_binding": {"policies": [], "policy_set_digest": "p", "gate_outcomes": [],
                                "registry_gate_types": []},
-            "issued_at": at(from),
+            // Issued before its first time token (a token is never older).
+            "issued_at": at(from.min(-1) - 1),
             "issuer_sovereign_id": "sovereign-c",
             "issued_by": "na-key",
         }),
@@ -579,7 +579,7 @@ async fn an_na_that_says_the_grant_ended_sends_the_holder_to_its_fallback() {
 }
 
 #[tokio::test]
-async fn uploads_in_chain_order_and_dead_letters_a_use_behind_a_refused_one() {
+async fn uploads_in_chain_order_past_a_quarantined_use_and_retries_one_in_the_future() {
     let (offline_client, outbox) = offline();
     let mut holder = holder(-1, 60);
     let mut uses = Vec::new();
@@ -594,9 +594,13 @@ async fn uploads_in_chain_order_and_dead_letters_a_use_behind_a_refused_one() {
             .record,
         );
     }
+    // The first is quarantined, and still takes its place in the chain: the
+    // second is submitted and judged on its own. The NA dates it ahead of its
+    // clock: it is retried, and admitted on the next flush.
     let (url, server) = scripted(vec![
         (422, error("grant_envelope_mismatch")),
-        (422, error("grant_use_chain_gap")),
+        (422, error("grant_use_in_future")),
+        (201, json!({"status": "recorded", "resource_sequence": 1})),
     ])
     .await;
     let (client, _) = client(&url);
@@ -616,18 +620,28 @@ async fn uploads_in_chain_order_and_dead_letters_a_use_behind_a_refused_one() {
         })
         .await
         .unwrap();
-    assert_eq!(report.dead_lettered.len(), 2);
+    assert_eq!(report.dead_lettered.len(), 1);
     assert_eq!(
         report.dead_lettered[0].last_error.as_ref().unwrap().code,
         "grant_envelope_mismatch"
     );
+    assert_eq!(report.pending.len(), 1);
     assert_eq!(
-        report.dead_lettered[1].last_error.as_ref().unwrap().code,
-        PREDECESSOR_DEAD_LETTERED
+        report.pending[0].last_error.as_ref().unwrap().code,
+        "grant_use_in_future"
     );
+    let again = client
+        .evidence_store
+        .flush_records(FlushOptions {
+            ignore_backoff: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(again.admitted.len(), 1);
     let seen = server.await.unwrap();
     assert_eq!(seen[0].body["evidence"], uses[0]);
     assert_eq!(seen[1].body["evidence"], uses[1]);
+    assert_eq!(seen[2].body["evidence"], uses[1]);
     // A use alone is a grant use entry of the record outbox.
     assert_eq!(
         RecordOutboxEntry::new(uses[0].clone()).kind,
@@ -747,4 +761,56 @@ async fn the_grant_routes_are_the_nas() {
     assert_eq!(seen[3].body, json!({"reason": "the device was lost"}));
     assert_eq!(seen[4].body, json!({"request": {"grant_id": "g"}}));
     assert_eq!(seen[5].body, json!({"evidence": {"use_id": "u"}}));
+}
+
+#[tokio::test]
+async fn applies_the_bearer_keys_resource_prefix_offline() {
+    let (client, _) = offline();
+    let mut holder = holder(-1, 60);
+    holder.set_resource_prefix(Some("kv:other/".into()));
+    let err = holder
+        .act(&client, rotate(30), |_| report("v1"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "grant_use_out_of_scope");
+    holder.set_resource_prefix(Some("kv:vault/".into()));
+    used(
+        holder
+            .act(&client, rotate(30), |_| report("v1"))
+            .await
+            .unwrap(),
+    );
+    // Without a resource, a scoped key signs nothing.
+    let bare = GrantRequest::new("secret.rotate", json!({"lifetime_days": 1}));
+    let err = holder
+        .act(&client, bare, |_| report("v2"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "grant_use_out_of_scope");
+    // The prefix is kept with the holder's state.
+    let state: GrantHolderState =
+        serde_json::from_value(serde_json::to_value(holder.state()).unwrap()).unwrap();
+    assert_eq!(state.resource_prefix.as_deref(), Some("kv:vault/"));
+}
+
+#[test]
+fn a_use_id_is_a_lowercase_uuid() {
+    let recorder = recorder();
+    let input = |id: &str| GrantUseInput {
+        use_id: Some(id.to_owned()),
+        ..GrantUseInput::new(grant(-1, 60), token(0, None, -1), 1, None, "secret.rotate")
+    };
+    assert!(recorder
+        .sign_grant_use(input("00000000-0000-4000-8000-000000000101"))
+        .is_ok());
+    for bad in ["use-1", "00000000-0000-4000-8000-00000000010A", ""] {
+        assert_eq!(
+            recorder.sign_grant_use(input(bad)).unwrap_err().code(),
+            "grant_use_malformed",
+            "{bad}"
+        );
+    }
+    assert!(genesis_mesh_sdk::grants::valid_use_id(
+        "c287470c-692b-442b-a950-62740b3ea6e0"
+    ));
 }

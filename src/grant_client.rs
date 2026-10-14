@@ -21,7 +21,8 @@ pub struct GrantQuery {
     pub bearer_key_id: Option<String>,
     /// 1 to 500; the NA's default is 100.
     pub limit: Option<u32>,
-    /// The previous page's `next_before`.
+    /// The previous page's `next_before`: a grant id (grants are ordered by
+    /// `issued_at`, then `grant_id`); an unknown one is `400 invalid_page`.
     pub before: Option<String>,
 }
 
@@ -50,7 +51,10 @@ impl GrantClient {
     /// `invalid_grant_envelope`, `invalid_agreement`), `422` for the bearer
     /// key (`grant_bearer_key_unknown`, `grant_bearer_key_not_executor`,
     /// `grant_bearer_key_retired`) and the issuance refusals
-    /// ([`ISSUANCE_REFUSALS`](crate::grants::ISSUANCE_REFUSALS)).
+    /// ([`ISSUANCE_REFUSALS`](crate::grants::ISSUANCE_REFUSALS)); `409
+    /// grant_issuance_conflict` (another issuance took the store's position:
+    /// issue again), `503 evidence_store_unavailable` or
+    /// `grant_store_integrity_failed`.
     pub async fn issue(&self, request: Value) -> Result<Value> {
         self.http.admin_post("/admin/grants", request).await
     }
@@ -79,17 +83,47 @@ impl GrantClient {
         self.http.admin_get("/admin/grants", &pairs).await
     }
 
-    /// One grant (admin, read tier): its summary, `remaining_uses`, the
-    /// signed `grant`, the policy versions it is bound to and its
-    /// `revocation` (or `null`); `404 grant_not_found`.
+    /// One grant (admin, read tier): its summary, `remaining_uses`,
+    /// `chain_length` (its use chain's length: admitted uses and quarantined
+    /// uses that continued it), the signed `grant`, the policy versions it is
+    /// bound to and its `revocation` (or `null`); `404 grant_not_found`.
     pub async fn get(&self, grant_id: &str) -> Result<Value> {
         self.http
             .admin_get(&format!("/admin/grants/{}", segment(grant_id)?), &[])
             .await
     }
 
+    /// One page of a grant's use chain, newest first (admin, read tier,
+    /// beta): `{grant_id, uses, next_before}`, each use with `use_id`,
+    /// `use_sequence`, `state` (`admitted` or `quarantined`, with its
+    /// `rejection_code`), `executed_at`, `recorded_at`, `store_sequence`,
+    /// `resource_id`, `resource_sequence` and `outcome`. `before` is the
+    /// previous page's `next_before` (a `use_sequence`); `limit` 1 to 500.
+    /// `404 grant_not_found`, `400 invalid_page`.
+    pub async fn uses(
+        &self,
+        grant_id: &str,
+        before: Option<u64>,
+        limit: Option<u32>,
+    ) -> Result<Value> {
+        let mut pairs = Vec::new();
+        if let Some(before) = before {
+            pairs.push(("before".to_owned(), before.to_string()));
+        }
+        if let Some(limit) = limit {
+            pairs.push(("limit".to_owned(), limit.to_string()));
+        }
+        self.http
+            .admin_get(
+                &format!("/admin/grants/{}/uses", segment(grant_id)?),
+                &pairs,
+            )
+            .await
+    }
+
     /// Revoke a grant from now on (admin, privileged), with an optional
-    /// reason of 1 to 1024 characters recorded as the revocation's `detail`:
+    /// reason of 1 to 1024 characters recorded as the revocation's `detail`
+    /// (its `reason` is `operator`):
     /// `{grant_id, status: "revoked", revocation, entry, entry_digest}`. A
     /// use dated before the revocation stands; one at or after it is refused.
     /// `409 grant_already_revoked`, `404 grant_not_found`,
@@ -114,7 +148,8 @@ impl GrantClient {
     /// `time_token_request_invalid_signature`, `time_token_request_stale`;
     /// `409` `grant_bearer_key_retired`, `grant_revoked`, `grant_expired`,
     /// `grant_budget_exhausted`, `time_token_request_behind`,
-    /// `time_token_request_mismatch`.
+    /// `time_token_request_mismatch` (compared with the chain's length,
+    /// which counts quarantined uses).
     pub async fn request_time_token(&self, request: Value) -> Result<Value> {
         self.http
             .public_post("/grants/time-tokens", json!({ "request": request }))
@@ -127,7 +162,9 @@ impl GrantClient {
     /// chain), `200` with `status: "duplicate"` for a use it holds. The use
     /// rejections ([`USE_REJECTION_CODES`](crate::grants::USE_REJECTION_CODES))
     /// are `422` (`409 grant_use_conflict`); an authentic use refused for
-    /// good is kept as a quarantine entry. Keep uses in the record outbox
+    /// good is kept as a quarantine entry (`error.details.quarantine_id`, the
+    /// same on a re-upload), and still takes its place in the chain when it
+    /// continues it. Keep uses in the record outbox
     /// ([`EvidenceStoreClient::enqueue_record`](crate::EvidenceStoreClient::enqueue_record))
     /// to submit them in their chain's order.
     pub async fn submit_use(&self, evidence: Value) -> Result<Value> {

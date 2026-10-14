@@ -31,5 +31,6 @@ their digests.
 
 `grants.json` (1.6.0) is the core's `grants` conformance suite (the grant
 records' signed forms, envelopes, the issuance check, the use rules and stores
-holding grants), copied unchanged. `tests/grants.rs` runs every vector but the
-58 issuance vectors, which the suite leaves to the NA.
+holding grants), copied unchanged. `tests/grants.rs` runs every vector but
+those of its `na_only_kinds` (the 59 issuance vectors: only the NA issues
+grants).

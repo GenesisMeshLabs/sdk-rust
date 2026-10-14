@@ -111,7 +111,7 @@ fn the_binary_gives_the_reference_verdicts_on_the_shared_vectors() {
     // rules are the SDK's own tests (tests/grants.rs).
     assert_eq!(
         tally.ran,
-        10 + 6 + 41 + 31 + 8 + (19 + 13 + 22 + 2 + 13) + (12 + 20),
+        10 + 6 + 41 + 31 + 8 + (19 + 13 + 22 + 2 + 13) + (12 + 26),
         "{:#?}",
         tally.skipped
     );

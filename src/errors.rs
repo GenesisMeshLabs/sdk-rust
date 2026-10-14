@@ -220,7 +220,8 @@ pub enum GenesisMeshError {
 
     /// A grant does not cover a request, or cannot be used for it now, and
     /// nothing ran (1.6.0, [`GrantHolder::act`](crate::GrantHolder::act)).
-    /// `code` is the one the NA would give: `grant_capability_mismatch`,
+    /// `code` is the one the NA would give: `grant_use_out_of_scope`,
+    /// `grant_capability_mismatch`,
     /// `grant_envelope_mismatch`, `grant_use_outside_validity`, or, without
     /// a fallback, `grant_revoked`, `grant_expired`,
     /// `grant_budget_exhausted`, `grant_bearer_key_retired`,

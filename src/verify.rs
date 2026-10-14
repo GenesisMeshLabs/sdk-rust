@@ -21,7 +21,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::grants::{next_previous, token_signature_valid, use_problem, PreviousUse, UseContext};
+use crate::grants::{
+    continues_chain, next_previous, token_signature_valid, use_problem, PreviousUse, UseContext,
+};
 use crate::key_history::{
     succession_form_refusal, succession_signed_by, NaKeyHistory, NaKeys,
     SUCCESSION_MIN_LEAD_SECONDS,
@@ -938,7 +940,13 @@ validator!(valid_time_token_request, {
 validator!(valid_grant_use, {
     let fields = shape(
         vec![
-            ("use_id", bounded(128, 1)),
+            (
+                "use_id",
+                Box::new(|v| {
+                    v.and_then(Value::as_str)
+                        .is_some_and(crate::grants::valid_use_id)
+                }),
+            ),
             ("grant_id", bounded(128, 1)),
             ("grant_digest", sha256()),
             ("use_sequence", use_sequence(1)),
@@ -2194,6 +2202,21 @@ fn fail(result: &mut EvidenceVerification, seq: Option<i64>, reason: &str, detai
 ///   that resource links to the use's digest;
 /// * a judgement may match a use (`governed_by: grant`), and a quarantine
 ///   entry may hold a refused one.
+///
+/// The 1.6.0 review fixes:
+///
+/// * a quarantined use (an authentic `quarantine` entry of `record_kind`
+///   `grant_execution`, signed by the grant's bearer key) that continues its
+///   grant's use chain is the chain's head: the next use may link to it, and a
+///   time token may name it. The budget counts the admitted uses (when the
+///   run holds the chain from its first use), and the order and time rules
+///   compare a use with the last admitted one;
+/// * a use signed by a bearer key with a `resource_prefix` is within it
+///   (`grant_use_out_of_scope`);
+/// * a use's `use_id` is not the id of execution evidence or a break-glass
+///   record (`duplicate_record`, in either order);
+/// * a grant whose signature fails is not held: its uses and revocation are
+///   checked as for a grant the run does not hold.
 pub fn verify_evidence_events<'a>(
     events: impl IntoIterator<Item = &'a Value>,
     options: &VerifyEvidenceOptions,
@@ -2237,13 +2260,12 @@ pub fn verify_evidence_events<'a>(
     // execution evidence's resources, remediated subjects, and operator keys
     // as the holder registry records them.
     let mut stage3 = Stage3::default();
-    // v1.6.0: grants by id (the record and its digest as received), when each
-    // was revoked, the head of each grant's use chain (its position and
-    // state), and each use's digest and time by position.
+    // v1.6.0: grants by id (the record and its digest as received; only an
+    // authentic grant is held), when each was revoked, and the state of each
+    // grant's use chain.
     let mut grants_held: HashMap<String, (Value, String)> = HashMap::new();
     let mut revoked: HashMap<String, i64> = HashMap::new();
-    let mut last_use: HashMap<String, (i64, PreviousUse)> = HashMap::new();
-    let mut use_heads: HashMap<(String, i64), (String, i64)> = HashMap::new();
+    let mut chains = GrantChains::default();
     let mut first_sequence: Option<i64> = None;
     let mut from_start = false;
     let mut prev: Option<Value> = None;
@@ -2605,7 +2627,15 @@ pub fn verify_evidence_events<'a>(
                     _ => {}
                 }
                 last_exec.insert(decision_id, ev.clone());
-                matchable.insert(str_field(ev, "evidence_id").unwrap_or_default().to_owned());
+                let evidence_id = str_field(ev, "evidence_id").unwrap_or_default().to_owned();
+                // v1.6.0 review fixes: observations match a use and execution
+                // evidence by id, so they never share one.
+                if chains.use_ids.contains(&evidence_id) {
+                    let detail = format!("execution {evidence_id} is a grant use's ID");
+                    fail(result, s, "duplicate_record", &detail);
+                }
+                chains.other_ids.insert(evidence_id.clone());
+                matchable.insert(evidence_id);
                 stage3.executed.insert(
                     str_field(ev, "evidence_id").unwrap_or_default().to_owned(),
                     Execution {
@@ -2736,6 +2766,12 @@ pub fn verify_evidence_events<'a>(
                     observation_heads.insert(resource, next);
                 } else {
                     result.break_glass += 1;
+                    // v1.6.0 review fixes: nor a use and a break-glass record.
+                    if chains.use_ids.contains(&record_id) {
+                        let detail = format!("break_glass {record_id} is a grant use's ID");
+                        fail(result, s, "duplicate_record", &detail);
+                    }
+                    chains.other_ids.insert(record_id.clone());
                     matchable.insert(record_id);
                 }
             }
@@ -2809,13 +2845,20 @@ pub fn verify_evidence_events<'a>(
                 }
             }
             "quarantine" => {
+                let failed_before = result.failures.len();
                 let signed = signed_now(kind, payload);
                 signature(result, signed, model_of(kind), payload, kind);
+                let authentic = result.failures.len() == failed_before;
                 result.quarantined += 1;
                 if payload_digest(&payload["record"]).ok().as_deref()
                     != str_field(payload, "record_digest")
                 {
                     fail(result, s, "quarantine_digest_mismatch", "");
+                } else if authentic && str_field(payload, "record_kind") == Some("grant_execution")
+                {
+                    // v1.6.0 review fixes: a quarantined use that continues
+                    // its grant's chain is the chain's head.
+                    chains.quarantined(&payload["record"], &grants_held, from_start || pack);
                 }
             }
             "registry" => {
@@ -2893,14 +2936,18 @@ pub fn verify_evidence_events<'a>(
                 signature(result, signed, model_of(kind), payload, kind);
                 result.archives += 1;
             }
-            // v1.6.0: a grant, held for the uses and revocation that name it,
-            // whatever its signature says (that fails the run by itself).
+            // v1.6.0: a grant, held for the uses and revocation that name it;
+            // review fixes: only when authentic (one whose signature fails is
+            // not held, so its uses are checked as a missing grant's).
             "grant" => {
+                let failed_before = result.failures.len();
                 let signed = signed_now(kind, payload);
                 signature(result, signed, model_of(kind), payload, kind);
                 result.grants += 1;
-                let digest = crate::grants::grant_digest(payload).unwrap_or_default();
-                grants_held.insert(record_id, (payload.clone(), digest));
+                if result.failures.len() == failed_before {
+                    let digest = crate::grants::grant_digest(payload).unwrap_or_default();
+                    grants_held.insert(record_id, (payload.clone(), digest));
+                }
             }
             "grant_revocation" => {
                 let failed_before = result.failures.len();
@@ -2944,6 +2991,18 @@ pub fn verify_evidence_events<'a>(
                 result.grant_executions += 1;
                 let received = crate::grants::use_digest(payload).unwrap_or_default();
                 let grant_id = str_field(payload, "grant_id").unwrap_or_default();
+                let key_id = payload["signature"]["key_id"].as_str();
+                let signer = key_id.and_then(|id| executor_keys.get(id));
+                // Its place in the chain first: after the head (an admitted
+                // use, or a quarantined one that continued the chain).
+                let expected = chains.head(grant_id, from_start);
+                if chained
+                    && expected.is_some_and(|(at, digest)| {
+                        !continues_chain(payload, (at, digest.as_deref()))
+                    })
+                {
+                    fail(result, s, "grant_use_chain_break", grant_id);
+                }
                 let held = grants_held.get(grant_id);
                 match held {
                     // A pack holds (or cites) the grant of every use in its range.
@@ -2958,43 +3017,45 @@ pub fn verify_evidence_events<'a>(
                     None if chained && options.contiguous && from_start => {
                         fail(result, s, "grant_missing", grant_id);
                     }
-                    None => {}
-                    Some((grant, digest)) => {
-                        let key_id = payload["signature"]["key_id"].as_str();
-                        let bearer = key_id.and_then(|id| executor_keys.get(id));
+                    Some((grant, _))
                         if key_id.is_none()
                             || key_id != str_field(grant, "bearer_key_id")
                             || str_field(payload, "executor_sovereign_id")
                                 != str_field(grant, "bearer_sovereign_id")
-                            || bearer.is_some_and(|b| {
+                            || signer.is_some_and(|b| {
                                 str_field(b, "public_key") != str_field(grant, "bearer_public_key")
-                            })
-                        {
-                            fail(result, s, "grant_bearer_mismatch", &record_id);
-                        }
-                        if str_field(payload, "grant_digest") != Some(digest.as_str()) {
-                            fail(result, s, "grant_mismatch", grant_id);
-                        }
+                            }) =>
+                    {
+                        fail(result, s, "grant_bearer_mismatch", &record_id);
+                    }
+                    _ => {}
+                }
+                // Review fixes: a bearer key with a resource prefix signs
+                // within it, as for execution evidence.
+                if let Some(prefix) = signer.and_then(|k| str_field(k, "resource_prefix")) {
+                    let within = str_field(payload, "resource_id")
+                        .is_some_and(|resource| resource.starts_with(prefix));
+                    if !within {
+                        let detail =
+                            format!("signing key covers only resources starting with {prefix:?}");
+                        fail(result, s, "grant_use_out_of_scope", &detail);
                     }
                 }
-                let sequence = payload["use_sequence"].as_i64().unwrap_or_default();
-                let chain_head = last_use.get(grant_id);
-                let (next, link) =
-                    chain_head.map_or((1, None), |(at, head)| (at + 1, Some(head.digest.as_str())));
-                if chained
-                    && (chain_head.is_some() || from_start)
-                    && (sequence != next || str_field(payload, "prev_use_digest") != link)
-                {
-                    fail(result, s, "grant_use_chain_break", grant_id);
+                if held.is_some_and(|(_, digest)| {
+                    str_field(payload, "grant_digest") != Some(digest.as_str())
+                }) {
+                    fail(result, s, "grant_mismatch", grant_id);
                 }
-                let previous = chain_head
-                    .filter(|(at, _)| *at == sequence - 1)
-                    .map(|(_, head)| head.clone());
+                let sequence = payload["use_sequence"].as_u64().unwrap_or_default();
+                if sequence == 1 {
+                    chains.admitted.entry(grant_id.to_owned()).or_insert(0);
+                }
                 let token = &payload["time_token"];
                 let token_keys = na.at(str_field(token, "issued_at").and_then(|t| micros(t).ok()));
                 if chained {
-                    let token_sequence = token["use_sequence"].as_i64().unwrap_or_default();
-                    let named = use_heads
+                    let token_sequence = token["use_sequence"].as_u64().unwrap_or_default();
+                    let named = chains
+                        .positions
                         .get(&(grant_id.to_owned(), token_sequence))
                         .filter(|_| token_sequence != 0)
                         .and_then(|(digest, at)| {
@@ -3002,7 +3063,8 @@ pub fn verify_evidence_events<'a>(
                         });
                     let context = UseContext {
                         grant: held.map(|(grant, _)| grant),
-                        previous: previous.as_ref(),
+                        previous: chains.last_admitted.get(grant_id),
+                        admitted: chains.admitted.get(grant_id).copied(),
                         token_head: named,
                         token_keys: &token_keys,
                         revoked_at: revoked
@@ -3016,13 +3078,12 @@ pub fn verify_evidence_events<'a>(
                 } else if !token_signature_valid(token, &token_keys) {
                     fail(result, s, "grant_time_token_invalid", &record_id);
                 }
-                let state = next_previous(payload, &received, previous.as_ref());
-                let executed = state.executed_at.timestamp_micros();
-                last_use.insert(grant_id.to_owned(), (sequence, state));
-                use_heads.insert(
-                    (grant_id.to_owned(), sequence),
-                    (received.clone(), executed),
-                );
+                chains.admit(grant_id, sequence, &received, payload);
+                if chains.other_ids.contains(&record_id) {
+                    let detail = format!("grant_execution {record_id} is another record's ID");
+                    fail(result, s, "duplicate_record", &detail);
+                }
+                chains.use_ids.insert(record_id.clone());
                 matchable.insert(record_id.clone());
                 let position = entry["resource_sequence"].as_u64();
                 if let Some(resource_id) = str_field(payload, "resource_id") {
@@ -3056,6 +3117,100 @@ pub fn verify_evidence_events<'a>(
         merge_cited(&mut main, &mut cited_result);
     }
     main
+}
+
+/// The use chains of an export's grants (1.6.0; the review fixes).
+#[derive(Default)]
+struct GrantChains {
+    /// Each grant's chain head: its position and digest (an admitted use, or
+    /// a quarantined one that continued the chain).
+    heads: HashMap<String, (u64, String)>,
+    /// Each grant's last admitted use: the order and time rules compare a use
+    /// with it.
+    last_admitted: HashMap<String, PreviousUse>,
+    /// How many uses of each grant were admitted, when the run holds its
+    /// chain from its first use.
+    admitted: HashMap<String, u64>,
+    /// Each chain use's digest and time (microseconds), by grant and
+    /// position: what a time token names.
+    positions: HashMap<(String, u64), (String, i64)>,
+    /// The ids of the uses, and of the execution evidence and break-glass
+    /// records observations also match by id.
+    use_ids: HashSet<String>,
+    other_ids: HashSet<String>,
+}
+
+impl GrantChains {
+    /// The head a use must continue: the chain's, or its start when the run
+    /// holds the store from its start; `None` when it cannot tell.
+    fn head(&self, grant_id: &str, from_start: bool) -> Option<(u64, Option<String>)> {
+        match self.heads.get(grant_id) {
+            Some((at, digest)) => Some((*at, Some(digest.clone()))),
+            None => from_start.then_some((0, None)),
+        }
+    }
+
+    /// An admitted use: the chain's head and its last admitted use.
+    fn admit(&mut self, grant_id: &str, sequence: u64, digest: &str, use_record: &Value) {
+        let previous = next_previous(use_record);
+        let executed = previous.executed_at.timestamp_micros();
+        self.heads
+            .insert(grant_id.to_owned(), (sequence, digest.to_owned()));
+        self.last_admitted.insert(grant_id.to_owned(), previous);
+        if let Some(count) = self.admitted.get_mut(grant_id) {
+            *count += 1;
+        }
+        self.positions.insert(
+            (grant_id.to_owned(), sequence),
+            (digest.to_owned(), executed),
+        );
+    }
+
+    /// A use the NA quarantined (the record an authentic quarantine entry
+    /// holds): the chain's head when it continues the chain, signed by its
+    /// grant's bearer key when the run holds the grant.
+    fn quarantined(
+        &mut self,
+        record: &Value,
+        grants_held: &HashMap<String, (Value, String)>,
+        held_from_start: bool,
+    ) {
+        if !valid_grant_record("GrantExecutionEvidence", record) {
+            return;
+        }
+        let grant_id = str_field(record, "grant_id").unwrap_or_default();
+        if let Some((grant, _)) = grants_held.get(grant_id) {
+            let bearer = str_field(grant, "bearer_public_key").unwrap_or_default();
+            if record["signature"]["key_id"].as_str() != str_field(grant, "bearer_key_id")
+                || !crate::grants::signed_as_received(
+                    "GrantExecutionEvidence",
+                    record,
+                    &[bearer.to_owned()],
+                )
+            {
+                return;
+            }
+        }
+        let sequence = record["use_sequence"].as_u64().unwrap_or_default();
+        let expected = self.head(grant_id, held_from_start || sequence == 1);
+        let Some((at, digest)) = expected else {
+            return;
+        };
+        if !continues_chain(record, (at, digest.as_deref())) {
+            return;
+        }
+        let digest = crate::grants::use_digest(record).unwrap_or_default();
+        let executed = str_field(record, "executed_at")
+            .and_then(|t| micros(t).ok())
+            .unwrap_or_default();
+        self.heads
+            .insert(grant_id.to_owned(), (sequence, digest.clone()));
+        self.positions
+            .insert((grant_id.to_owned(), sequence), (digest, executed));
+        if sequence == 1 {
+            self.admitted.entry(grant_id.to_owned()).or_insert(0);
+        }
+    }
 }
 
 /// What a key succession entry signed by its outgoing key still lacks (1.5.0;

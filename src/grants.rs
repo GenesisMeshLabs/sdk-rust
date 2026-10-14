@@ -72,32 +72,38 @@ pub const MAX_ENVELOPE_PARAMETERS: usize = 64;
 pub const MAX_LIST_VALUES: usize = 256;
 
 /// Why the NA revokes a grant.
-pub const REVOCATION_REASONS: [&str; 5] = [
+pub const REVOCATION_REASONS: [&str; 6] = [
     "operator",
     "attestation_revoked",
     "policy_deactivated",
     "policy_activated",
     "bearer_key_retired",
+    // The review fixes: an agreement basis no longer signed by parties the
+    // NA trusts (a recognition treaty was revoked or has expired).
+    "agreement_untrusted",
 ];
 
 /// The outcomes a use records.
 pub const USE_OUTCOMES: [&str; 3] = ["success", "failure", "partial"];
 
 /// Why a use is refused, in the order the NA and every verifier check them
-/// (the first that applies is the use's code). Codes from
-/// `grant_bearer_mismatch` on, except `grant_use_chain_gap` and
-/// `grant_use_secret_material`, keep an authentic use as a quarantine entry.
-pub const USE_REJECTION_CODES: [&str; 23] = [
+/// (the first that applies is the use's code): the use's form, its grant and
+/// signature, secret material, its place in the chain, the bearer key, its
+/// scope and the grant's digest, then [`use_problem`]. The refusals after
+/// the signature keep the authentic use as a quarantine entry
+/// ([`QUARANTINED_USE_CODES`]); the rest are not stored.
+pub const USE_REJECTION_CODES: [&str; 24] = [
     "grant_use_malformed",
     "grant_not_found",
     "grant_use_invalid_signature",
-    "grant_bearer_mismatch",
     "grant_use_secret_material",
-    "grant_bearer_key_retired",
-    "grant_mismatch",
     "grant_use_conflict",
     "grant_use_chain_gap",
     "grant_use_chain_mismatch",
+    "grant_bearer_mismatch",
+    "grant_bearer_key_retired",
+    "grant_use_out_of_scope",
+    "grant_mismatch",
     "grant_capability_mismatch",
     "grant_envelope_mismatch",
     "grant_budget_exhausted",
@@ -112,6 +118,46 @@ pub const USE_REJECTION_CODES: [&str; 23] = [
     "grant_use_uploaded_late",
     "grant_revoked",
 ];
+
+/// The refusals of an authentic use that no later attempt overcomes: the use
+/// already happened, so the NA keeps it as a quarantine entry (the error
+/// names its `quarantine_id`, the same on a re-upload). Not stored: secret
+/// material, and a use the holder retries (`grant_use_chain_gap`, an earlier
+/// use not uploaded yet; `grant_use_in_future`, until the NA's clock reaches
+/// it). A quarantined use that continues the chain ([`continues_chain`]) is
+/// its head, so the holder's later uses are judged on their own; a conflict
+/// or a chain mismatch never continues it.
+pub const QUARANTINED_USE_CODES: [&str; 18] = [
+    "grant_use_conflict",
+    "grant_use_chain_mismatch",
+    "grant_bearer_mismatch",
+    "grant_bearer_key_retired",
+    "grant_use_out_of_scope",
+    "grant_mismatch",
+    "grant_capability_mismatch",
+    "grant_envelope_mismatch",
+    "grant_budget_exhausted",
+    "grant_time_token_invalid",
+    "grant_time_token_mismatch",
+    "grant_time_token_regressed",
+    "grant_time_token_exhausted",
+    "grant_use_before_time_token",
+    "grant_use_out_of_order",
+    "grant_use_outside_validity",
+    "grant_use_uploaded_late",
+    "grant_revoked",
+];
+
+/// Whether a use's `use_id` is a UUID in its canonical lowercase form, as
+/// the reference requires (observations match a use by it).
+pub fn valid_use_id(use_id: &str) -> bool {
+    let b = use_id.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_digit() || (b'a'..=b'f').contains(c),
+        })
+}
 
 /// Why the NA refuses to issue a grant, in the order it checks
 /// (`422 <code>` from `POST /admin/grants`, `error.details.problems` listing
@@ -618,21 +664,24 @@ pub fn token_signature_valid(raw_token: &Value, keys: &[String]) -> bool {
 
 // ── Uses ─────────────────────────────────────────────────────────────────────
 
-/// The use before this one in a grant's chain, as a holder, the NA or a
-/// verifier holds it.
+/// The last admitted use of the grant before this one, as the NA or a
+/// verifier holds it: the order and time rules compare a use with it (never
+/// with a quarantined use).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviousUse {
-    /// Its digest ([`use_digest`]).
-    pub digest: String,
     /// When it was executed.
     pub executed_at: DateTime<Utc>,
-    /// The time token it cites.
-    pub time_token_id: String,
-    /// That token's `issued_at`.
+    /// Its time token's `issued_at`.
     pub time_token_issued_at: DateTime<Utc>,
-    /// How many uses up to and including this one cite its time token (they
-    /// are consecutive).
-    pub token_uses: u64,
+}
+
+/// Whether a use continues a grant's use chain whose head is
+/// `(use_sequence, digest)` (`(0, None)` before the first use): the head is
+/// the last use the chain holds, admitted, or quarantined after it continued
+/// the chain.
+pub fn continues_chain(use_record: &Value, head: (u64, Option<&str>)) -> bool {
+    use_record["use_sequence"].as_u64() == Some(head.0 + 1)
+        && use_record.get("prev_use_digest").and_then(Value::as_str) == head.1
 }
 
 /// What a use is checked against, as the caller holds it
@@ -642,10 +691,15 @@ pub struct UseContext<'a> {
     /// The grant; `None` skips the checks that need it (capability,
     /// envelope, budget, per-token limit, validity, late upload).
     pub grant: Option<&'a Value>,
-    /// The use before it in the chain; `None` for the first use or when it
-    /// is not held.
+    /// The last admitted use before it; `None` for none or when it is not
+    /// held.
     pub previous: Option<&'a PreviousUse>,
-    /// The digest and time of the use the time token names, when held.
+    /// How many uses of the grant were admitted before it; `None` when the
+    /// caller does not hold the chain from its first use (the budget is then
+    /// not checked).
+    pub admitted: Option<u64>,
+    /// The digest and time of the use the time token names (admitted or
+    /// quarantined), when held.
     pub token_head: Option<(&'a str, DateTime<Utc>)>,
     /// The NA keys valid at the time token's `issued_at`.
     pub token_keys: &'a [String],
@@ -677,16 +731,18 @@ const SKEW_MICROS: i64 = GRANT_CLOCK_SKEW_SECONDS * 1_000_000;
 /// NA and an export verifier run it with what each holds:
 ///
 /// 1. with the grant: its capability (`grant_capability_mismatch`), the
-///    envelope (`grant_envelope_mismatch`), the budget
+///    envelope (`grant_envelope_mismatch`), the budget over the admitted uses
 ///    (`grant_budget_exhausted`);
-/// 2. the time token is the NA's for this grant (`grant_time_token_invalid`),
-///    issued before this use (`grant_time_token_mismatch`), naming the use
-///    the store holds at that position, dated at most 300 s after it
-///    (`grant_time_token_mismatch`);
-/// 3. after the previous use: no older token (`grant_time_token_regressed`),
-///    and within the per-token limit (`grant_time_token_exhausted`);
-/// 4. not dated before its token (`grant_use_before_time_token`) nor the
-///    previous use (`grant_use_out_of_order`), within the grant's validity
+/// 2. the time token is the NA's for this grant, not older than the grant
+///    (`grant_time_token_invalid`), issued before this use
+///    (`grant_time_token_mismatch`), naming the use the store holds at that
+///    position, dated at most 300 s after it (`grant_time_token_mismatch`);
+/// 3. no older token than the last admitted use's
+///    (`grant_time_token_regressed`), and at most `max_uses_per_time_token`
+///    uses after the use the token names (`grant_time_token_exhausted`);
+/// 4. dated no more than 300 s before its token
+///    (`grant_use_before_time_token`), not before the last admitted use
+///    (`grant_use_out_of_order`), within the grant's validity
 ///    (`grant_use_outside_validity`);
 /// 5. once recorded: not dated more than 300 s after it
 ///    (`grant_use_in_future`), nor uploaded later than the grant's validity
@@ -716,15 +772,19 @@ pub fn use_problem(use_record: &Value, context: &UseContext<'_>) -> Option<(&'st
             return Some(("grant_envelope_mismatch", problem));
         }
         let budget = number(grant, "max_uses");
-        if sequence > budget {
+        if let Some(admitted) = context.admitted.filter(|admitted| *admitted >= budget) {
             return Some((
                 "grant_budget_exhausted",
-                format!("use {sequence} of a budget of {budget}"),
+                format!("{admitted} uses admitted of a budget of {budget}"),
             ));
         }
     }
+    let token_issued = time(token, "issued_at");
     if text(token, "grant_id") != text(use_record, "grant_id")
         || !token_signature_valid(token, context.token_keys)
+        || context
+            .grant
+            .is_some_and(|grant| token_issued < time(grant, "issued_at"))
     {
         return Some((
             "grant_time_token_invalid",
@@ -740,7 +800,6 @@ pub fn use_problem(use_record: &Value, context: &UseContext<'_>) -> Option<(&'st
             ),
         ));
     }
-    let token_issued = time(token, "issued_at");
     if let Some((digest, at)) = context.token_head {
         if Some(digest) != token.get("use_head_digest").and_then(Value::as_str)
             || at.timestamp_micros() > token_issued + SKEW_MICROS
@@ -751,33 +810,32 @@ pub fn use_problem(use_record: &Value, context: &UseContext<'_>) -> Option<(&'st
             ));
         }
     }
-    if let Some(previous) = context.previous {
-        if token_issued < previous.time_token_issued_at.timestamp_micros() {
+    if context
+        .previous
+        .is_some_and(|p| token_issued < p.time_token_issued_at.timestamp_micros())
+    {
+        return Some((
+            "grant_time_token_regressed",
+            "the time token is older than the previous use's".into(),
+        ));
+    }
+    if let Some(grant) = context.grant {
+        // Stateless: at most this many uses follow the use the token names.
+        let limit = number(grant, "max_uses_per_time_token");
+        if sequence.saturating_sub(token_sequence) > limit {
             return Some((
-                "grant_time_token_regressed",
-                "the time token is older than the previous use's".into(),
+                "grant_time_token_exhausted",
+                format!(
+                    "use {sequence} is more than {limit} uses after the time token's {token_sequence}"
+                ),
             ));
         }
-        if let Some(grant) = context.grant {
-            let limit = number(grant, "max_uses_per_time_token");
-            if text(token, "time_token_id").as_deref() == Some(previous.time_token_id.as_str())
-                && previous.token_uses >= limit
-            {
-                return Some((
-                    "grant_time_token_exhausted",
-                    format!(
-                        "{limit} uses already cite time token {}",
-                        previous.time_token_id
-                    ),
-                ));
-            }
-        }
     }
-    if executed < token_issued {
+    if executed < token_issued - SKEW_MICROS {
         return Some((
             "grant_use_before_time_token",
             format!(
-                "executed at {}, before the time token's {}",
+                "executed at {}, more than {GRANT_CLOCK_SKEW_SECONDS} s before the time token's {}",
                 iso(executed),
                 iso(token_issued)
             ),
@@ -845,15 +903,8 @@ pub fn use_problem(use_record: &Value, context: &UseContext<'_>) -> Option<(&'st
     None
 }
 
-/// The chain's state after a use (`digest` is its [`use_digest`]): what the
-/// next use is checked against.
-pub fn next_previous(
-    use_record: &Value,
-    digest: &str,
-    previous: Option<&PreviousUse>,
-) -> PreviousUse {
-    let token = &use_record["time_token"];
-    let token_id = token["time_token_id"].as_str().unwrap_or_default();
+/// What the next use is checked against once this one is admitted.
+pub fn next_previous(use_record: &Value) -> PreviousUse {
     let at = |value: &Value, key: &str| {
         value
             .get(key)
@@ -861,13 +912,9 @@ pub fn next_previous(
             .and_then(|s| parse_timestamp(s).ok())
             .unwrap_or_default()
     };
-    let same = previous.filter(|p| p.time_token_id == token_id);
     PreviousUse {
-        digest: digest.to_owned(),
         executed_at: at(use_record, "executed_at"),
-        time_token_id: token_id.to_owned(),
-        time_token_issued_at: at(token, "issued_at"),
-        token_uses: same.map_or(1, |p| p.token_uses + 1),
+        time_token_issued_at: at(&use_record["time_token"], "issued_at"),
     }
 }
 
@@ -937,7 +984,7 @@ pub struct GrantUseInput {
     pub outcome_detail: Option<String>,
     /// Identifiers and versions only. Defaults to `{}`.
     pub execution_parameters: Option<Value>,
-    /// Defaults to a random UUID.
+    /// Defaults to a random UUID; a UUID in its canonical lowercase form.
     pub use_id: Option<String>,
 }
 
@@ -1035,6 +1082,11 @@ pub(crate) fn sign_grant_use(
             .and_then(|detail| length_problem("outcome_detail", detail, 0, 1024)),
         time_problem("executed_at", Some(executed_at)),
         (!input.time_token.is_object()).then(|| "time_token must be the NA's token".into()),
+        input
+            .use_id
+            .as_deref()
+            .filter(|id| !valid_use_id(id))
+            .map(|_| "use_id must be a UUID in its canonical lowercase form".into()),
     ]
     .into_iter()
     .flatten()

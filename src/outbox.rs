@@ -379,23 +379,27 @@ pub fn classify_record_submission_error(err: &GenesisMeshError) -> (SubmissionFa
 }
 
 /// The NA's refusals of a grant use that no retry can overcome (1.6.0): the
-/// use is not one it can read, verify or store, or (from
-/// `grant_bearer_mismatch` on) it is authentic and refused for good, and the
-/// NA keeps it as a quarantine entry. Retried: `grants_disabled` (grants may
-/// be turned on), an earlier use not uploaded yet (`grant_use_chain_gap`,
-/// final once that use is a dead letter), and every transient failure.
-pub const GRANT_USE_PERMANENT_REFUSALS: [&str; 23] = [
+/// use is not one it can read, verify or store, or it is authentic and
+/// refused for good, and the NA keeps it as a quarantine entry
+/// ([`QUARANTINED_USE_CODES`](crate::grants::QUARANTINED_USE_CODES)); a
+/// quarantined use that continues the chain still takes its place in it, so
+/// the uses after it are submitted and judged on their own. Retried:
+/// `grants_disabled` (grants may be turned on), an earlier use not uploaded
+/// yet (`grant_use_chain_gap`), a use dated ahead of the NA's clock
+/// (`grant_use_in_future`), and every transient failure.
+pub const GRANT_USE_PERMANENT_REFUSALS: [&str; 24] = [
     "invalid_json",
     "invalid_grant_use",
     "grant_use_malformed",
     "grant_not_found",
     "grant_use_invalid_signature",
     "grant_use_secret_material",
-    "grant_bearer_mismatch",
-    "grant_bearer_key_retired",
-    "grant_mismatch",
     "grant_use_conflict",
     "grant_use_chain_mismatch",
+    "grant_bearer_mismatch",
+    "grant_bearer_key_retired",
+    "grant_use_out_of_scope",
+    "grant_mismatch",
     "grant_capability_mismatch",
     "grant_envelope_mismatch",
     "grant_budget_exhausted",
@@ -406,8 +410,8 @@ pub const GRANT_USE_PERMANENT_REFUSALS: [&str; 23] = [
     "grant_use_before_time_token",
     "grant_use_out_of_order",
     "grant_use_outside_validity",
-    "grant_use_in_future",
     "grant_use_uploaded_late",
+    "grant_revoked",
 ];
 
 fn classify(err: &GenesisMeshError, refusals: &[&str]) -> (SubmissionFailure, bool) {

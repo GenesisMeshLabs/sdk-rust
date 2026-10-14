@@ -67,6 +67,11 @@ pub struct GrantHolderState {
     /// (`grant_revoked`, `grant_expired`, `grant_budget_exhausted`,
     /// `grant_bearer_key_retired`).
     pub ended: Option<String>,
+    /// The bearer key's `resource_prefix`, when the NA registered it with
+    /// one ([`GrantHolder::set_resource_prefix`]): a use outside it is
+    /// refused offline (`grant_use_out_of_scope`).
+    #[serde(default)]
+    pub resource_prefix: Option<String>,
 }
 
 /// Why a grant does not cover a request, or cannot be used for it now
@@ -304,6 +309,7 @@ impl GrantHolder {
                 head_executed_at: None,
                 feed: None,
                 ended: None,
+                resource_prefix: None,
             },
             recorder,
             na_public_keys,
@@ -391,6 +397,9 @@ impl GrantHolder {
         if token["grant_id"] != self.state.grant["grant_id"] {
             return Err(invalid("the time token is another grant's"));
         }
+        if micros_of(token, "issued_at") < micros_of(&self.state.grant, "issued_at") {
+            return Err(invalid("the time token is older than the grant"));
+        }
         // It names the head of this holder's chain when it asked.
         let sequence = token["use_sequence"].as_u64().unwrap_or(u64::MAX);
         if sequence > self.state.uses {
@@ -418,6 +427,15 @@ impl GrantHolder {
             return Err(invalid("the revocation feed is another sovereign's"));
         }
         Ok(())
+    }
+
+    /// Apply the bearer key's `resource_prefix` (as
+    /// [`EvidenceStoreClient::list_executor_keys`](crate::EvidenceStoreClient::list_executor_keys)
+    /// lists it) offline: a use on a resource outside it, or without a
+    /// resource, is refused (`grant_use_out_of_scope`), as the NA refuses
+    /// and quarantines it.
+    pub fn set_resource_prefix(&mut self, resource_prefix: Option<String>) {
+        self.state.resource_prefix = resource_prefix;
     }
 
     /// What the holder keeps, to persist after every use.
@@ -483,19 +501,29 @@ impl GrantHolder {
     }
 
     /// Why the grant does not cover a request for `capability` with these
-    /// parameters, or cannot be used for it at `now`, or `None` when the
-    /// next use may be made, checked offline in the order the NA checks a
-    /// use: the capability, the envelope, revocation (the feed held, or
-    /// what the NA said), the validity, the budget, and the uses the latest
-    /// time token may still anchor (at most `max_uses_per_time_token` after
-    /// the use it names).
+    /// parameters on `resource_id`, or cannot be used for it at `now`, or
+    /// `None` when the next use may be made, checked offline in the order
+    /// the NA checks a use: the bearer key's resource prefix, the
+    /// capability, the envelope, revocation (the feed held, or what the NA
+    /// said), the validity, the budget (every use the holder made counts),
+    /// and the uses the latest time token may still anchor (at most
+    /// `max_uses_per_time_token` after the use it names).
     pub fn check(
         &self,
         capability: &str,
         request_parameters: &Value,
+        resource_id: Option<&str>,
         now: DateTime<Utc>,
     ) -> Option<GrantCheck> {
         let grant = &self.state.grant;
+        if let Some(prefix) = &self.state.resource_prefix {
+            if !resource_id.is_some_and(|r| r.starts_with(prefix.as_str())) {
+                return Some(GrantCheck::new(
+                    "grant_use_out_of_scope",
+                    format!("the bearer key covers only resources starting with {prefix:?}"),
+                ));
+            }
+        }
         let named = grant["capabilities"]
             .as_array()
             .is_some_and(|c| c.iter().any(|c| c.as_str() == Some(capability)));
@@ -637,7 +665,7 @@ impl GrantHolder {
     ///    (`grant_use_secret_material`), a record outbox that can be read
     ///    ([`GenesisMeshError::RecordOutboxRequired`]).
     /// 2. The grant is checked offline ([`GrantHolder::check`]). A request it
-    ///    does not cover (`grant_capability_mismatch`,
+    ///    does not cover (`grant_use_out_of_scope`, `grant_capability_mismatch`,
     ///    `grant_envelope_mismatch`) or a grant not valid yet is refused
     ///    ([`GenesisMeshError::GrantRefused`]): nothing runs. When the time
     ///    token is spent, a new one is asked for.
@@ -705,17 +733,20 @@ impl GrantHolder {
             crate::out_of_band::check_justification(&fallback.justification)?;
         }
 
-        let mut problem = self.check(&request.capability, &parameters, Utc::now());
+        let resource = request.resource_id.as_deref();
+        let mut problem = self.check(&request.capability, &parameters, resource, Utc::now());
         if problem
             .as_ref()
             .is_some_and(|p| p.code == "grant_time_token_exhausted")
         {
             match self.refresh_time_token(&client.grants).await {
-                Ok(_) => problem = self.check(&request.capability, &parameters, Utc::now()),
+                Ok(_) => {
+                    problem = self.check(&request.capability, &parameters, resource, Utc::now())
+                }
                 // Spent, and the NA did not answer: the grant cannot be used now.
                 Err(err) if evaluation_failure(&err).is_some() => {}
                 Err(err) if NA_ENDED.contains(&err.code()) => {
-                    problem = self.check(&request.capability, &parameters, Utc::now());
+                    problem = self.check(&request.capability, &parameters, resource, Utc::now());
                 }
                 Err(err) => return Err(err),
             }
