@@ -42,6 +42,10 @@ def main():
         options["operator_key_holders"] = {"ops": "alice", "reviewer": "bob"}
         operator_keys["reviewer"] = reviewer.public_key_b64
         tiers["reviewer"] = "privileged"
+    # Pre-issued grants, on a core that has them (1.6.0); they need the
+    # records of changes outside the controlled path.
+    if "evidence_grants" in parameters and options.get("evidence_out_of_band") == "on":
+        options["evidence_grants"] = "on"
     with tempfile.TemporaryDirectory(prefix="gm-sdk-e2e-") as tmp:
         service = NetworkAuthorityService(
             genesis_block=genesis, na_private_key=root.private_key, key_id="na-e2e",
@@ -56,7 +60,7 @@ def main():
         config = {"baseUrl": f"http://127.0.0.1:{server.server_port}",
                   "signingKeyBase64": operator.private_key_b64, "keyId": "ops",
                   "naPublicKey": root.public_key_b64, "outOfBand": "evidence_out_of_band" in options,
-                  "remediation": remediation}
+                  "remediation": remediation, "grants": "evidence_grants" in options}
         if remediation:
             config.update({"reviewerKeyId": "reviewer", "reviewerSigningKeyBase64": reviewer.private_key_b64})
         print(json.dumps(config), flush=True)

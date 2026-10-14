@@ -7,8 +7,11 @@
 //! loopback NA says so, and `GM_E2E_OUT_OF_BAND=1` says so of an existing one.
 //! Remediation and reviews (1.4.0) are exercised when the loopback NA records
 //! them, with a second operator key of another holder deciding reviews.
+//! Pre-issued grants (1.6.0) are exercised when the loopback NA issues them
+//! (`EVIDENCE_GRANTS=on`).
 
 use std::{
+    collections::BTreeMap,
     io::{BufRead, BufReader},
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -17,6 +20,7 @@ use std::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{Duration, Utc};
 use genesis_mesh_sdk::{
+    audit_pack,
     canonical::execution_digest,
     governed_action, governed_action_with_break_glass, json, public_key_from_seed,
     remediation::review_approval_problem,
@@ -28,7 +32,8 @@ use genesis_mesh_sdk::{
     },
     ActionError, ActionReport, BreakGlassOptions, ClientOptions, EvaluationFailure, EvidenceOutbox,
     ExecutionRecorder, FlushOptions, GenesisMeshClient, GenesisMeshError, GovernedActionOutcome,
-    GovernedActionParams, GovernedVerification, MemoryOutbox, MemoryRecordOutbox, ObservationInput,
+    GovernedActionParams, GovernedVerification, GrantActionOutcome, GrantAuthority, GrantFallback,
+    GrantHolder, GrantRequest, HttpTransport, MemoryOutbox, MemoryRecordOutbox, ObservationInput,
     ObservationRecorder, OutboxState, RecordExecution, RecordOutbox, RemediationSubject,
     ReviewDecision, RotateForwardParams, RotatedVersion, Value,
 };
@@ -43,6 +48,8 @@ struct LiveNa {
     /// With remediation and reviews (1.4.0): a privileged key of another
     /// holder, which decides reviews.
     reviewer: Option<GenesisMeshClient>,
+    /// The NA issues pre-issued grants (1.6.0).
+    grants: bool,
     child: Option<Child>,
 }
 
@@ -98,6 +105,7 @@ fn live_na() -> Option<LiveNa> {
         na_public_key: config["naPublicKey"].as_str().unwrap().to_owned(),
         out_of_band: config["outOfBand"].as_bool().unwrap_or(false),
         reviewer,
+        grants: config["grants"].as_bool().unwrap_or(false),
         child,
     })
 }
@@ -129,6 +137,7 @@ async fn governed_lifecycle_against_a_live_na() {
     keep_evidence_while_the_na_is_unreachable_and_admit_it_in_order(&na).await;
     record_and_judge_changes_outside_the_controlled_path(&na).await;
     remediate_review_and_verify_offline(&na).await;
+    act_within_grants_offline_and_upload_on_reconnect(&na).await;
 }
 
 /// v1.4.0: a denied change cancelled by a forward rotation and a disable,
@@ -1119,4 +1128,314 @@ async fn observe_enforce_rollback_failures_conflicts_and_retired_keys(na: &LiveN
         (check.accepted, check.reason.as_str()),
         (false, "policy_binding_mismatch")
     );
+}
+
+/// v1.6.0: a device acts within a pre-issued grant while the NA cannot be
+/// reached, uploads its uses on reconnecting (every one admitted, at the
+/// NA's resource positions), and execution evidence made online afterwards
+/// follows them in the resource's chain; past a grant's end, with the NA
+/// unreachable, it falls back to break-glass; a revoked grant is refused
+/// once the feed says so; the export and an audit pack verify offline.
+async fn act_within_grants_offline_and_upload_on_reconnect(na: &LiveNa) {
+    if !na.grants {
+        eprintln!("skipped 1.6.0: the NA does not issue grants");
+        return;
+    }
+    let gm = &na.client;
+    let keys = vec![na.na_public_key.clone()];
+    let id = Uuid::new_v4().to_string();
+    let capability = format!("sdk.grant.{id}");
+    let resource = format!("kv:grant-{id}/api-key");
+    let attestation = gm
+        .attestation
+        .issue(json!({"subject_id": id, "roles": ["role:client"],
+                      "claims": {"capabilities": [capability]}}))
+        .await
+        .unwrap();
+    // A grant must lie within every policy that applies.
+    let valid_from = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+    let valid_until = (Utc::now() + Duration::days(2)).to_rfc3339();
+    let policy = gm
+        .policy
+        .publish(json!({
+            "policy_id": format!("grant-{id}"), "valid_from": valid_from, "valid_until": valid_until,
+            "selector": {"capabilities": [capability]},
+            "gates": [{"gate_id": "lifetime", "gate_type": "max_value.v1", "order": 0,
+                       "config": {"path": "request_parameters.lifetime_days", "max": 90}}],
+        }))
+        .await
+        .unwrap();
+    gm.policy
+        .activate(
+            policy["policy_id"].as_str().unwrap(),
+            policy["version"].as_u64().unwrap(),
+        )
+        .await
+        .unwrap();
+    let (recorder, executor_key) = executor(&format!("device-{id}"));
+    gm.evidence_store
+        .register_executor_key(json!({
+            "key_id": recorder.key_id(), "public_key": executor_key,
+            "executor_sovereign_id": recorder.executor_sovereign_id(),
+        }))
+        .await
+        .unwrap();
+    let request = |valid_until: String, max_uses: u64| {
+        json!({
+            "bearer_key_id": recorder.key_id(), "capabilities": [capability],
+            "attestation_id": attestation["attestation_id"], "valid_until": valid_until,
+            "max_uses": max_uses, "max_uses_per_time_token": 2,
+            "parameter_envelope": {"lifetime_days": {"number_range": {
+                "number_type": "integer", "minimum": 1, "maximum": 60}}},
+        })
+    };
+    // The NA decides the policy over the whole envelope; 1 to 400 days may be denied.
+    let mut wide = request(
+        genesis_mesh_sdk::canonical::python_timestamp(Utc::now() + Duration::hours(1)),
+        3,
+    );
+    wide["parameter_envelope"]["lifetime_days"]["number_range"]["maximum"] = json!(400);
+    let refused = gm.grants.issue(wide).await.unwrap_err();
+    assert_eq!(refused.code(), "grant_gate_may_deny");
+    let issued = gm
+        .grants
+        .issue(request(
+            genesis_mesh_sdk::canonical::python_timestamp(Utc::now() + Duration::hours(1)),
+            3,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(issued["time_token"]["use_sequence"], 0);
+    let mut holder = GrantHolder::from_issued(&issued, recorder.clone(), keys.clone()).unwrap();
+
+    // Offline: the same record outbox, behind an NA that cannot be reached.
+    let outbox = Arc::new(MemoryRecordOutbox::default());
+    let online =
+        GenesisMeshClient::new(na.options.clone().with_record_outbox(outbox.clone())).unwrap();
+    let offline = GenesisMeshClient::new(
+        ClientOptions {
+            base_url: "http://127.0.0.1:9".into(),
+            ..na.options.clone()
+        }
+        .with_audience(na.na_public_key.clone())
+        .with_record_outbox(outbox.clone()),
+    )
+    .unwrap();
+    let rotate = |lifetime: u64| {
+        GrantRequest::new(capability.clone(), json!({"lifetime_days": lifetime}))
+            .on(resource.clone(), "rotate")
+    };
+    let report = |version: &'static str| async move {
+        Ok::<_, ActionError>(ActionReport {
+            value: Some(version),
+            execution_parameters: Some(json!({"version_id": version})),
+            ..ActionReport::default()
+        })
+    };
+    let mut uses = Vec::new();
+    for version in ["v1", "v2"] {
+        let GrantActionOutcome::Used(used) = holder
+            .act(&offline, rotate(30), |_| report(version))
+            .await
+            .unwrap()
+        else {
+            panic!("not used under the grant");
+        };
+        assert!(used.submission.is_none());
+        uses.push(used.record);
+    }
+    // The envelope is checked offline: nothing runs.
+    let outside = holder
+        .act(&offline, rotate(61), |_| report("x"))
+        .await
+        .unwrap_err();
+    assert_eq!(outside.code(), "grant_envelope_mismatch");
+    let state = serde_json::to_value(holder.state()).unwrap();
+
+    // Reconnected: the feed, the uploads (every use admitted, in order), a new token.
+    let sync = holder.sync(&online).await.unwrap();
+    assert!(sync.feed_read && !sync.revoked);
+    let uploads = sync.uploads.unwrap();
+    assert_eq!(uploads.admitted.len(), 2, "{uploads:?}");
+    assert!(uploads.dead_lettered.is_empty() && uploads.pending.is_empty());
+    assert!(sync.time_token_refreshed);
+    assert_eq!(holder.time_token()["use_sequence"], 2);
+    let GrantActionOutcome::Used(third) = holder
+        .act(&online, rotate(45), |_| report("v3"))
+        .await
+        .unwrap()
+    else {
+        panic!("not used under the grant");
+    };
+    let submission = third.submission.unwrap();
+    assert_eq!(submission["status"], "recorded");
+    assert_eq!(submission["resource_sequence"], 3);
+    let held = gm.grants.get(holder.grant_id()).await.unwrap();
+    assert_eq!(held["uses"], 3);
+    assert_eq!(held["remaining_uses"], 0);
+    // The budget is spent: refused offline, without a fallback.
+    let spent = holder
+        .act(&offline, rotate(30), |_| report("x"))
+        .await
+        .unwrap_err();
+    assert_eq!(spent.code(), "grant_budget_exhausted");
+    // The same use again is a duplicate.
+    let again = gm.grants.submit_use(uses[0].clone()).await.unwrap();
+    assert_eq!(again["status"], "duplicate");
+    // A restored holder keeps its chain (here: its state before the upload).
+    let restored = GrantHolder::restore(
+        serde_json::from_value(state).unwrap(),
+        recorder.clone(),
+        keys.clone(),
+    )
+    .unwrap();
+    assert_eq!(restored.uses(), 2);
+
+    // Online, a decision's evidence on the same resource follows the uses.
+    let verify = GovernedVerification {
+        operator_public_keys: keys.clone(),
+        expected_attestation: Some(attestation.clone()),
+        expected_policies: vec![policy.clone()],
+        ..GovernedVerification::default()
+    };
+    let decided = governed_action(
+        &online.boundary,
+        &online.evidence_store,
+        &recorder,
+        GovernedActionParams {
+            evaluate: json!({"attestation_id": attestation["attestation_id"],
+                             "requested_capability": capability,
+                             "context": {"request_parameters": {"lifetime_days": 30}}}),
+            resource_id: Some(resource.clone()),
+            resource_action: Some("rotate".into()),
+            prior_resource: None,
+            verify: verify.clone(),
+        },
+        |_| report("v4"),
+    )
+    .await
+    .unwrap();
+    assert!(decided.authorized);
+    assert_eq!(decided.evidence.as_ref().unwrap()["resource_sequence"], 4);
+    assert_eq!(
+        decided.evidence.as_ref().unwrap()["prev_resource_digest"],
+        genesis_mesh_sdk::grants::use_digest(&third.record)
+            .unwrap()
+            .as_str()
+    );
+
+    // Past its end, the NA unreachable: break-glass naming the capability.
+    let brief = gm
+        .grants
+        .issue(request(
+            genesis_mesh_sdk::canonical::python_timestamp(Utc::now() + Duration::seconds(3)),
+            2,
+        ))
+        .await
+        .unwrap();
+    let mut ended = GrantHolder::from_issued(&brief, recorder.clone(), keys.clone()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let fallback = GrantFallback::new("the credential must rotate now", verify.clone());
+    let outcome = ended
+        .act(
+            &offline,
+            rotate(30).with_fallback(fallback.clone()),
+            |authority| async move {
+                assert_eq!(authority, GrantAuthority::BreakGlass);
+                report("v5").await
+            },
+        )
+        .await
+        .unwrap();
+    let GrantActionOutcome::FellBack { unusable, outcome } = outcome else {
+        panic!("did not fall back");
+    };
+    assert_eq!(unusable.code, "grant_expired");
+    let GovernedActionOutcome::BrokeGlass(glass) = *outcome else {
+        panic!("did not break the glass");
+    };
+    assert_eq!(glass.record["capability"], capability.as_str());
+    // With the NA back, the fallback asks it, and its ALLOW runs.
+    let outcome = ended
+        .act(
+            &online,
+            rotate(30).with_fallback(fallback),
+            |authority| async move {
+                assert!(matches!(authority, GrantAuthority::Decision(_)));
+                report("v6").await
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        GrantActionOutcome::FellBack { ref outcome, .. }
+            if matches!(**outcome, GovernedActionOutcome::Evaluated(ref r) if r.authorized)
+    ));
+    // The fallback uploaded what was pending first: the break-glass record.
+    assert!(outbox.list().await.unwrap().is_empty());
+
+    // Revoked by an operator: the feed lists it, and the holder refuses it.
+    let revocable = gm
+        .grants
+        .issue(request(
+            genesis_mesh_sdk::canonical::python_timestamp(Utc::now() + Duration::hours(1)),
+            2,
+        ))
+        .await
+        .unwrap();
+    let mut revoked = GrantHolder::from_issued(&revocable, recorder.clone(), keys.clone()).unwrap();
+    let answer = gm
+        .grants
+        .revoke(revoked.grant_id(), Some("the device was lost"))
+        .await
+        .unwrap();
+    assert_eq!(answer["status"], "revoked");
+    assert!(revoked.refresh_feed(&gm.grants).await.unwrap());
+    let refused = revoked
+        .act(&offline, rotate(30), |_| report("x"))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), "grant_revoked");
+
+    // The whole store verifies offline, grants, uses and revocation with it.
+    let events = gm.evidence_store.export_all(0, 1000).await.unwrap();
+    let executor_keys = gm.evidence_store.list_executor_keys().await.unwrap();
+    let verification = verify_evidence_events(
+        &events,
+        &VerifyEvidenceOptions::new(keys.clone(), executor_keys),
+    );
+    assert!(verification.verified, "{:?}", verification.failures);
+    assert!(verification.grants >= 3);
+    assert!(verification.grant_executions >= 3);
+    assert!(verification.grant_revocations >= 1);
+
+    // And so does an audit pack holding them.
+    let transport = HttpTransport::new(na.options.clone()).unwrap();
+    let _: Value = transport
+        .admin_post("/admin/evidence/anchors", json!({}))
+        .await
+        .unwrap();
+    let pack: Value = transport
+        .admin_post("/admin/evidence/audit-pack", json!({}))
+        .await
+        .unwrap();
+    let mut files: BTreeMap<String, Vec<u8>> = pack["files"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(path, text)| (path.clone(), text.as_str().unwrap().as_bytes().to_vec()))
+        .collect();
+    files.insert(
+        "manifest.json".into(),
+        audit_pack::pack_json_bytes(&pack["manifest"]),
+    );
+    let checked = audit_pack::verify_audit_pack(
+        &files,
+        &audit_pack::VerifyPackOptions::new(na.na_public_key.clone(), None),
+    );
+    assert!(checked.verified, "{:?}", checked.reasons());
+    let report_md = String::from_utf8(files["report.md"].clone()).unwrap();
+    assert!(report_md.contains("## Grants"));
+    assert!(report_md.contains("## Grant revocations"));
 }
