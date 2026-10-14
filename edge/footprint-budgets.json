@@ -1,0 +1,4 @@
+{
+  "x86_64-unknown-linux-musl": {"binary_bytes": 12582912, "max_rss_kib": 32768},
+  "aarch64-unknown-linux-musl": {"binary_bytes": 12582912, "max_rss_kib": 32768}
+}

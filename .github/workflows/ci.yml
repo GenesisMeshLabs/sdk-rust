@@ -32,8 +32,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ matrix.rust }}
-      # The SDK and genesis-mesh-verify (verifier/).
-      - run: cargo test --locked --workspace --all-targets
+      # The SDK, genesis-mesh-verify (verifier/) and genesis-mesh-edge (edge/,
+      # 1.7.0: Unix only; its live scenarios run in edge.yml).
+      - run: cargo test --locked --workspace --all-targets ${{ runner.os == 'Windows' && '--exclude genesis-mesh-edge' || '' }}
       - run: cargo test --locked --doc
 
   # 1.7.0: the SDK without its default `client` feature is the offline
@@ -90,7 +91,7 @@ jobs:
           path: core
       - name: The signing vectors are the core's
         run: |
-          for suite in admin_auth field_registry canonical out_of_band remediation audit; do
+          for suite in admin_auth field_registry canonical out_of_band remediation audit grants node; do
             if [ -f "core/conformance/vectors/$suite.json" ]; then
               cmp "core/conformance/vectors/$suite.json" "tests/fixtures/$suite.json"
             else

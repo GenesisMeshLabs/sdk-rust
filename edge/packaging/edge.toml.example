@@ -1,0 +1,48 @@
+# genesis-mesh-edge (beta) configuration: /etc/genesis-mesh-edge/edge.toml.
+# Every key can also be set in the environment (GM_EDGE_*), which wins over
+# this file; docs/edge.md lists them.
+
+[authority]
+# The Network Authority. https; plain http only to a loopback host, or with
+# allow_insecure_http = true.
+url = "https://na.example.org"
+# The root public key the NA's key history is verified from (the genesis
+# block's root_public_key), obtained out of band.
+root_public_key = "REPLACE-WITH-THE-ROOT-PUBLIC-KEY"
+timeout_seconds = 5
+allow_insecure_http = false
+
+[node]
+state_dir = "/var/lib/genesis-mesh-edge"
+validity_hours = 168
+heartbeat_interval_seconds = 30
+renew_before_seconds = 86400
+
+[snapshot]
+sync_interval_seconds = 60
+retry_interval_seconds = 15
+# Grants are used offline only while the snapshot is younger than this
+# (60 to 604800 seconds).
+max_snapshot_age_seconds = 86400
+
+[decisions]
+# Pin the attestation decisions are asked under (optional).
+# attestation_id = "..."
+
+[local_api]
+# A Unix socket, open to the users and groups listed (root is not implied),
+listen = "unix:/run/genesis-mesh-edge/agent.sock"
+allowed_uids = []
+allowed_gids = []
+socket_mode = "0660"
+# socket_group = "edge-clients"
+# or a loopback port with bearer tokens (genesis-mesh-edge token new --name X):
+# listen = "tcp://127.0.0.1:7443"
+# [[local_api.tokens]]
+# name = "controller"
+# sha256 = "..."
+report_timeout_seconds = 300
+queue_timeout_seconds = 30
+
+[log]
+level = "info"
