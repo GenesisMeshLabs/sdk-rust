@@ -13,9 +13,10 @@ publish = false
 name = "genesis-mesh-verify"
 path = "src/main.rs"
 
-# Only the SDK's offline modules are used (verify, canonical, strict JSON);
+# Only the SDK's offline modules are used (verify, canonical, strict JSON),
+# without its HTTP client (default-features = false, 1.7.0);
 # clippy.toml refuses its HTTP clients, network sockets and signing keys here.
 [dependencies]
 base64 = "0.23"
-genesis-mesh-sdk = { path = ".." }
+genesis-mesh-sdk = { path = "..", default-features = false }
 serde_json = { version = "1", features = ["float_roundtrip"] }

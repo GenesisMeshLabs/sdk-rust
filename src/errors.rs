@@ -46,7 +46,8 @@ pub enum GenesisMeshError {
         code: String,
     },
 
-    /// Network transport failure.
+    /// Network transport failure (with the `client` feature).
+    #[cfg(feature = "client")]
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
 
@@ -55,7 +56,8 @@ pub enum GenesisMeshError {
     /// `response_body_unreadable`. Unlike [`Network`](Self::Network), the
     /// request reached the NA, which may have acted on it (decided, even
     /// denied): it never breaks the glass. An outbox retries a submission
-    /// that ended so; the NA admits it once.
+    /// that ended so; the NA admits it once. With the `client` feature.
+    #[cfg(feature = "client")]
     #[error("the response body could not be read (HTTP {status}): {source}")]
     #[non_exhaustive]
     ResponseBodyUnreadable {
@@ -315,7 +317,9 @@ impl GenesisMeshError {
             Self::RecordOutboxRequired => "record_outbox_required",
             Self::RemediationNotRecorded { .. } => "remediation_not_recorded",
             Self::Configuration(_) => "configuration",
+            #[cfg(feature = "client")]
             Self::Network(_) => "network",
+            #[cfg(feature = "client")]
             Self::ResponseBodyUnreadable { .. } => "response_body_unreadable",
             Self::Json(_) => "json",
             Self::SigningKey(_) | Self::MissingSigningKey => "signing_key",
@@ -343,6 +347,7 @@ impl GenesisMeshError {
     }
 }
 
+#[cfg(feature = "client")]
 pub(crate) fn from_http_error(status: u16, body: &Value) -> GenesisMeshError {
     let (message, code) = extract_error(body);
 
@@ -360,6 +365,7 @@ pub(crate) fn from_http_error(status: u16, body: &Value) -> GenesisMeshError {
     }
 }
 
+#[cfg(feature = "client")]
 fn extract_error(body: &Value) -> (String, String) {
     if let Some(message) = body
         .as_str()
@@ -406,7 +412,7 @@ fn extract_error(body: &Value) -> (String, String) {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "client"))]
 mod tests {
     use super::*;
     use serde_json::json;

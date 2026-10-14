@@ -145,6 +145,12 @@ pub struct GovernedVerification {
     pub expected_policies: Vec<Value>,
     /// Required for an ALLOW under an attestation basis.
     pub expected_attestation: Option<Value>,
+    /// Accept whatever policy versions the decision binds instead of
+    /// comparing them with `expected_policies` (1.7.0, beta): for a device
+    /// that holds no policies, such as an edge agent. The NA's signature,
+    /// the context and the attestation are still checked. Defaults to
+    /// `false`.
+    pub any_bound_policies: bool,
 }
 
 /// A governed action request.
@@ -317,7 +323,8 @@ fn check_decision(decision: &Value, params: &GovernedActionParams, context_id: &
             operator_public_keys: params.verify.operator_public_keys.clone(),
             freshness_proof_issuer_keys: params.verify.freshness_proof_issuer_keys.clone(),
             now: Some(Utc::now()),
-            expected_policies: Some(params.verify.expected_policies.clone()),
+            expected_policies: (!params.verify.any_bound_policies)
+                .then(|| params.verify.expected_policies.clone()),
             expected_attestation: params.verify.expected_attestation.clone(),
             at_record_time: false,
             key_history: None,

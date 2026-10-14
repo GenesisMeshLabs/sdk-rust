@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use ed25519_dalek::SigningKey;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
@@ -11,7 +12,6 @@ use crate::{
     auth::{load_signing_key, sign_canonical},
     canonical::{execution_canonical, execution_digest, parse_timestamp, python_timestamp},
     errors::{GenesisMeshError, Result},
-    evidence_store::ResourceHead,
     out_of_band::{
         action_problem, check_nesting, length_problem, sign_break_glass, time_problem,
         BreakGlassInput,
@@ -136,6 +136,15 @@ pub(crate) fn ensure_metadata_only(
         Some(reason) => Err(GenesisMeshError::SecretMaterial(reason)),
         None => Ok(()),
     }
+}
+
+/// The head of a resource chain: what the next record must link to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceHead {
+    /// Sequence of the latest record of the resource.
+    pub resource_sequence: u64,
+    /// `ExecutionEvidence.digest()` of that record.
+    pub record_digest: String,
 }
 
 /// The previous record of a resource: the record itself, or its head (from

@@ -36,6 +36,32 @@ jobs:
       - run: cargo test --locked --workspace --all-targets
       - run: cargo test --locked --doc
 
+  # 1.7.0: the SDK without its default `client` feature is the offline
+  # modules only, and genesis-mesh-verify depends on it so: neither may
+  # depend on an HTTP, async, TLS or database crate.
+  features:
+    name: Without the client feature
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
+        with:
+          toolchain: stable
+      - run: cargo check --locked -p genesis-mesh-sdk --no-default-features --all-targets
+      - run: cargo test --locked -p genesis-mesh-sdk --no-default-features
+      - name: No HTTP, async, TLS or database crate without the client feature
+        run: |
+          set -eu
+          for package in "genesis-mesh-sdk --no-default-features" "genesis-mesh-verify"; do
+            # shellcheck disable=SC2086
+            tree="$(cargo tree --locked -p $package -e normal --prefix none -f '{p}' --target x86_64-unknown-linux-musl)"
+            if echo "$tree" | grep -E '^(reqwest|hyper|hyper-util|h2|tokio|mio|socket2|rustls|ring|webpki|rusqlite|libsqlite3-sys|futures)'; then
+              echo "::error::$package depends on the crates listed above"; exit 1
+            fi
+            echo "$package: $(echo "$tree" | sort -u | wc -l) crates, none of them HTTP, async, TLS or database"
+          done
+
   sdk-e2e:
     name: SDK against core main
     runs-on: ubuntu-latest

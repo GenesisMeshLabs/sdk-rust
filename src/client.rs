@@ -20,6 +20,7 @@ use crate::{
     evidence_store::EvidenceStoreClient,
     grant_client::GrantClient,
     health::HealthClient,
+    node::{NodeClient, NodeIdentity},
     outbox::{EvidenceOutbox, RecordOutbox},
     policy::PolicyClient,
 };
@@ -517,6 +518,10 @@ pub struct GenesisMeshClient {
     pub grants: GrantClient,
     /// Liveness, readiness and health.
     pub health: HealthClient,
+    /// A node's own routes, signed by its node key (1.7.0, beta): join,
+    /// heartbeat, renew, and an edge node's state, decisions and resource
+    /// heads.
+    pub node: NodeClient,
     /// Boundary policy lifecycle: validate, publish, activate, history, verify.
     pub policy: PolicyClient,
 }
@@ -539,8 +544,26 @@ impl GenesisMeshClient {
             evidence_store: EvidenceStoreClient::new(Arc::clone(&transport), outbox, record_outbox),
             grants: GrantClient::new(Arc::clone(&transport)),
             health: HealthClient::new(Arc::clone(&transport)),
+            node: NodeClient::new(Arc::clone(&transport)),
             policy: PolicyClient::new(transport),
         })
+    }
+
+    /// The same client acting as an enrolled edge node (1.7.0, beta):
+    /// [`BoundaryClient::evaluate`](crate::BoundaryClient::evaluate) calls
+    /// `POST /node/boundary/evaluate`, and
+    /// [`EvidenceStoreClient::resource_head`](crate::EvidenceStoreClient::resource_head)
+    /// and `resource_head_entry` call `POST /node/evidence/resource-head`,
+    /// signed by the node key instead of an operator key. The outboxes are
+    /// kept. [`governed_action`](crate::governed_action) and the grant
+    /// holder then need no operator key.
+    pub fn with_node_identity(mut self, identity: NodeIdentity) -> Self {
+        let identity = Arc::new(identity);
+        self.boundary = self
+            .boundary
+            .with_node(self.node.clone(), Arc::clone(&identity));
+        self.evidence_store = self.evidence_store.with_node(self.node.clone(), identity);
+        self
     }
 }
 

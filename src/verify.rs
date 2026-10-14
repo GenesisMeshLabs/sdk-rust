@@ -42,7 +42,7 @@ use crate::{
         policy_set_digest,
     },
     errors::{GenesisMeshError, Result},
-    evidence_store::ResourceHead,
+    execution::ResourceHead,
     remediation::{
         review_approval_problem, review_holder_problem, rotation_problem, ReviewHolders,
         RotationFacts,
@@ -4249,4 +4249,68 @@ pub fn check_events_against_anchors(
         anchored_through_sequence: anchored_through,
         unanchored_entries: by_sequence.keys().filter(|&&s| s > floor).count() as u64,
     }
+}
+
+// ── Node certificates and the CRL (1.7.0) ────────────────────────────────────
+
+/// The fields a `JoinCertificate` signature covers, in its canonical form.
+const JOIN_CERTIFICATE_FIELDS: [&str; 7] = [
+    "cert_id",
+    "node_public_key",
+    "network_name",
+    "roles",
+    "issued_at",
+    "expires_at",
+    "issued_by",
+];
+
+/// True when one of a `JoinCertificate`'s `signatures` verifies under the
+/// NA's keys (1.7.0, beta). The signature covers exactly `cert_id`,
+/// `node_public_key`, `network_name`, `roles`, `issued_at`, `expires_at` and
+/// `issued_by`, as received; what a response adds beside them (an edge
+/// node's `edge` block) is not signed and is ignored. A field missing or of
+/// the wrong type does not verify.
+pub fn verify_join_certificate(certificate: &Value, na_public_keys: &[String]) -> bool {
+    let mut signed = serde_json::Map::new();
+    for field in JOIN_CERTIFICATE_FIELDS {
+        let value = &certificate[field];
+        let well_formed = match field {
+            "roles" => value
+                .as_array()
+                .is_some_and(|roles| roles.iter().all(Value::is_string)),
+            _ => value.is_string(),
+        };
+        if !well_formed {
+            return false;
+        }
+        signed.insert(field.to_owned(), value.clone());
+    }
+    any_signed(
+        crate::auth::canonical_json(&Value::Object(signed)),
+        certificate.get("signatures"),
+        na_public_keys,
+    )
+}
+
+/// True when one of a certificate revocation list's (`GET /crl`)
+/// `signatures` verifies under the NA's keys (1.7.0, beta), over the list as
+/// received without its `signatures`. A list without `crl_id`, `sequence` or
+/// `revoked_certificates` does not verify.
+pub fn verify_crl(crl: &Value, na_public_keys: &[String]) -> bool {
+    let Some(map) = crl.as_object() else {
+        return false;
+    };
+    if !crl["crl_id"].is_string()
+        || !crl["sequence"].is_u64()
+        || !crl["revoked_certificates"].is_array()
+    {
+        return false;
+    }
+    let mut signed = map.clone();
+    signed.remove("signatures");
+    any_signed(
+        crate::auth::canonical_json(&Value::Object(signed)),
+        crl.get("signatures"),
+        na_public_keys,
+    )
 }

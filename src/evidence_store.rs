@@ -8,14 +8,14 @@ use std::{
 };
 
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
     canonical::{execution_digest, out_of_band_digest},
     client::{query_pairs, resource_path, segment, HttpTransport},
     errors::{GenesisMeshError, Result},
-    execution::ensure_metadata_only,
+    execution::{ensure_metadata_only, ResourceHead},
+    node::{NodeClient, NodeIdentity},
     outbox::{
         classify_record_submission_error, classify_submission_error, next_attempt, next_attempt_at,
         Delivery, EvidenceOutbox, FlushReport, OutboxEntry, OutboxState, RecordDelivery,
@@ -39,15 +39,6 @@ const OBSERVATION_BATCH: usize = 100;
 /// that predecessor may still be admitted, final once it is a dead letter
 /// (1.3.1).
 const CHAIN_GAPS: [&str; 2] = ["evidence_chain_gap", "resource_chain_gap"];
-
-/// The head of a resource chain: what the next record must link to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceHead {
-    /// Sequence of the latest record of the resource.
-    pub resource_sequence: u64,
-    /// `ExecutionEvidence.digest()` of that record.
-    pub record_digest: String,
-}
 
 /// Options for [`EvidenceStoreClient::flush_pending`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -140,6 +131,8 @@ pub struct EvidenceStoreClient {
     /// No record is due before this time (Unix milliseconds): the NA asked
     /// the client to wait (`Retry-After`, 1.3.1).
     records_paused_until: Arc<AtomicI64>,
+    /// The edge node reading resource heads (1.7.0).
+    node: Option<(NodeClient, Arc<NodeIdentity>)>,
 }
 
 impl EvidenceStoreClient {
@@ -158,7 +151,15 @@ impl EvidenceStoreClient {
             records_in_flight: Arc::default(),
             observation_batch: Arc::new(AtomicUsize::new(OBSERVATION_BATCH)),
             records_paused_until: Arc::new(AtomicI64::new(0)),
+            node: None,
         }
+    }
+
+    /// Read resource heads as this node (1.7.0):
+    /// `POST /node/evidence/resource-head`.
+    pub(crate) fn with_node(mut self, client: NodeClient, identity: Arc<NodeIdentity>) -> Self {
+        self.node = Some((client, identity));
+        self
     }
 
     /// The configured evidence outbox (v1.2.0).
@@ -571,6 +572,9 @@ impl EvidenceStoreClient {
     /// the head may be a grant use: [`resource_head_entry`](Self::resource_head_entry)
     /// says which.
     pub async fn resource_head(&self, resource_id: &str) -> Result<Option<ResourceHead>> {
+        if let Some((node, identity)) = &self.node {
+            return node.resource_head(identity, resource_id).await;
+        }
         let path = format!(
             "/admin/evidence/resource-heads/{}",
             resource_path(resource_id)?
@@ -595,6 +599,9 @@ impl EvidenceStoreClient {
     /// its `record_id` (an execution's `evidence_id`, a use's `use_id`).
     /// `None` for a resource with no history.
     pub async fn resource_head_entry(&self, resource_id: &str) -> Result<Option<Value>> {
+        if let Some((node, identity)) = &self.node {
+            return node.resource_head_entry(identity, resource_id).await;
+        }
         let path = format!(
             "/admin/evidence/resource-heads/{}",
             resource_path(resource_id)?

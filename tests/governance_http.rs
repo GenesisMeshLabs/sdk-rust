@@ -635,6 +635,56 @@ async fn governed_action_blocks_unverifiable_allows() {
 }
 
 #[tokio::test]
+async fn any_bound_policies_accepts_the_policies_a_decision_binds_and_nothing_else() {
+    // 1.7.0: a device holds no policies. With `any_bound_policies` the
+    // decision's binding is not compared, but its signature, context and
+    // attestation still are.
+    let v = vectors();
+    let run = |tamper: Tamper| {
+        let mut evaluation = signed_evaluation(&v, true, "ctx-4");
+        let mut p = params(&v, "ctx-4");
+        p.verify.expected_policies.clear();
+        p.verify.any_bound_policies = true;
+        p.prior_resource = Some(None);
+        tamper(&mut evaluation, &mut p);
+        async move {
+            let (url, _task) =
+                scripted(vec![ok(evaluation), ok(json!({"status": "recorded"}))]).await;
+            let c = client(&url);
+            governed_action(&c.boundary, &c.evidence_store, &recorder(), p, |_| async {
+                Ok::<ActionReport<()>, ActionError>(ActionReport::default())
+            })
+            .await
+        }
+    };
+    let result = run(Box::new(|_, _| {})).await.unwrap();
+    assert!(result.authorized);
+    // Without it, the same decision is refused.
+    let err = run(Box::new(|_, p| p.verify.any_bound_policies = false))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "policy_binding_mismatch");
+    let cases: Vec<(&str, Tamper)> = vec![
+        (
+            "invalid_signature",
+            Box::new(|e, _| e["decision"]["policy_binding"]["policies"] = json!([])),
+        ),
+        (
+            "context_binding_mismatch",
+            Box::new(|_, p| p.evaluate["context"]["context_id"] = json!("other")),
+        ),
+        (
+            "attestation_expectation_required",
+            Box::new(|_, p| p.verify.expected_attestation = None),
+        ),
+    ];
+    for (reason, tamper) in cases {
+        let err = run(tamper).await.unwrap_err();
+        assert_eq!(err.code(), reason, "{err}");
+    }
+}
+
+#[tokio::test]
 async fn governed_action_records_a_failure_without_the_error_text() {
     let v = vectors();
     let (url, task) = scripted(vec![
