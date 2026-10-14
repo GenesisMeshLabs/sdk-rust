@@ -42,10 +42,19 @@ An operator creates an **edge invite** with the privileged tier:
 genesis-mesh admin invite --node-sovereign-id site7-17 --executor-resource-prefix edge:site7-17/
 ```
 
+The invite token is a bearer secret for a privileged act. To bind the
+invite to the device, run `genesis-mesh-edge init` on the device first: it
+creates the state directory and both keys and prints the node public key
+(`--json` adds the executor key) for the invite's `recipient_public_key`.
+`enroll` then uses those keys.
+
 The agent enrols with the invite's token (`genesis-mesh-edge enroll`, or on
 its first `run`):
 
-1. It checks its configuration and state directory.
+1. It checks its configuration and state directory. Enrolment needs https,
+   or an NA on a loopback address: `allow_insecure_http` does not cover
+   `enroll` (the invite token would cross the network in clear text), only
+   `run`.
 2. It reads `GET /na/key-history` and verifies it from the configured root
    public key. The NA's audience is the genesis block's
    `network_authority.public_key`.
@@ -109,6 +118,7 @@ supported in 1.7.0.
 | `[[local_api.tokens]]` `name`, `sha256` | `GM_EDGE_TOKENS="name:hex,..."` | none |
 | `local_api.report_timeout_seconds` | `GM_EDGE_REPORT_TIMEOUT_SECONDS` | 300 |
 | `local_api.queue_timeout_seconds` | `GM_EDGE_QUEUE_TIMEOUT_SECONDS` | 30 |
+| `local_api.rate_limit_per_minute` | `GM_EDGE_RATE_LIMIT_PER_MINUTE` | 60 authorizations per minute per local client |
 | `log.level` | `GM_EDGE_LOG_LEVEL` | `info` |
 
 The agent refuses to start (exit 2) when the listener is a Unix socket and
@@ -123,8 +133,10 @@ HTTP/1.1 with JSON bodies of at most 64 KiB, read as strict JSON. Errors are
 
 - **Unix socket**: the agent reads the peer's credentials on each connection
   and refuses it (`403 local_peer_refused`, then closes it) unless its uid is
-  in `allowed_uids` or its gid in `allowed_gids`. Root is not implied. The
-  socket gets `socket_mode` and `socket_group` after it is bound.
+  in `allowed_uids` or its gid in `allowed_gids`. Root is not implied, and
+  only the peer's **primary** gid is checked: a user in an allowed group
+  through a supplementary group is refused (fails closed). The socket gets
+  `socket_mode` and `socket_group` after it is bound.
 - **Loopback**: `Authorization: Bearer <token>`, compared in constant time by
   its SHA-256; a missing or wrong token is `401 local_auth_required`.
   `genesis-mesh-edge token new --name controller` prints a new 32-byte token
@@ -136,7 +148,8 @@ HTTP/1.1 with JSON bodies of at most 64 KiB, read as strict JSON. Errors are
 `revoked`), the node (`node_public_key`, `node_sovereign_id`,
 `executor_key_id`, `resource_prefix`, `cert_id`, `cert_expires_at`), the
 connection (`connected`, `last_na_contact_at`), the snapshot
-(`snapshot_synced_at`, `snapshot_age_seconds`, `snapshot_fresh`), `grants`
+(`snapshot_synced_at`, `snapshot_age_seconds`, `snapshot_fresh`,
+`clock_behind`), `grants`
 (each with `grant_id`, `capabilities`, `valid_until`, `uses`, `max_uses`,
 `usable` and `code`) and the uploads (`pending_uploads`, `dead_letters`,
 `lost_authorizations`).
@@ -188,7 +201,10 @@ for up to `queue_timeout_seconds` (then `503 agent_busy` with
 is recorded as `failure`, with a detail saying it was not reported; reporting
 it later is `410 authorization_expired`. Other errors: `400 invalid_request`,
 `403 node_revoked`, `404 authorization_not_found`,
-`409 outcome_already_reported`, `413 request_too_large`, `503 not_enrolled`.
+`409 outcome_already_reported`, `413 request_too_large`,
+`429 local_rate_limited` (more than `rate_limit_per_minute` authorizations
+from one client, by uid or token name, counted before the NA is asked),
+`503 not_enrolled`.
 
 ## Decision order
 
@@ -199,21 +215,28 @@ latest expiry first. Decisions are verified under the NA's keys from the key
 history, against that attestation, accepting the policy versions the decision
 binds (the device holds no policies).
 
-1. **Connected** (an authenticated NA exchange within two heartbeat intervals,
-   state `active`): the NA decides through the node route. ALLOW runs the
-   action (`decision`); DENY is final (`na_denied`), with no fallback. Only a
-   transient failure (the NA unreachable, timing out, `5xx`, `429`) goes on.
-2. **Grants**, while the snapshot is fresh (otherwise `grant_code`
-   `snapshot_stale`): the held grants, soonest end first. The first that
-   covers the request is used (`grant`). A grant that names the capability
-   but does not cover the parameters or the resource refuses the request,
-   `outside_grant`, **even with a justification**. A covering grant that has
-   ended, is spent or is revoked, or no grant naming the capability, goes on
-   with its `grant_code`.
+Only a request that got **no answer** counts as the NA being unreachable:
+no connection, or no response within `timeout_seconds`. Anything the NA
+answers is final, a `429` or a `5xx` included (`na_refused`, with
+`na_code`): a local client that floods the NA, or a host sharing the
+device's address, cannot turn a DENY into a grant use or break-glass.
+
+1. **Connected** (an NA answer within two heartbeat intervals, state
+   `active`): the NA decides through the node route. ALLOW runs the action
+   (`decision`); DENY is final (`na_denied`); any other answer is
+   `na_refused`. Only an unanswered request goes on.
+2. **Grants**: the held grants, soonest end first. A grant that names the
+   capability but does not cover the parameters or the resource refuses the
+   request, `outside_grant`, **even with a justification, and whether or not
+   the snapshot is fresh**. A covering grant is used (`grant`) while the
+   snapshot is fresh; otherwise `grant_code` is `snapshot_stale`. A covering
+   grant that has ended, is spent or is revoked, or no grant naming the
+   capability, goes on with its `grant_code`.
 3. **Break-glass**: without a justification, `justification_required`. With
-   one (1 to 1024 characters, logged by its length only), the NA is asked
-   again; if it answers, its decision stands, otherwise the change runs under
-   break-glass and the NA judges it afterwards.
+   one (1 to 1024 characters, logged by its length only), the NA is asked (if
+   step 1 did not just ask it); if it answers, its answer stands, otherwise
+   the change runs under break-glass, recorded with how the evaluation
+   failed, and the NA judges it afterwards.
 
 A `revoked` agent refuses every request (`403 node_revoked`). With an expired
 certificate the NA is not asked: grants, break-glass and uploads still work,
@@ -234,11 +257,18 @@ then `POST /node/state`: the attestations and grants issued to the node, each
 verified. Each new grant gets a holder and a first time token. Then the
 record outbox is uploaded (break-glass records, then grant uses in chain
 order), then execution evidence, and every usable grant gets a fresh time
-token. The agent moves to `revoked` when the CRL lists its certificate or the
-NA refuses it as revoked.
+token. The agent moves to `revoked` when the CRL lists its certificate, the
+NA refuses it as revoked (`certificate_revoked`, `edge_node_retired`), or
+`/node/state` shows its executor key retired. Uploads the NA throttles
+(`429`) stay pending and are retried after its `Retry-After`.
 
 The **snapshot** is fresh while `now − min(synced_at, feed.issued_at)` is at
-most `max_snapshot_age_seconds`. A stale snapshot stops all grant use.
+most `max_snapshot_age_seconds`. A stale snapshot stops all grant use. The
+age is measured with the device's clock: freshness assumes a clock that does
+not go backwards. When the clock is more than 300 s behind the time the NA
+signed the snapshot, the snapshot counts as stale and `/v1/status` reports
+`clock_behind`. A clock that runs slow is not detected; offline, the hard
+bound on a grant is its `max_uses_per_time_token`.
 
 ## State
 
@@ -260,6 +290,11 @@ run left open are counted as `lost_authorizations`.
 
 `genesis-mesh-edge status [--json]` reads the state files without the agent
 running.
+
+### Commands
+
+`init [--json]`, `enroll [--invite-token-file F] [--reset [--discard-pending]]`,
+`run`, `status [--json]`, `token new --name N`, `check-config`, `--version`.
 
 ## Logging and exit codes
 
@@ -328,11 +363,22 @@ cosign verify --certificate-identity "https://github.com/GenesisMeshLabs/sdk-rus
 
 ## Size and memory
 
-CI builds both binaries on native runners and fails when a binary or the
-agent's maximum resident set size over the 120-second offline scenario
-exceeds `edge/footprint-budgets.json`; the measurements are uploaded with
-each run. A weekly soak (and every release pull request) runs the same
-scenario with the NA stopped for two hours.
+`edge/footprint-budgets.json` holds fixed targets: a binary of at most
+12 MiB and a maximum resident set size of at most 32 MiB, per architecture.
+CI builds both binaries on native runners and fails when a binary, or the
+agent's maximum resident set size over the 120-second offline scenario,
+exceeds them; the measured values are uploaded with each run
+(`footprint-<target>.json`) and recorded with each release, apart from the
+targets.
+
+The pull request scenarios cover an NA that refuses connections (120 s), a
+blackholed network (connections open, nothing answers), an NA that answers
+`429`, and a stale snapshot. The weekly soak (and every release pull request)
+runs the refused-connection scenario for two hours of real time: it shows
+that memory stays flat and the uploads still finish in order within 120 s.
+With the default limits nothing expires within those two hours (time tokens,
+grants, certificates and the snapshot all outlast it), so expiry is covered
+by the stale-snapshot scenario, not by the soak.
 
 ## Limits
 

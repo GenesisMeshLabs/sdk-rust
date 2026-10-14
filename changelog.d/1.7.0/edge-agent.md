@@ -9,7 +9,11 @@
   decision while connected; acts within pre-issued grants while not, as long
   as its trust snapshot is fresh; refuses a request a grant names but does
   not cover, even with a justification; breaks the glass with a
-  justification; and uploads every record in order when the NA is back. It
+  justification only when the NA gives no answer (any answer of the NA, a
+  `429` or a `5xx` included, is final); and uploads every record in order
+  when the NA is back. Local clients are rate limited (60 authorizations per
+  minute each by default). Enrolment needs https or a loopback NA;
+  `genesis-mesh-edge init` prints the node key for a recipient-bound invite. It
   renews its certificate, sends heartbeats with its status, and stops when
   the NA revokes the node. Local workloads ask it through a local API on a
   Unix socket (allowed by uid or gid) or a loopback port (bearer tokens); the
