@@ -62,6 +62,11 @@ fn at(offset_minutes: i64) -> String {
 /// A grant for `device-b`'s key: `secret.rotate`, 1 to 90 days, three uses,
 /// two per time token, valid from `from` to `until` minutes from now.
 fn grant(from: i64, until: i64) -> Value {
+    grant_of(from, until, 3)
+}
+
+/// [`grant`] with `max_uses` uses.
+fn grant_of(from: i64, until: i64, max_uses: u64) -> Value {
     na_signed(
         "CapabilityGrant",
         json!({
@@ -77,7 +82,7 @@ fn grant(from: i64, until: i64) -> Value {
             "provider_sovereign_id": "sovereign-c",
             "valid_from": at(from),
             "valid_until": at(until),
-            "max_uses": 3,
+            "max_uses": max_uses,
             "max_uses_per_time_token": 2,
             "parameter_envelope": {"lifetime_days": {
                 "required": true, "one_of": null, "subset_of": null,
@@ -127,12 +132,17 @@ fn offline() -> (GenesisMeshClient, Arc<MemoryRecordOutbox>) {
 
 fn client(url: &str) -> (GenesisMeshClient, Arc<MemoryRecordOutbox>) {
     let outbox = Arc::new(MemoryRecordOutbox::default());
+    (sharing(url, outbox.clone()), outbox)
+}
+
+/// A client keeping its records in `outbox`.
+fn sharing(url: &str, outbox: Arc<MemoryRecordOutbox>) -> GenesisMeshClient {
     let options = ClientOptions::new(url)
         .with_signing_key(STANDARD.encode([7; 32]))
         .with_audience("TEST")
         .with_timeout(Duration::from_secs(2))
-        .with_record_outbox(outbox.clone());
-    (GenesisMeshClient::new(options).unwrap(), outbox)
+        .with_record_outbox(outbox);
+    GenesisMeshClient::new(options).unwrap()
 }
 
 fn rotate(lifetime: i64) -> GrantRequest {
@@ -822,4 +832,128 @@ fn a_use_id_is_a_lowercase_uuid() {
     assert!(genesis_mesh_sdk::grants::valid_use_id(
         "c287470c-692b-442b-a950-62740b3ea6e0"
     ));
+}
+
+fn quarantined(code: &str) -> Value {
+    json!({"error": {"code": code, "message": code, "details": {"quarantine_id": "q-1"}}})
+}
+
+#[tokio::test]
+async fn stops_counting_a_use_against_the_budget_once_the_na_has_quarantined_it() {
+    // 1.7.0: the NA's budget counts admitted uses only. Three uses: use 1 is
+    // quarantined on upload and keeps its place in the chain, not the budget,
+    // so uses 2, 3 and 4 are the three the NA admits.
+    let outbox = Arc::new(MemoryRecordOutbox::default());
+    let offline_client = sharing("http://127.0.0.1:9", outbox.clone());
+    let mut holder = holder(-1, 60);
+    for version in ["v1", "v2"] {
+        used(
+            holder
+                .act(&offline_client, rotate(30), |_| report(version))
+                .await
+                .unwrap(),
+        );
+    }
+    // Offline, every use counts.
+    assert_eq!(holder.remaining_uses(), 1);
+    // Use 3 needs a time token naming the head, use 2.
+    let fresh = token(2, holder.state().head_digest.as_deref(), 0);
+    let (url, server) = scripted(vec![
+        (422, quarantined("grant_use_outside_validity")),
+        (201, json!({"status": "recorded", "resource_sequence": 1})),
+        (201, json!({"time_token": fresh})),
+        (201, json!({"status": "recorded", "resource_sequence": 2})),
+        (201, json!({"status": "recorded", "resource_sequence": 3})),
+    ])
+    .await;
+    let client = sharing(&url, outbox.clone());
+    let flushed = client
+        .evidence_store
+        .flush_records(FlushOptions {
+            ignore_backoff: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(flushed.dead_lettered.len(), 1);
+    let failure = flushed.dead_lettered[0].last_error.clone().unwrap();
+    assert_eq!(failure.code, "grant_use_outside_validity");
+    assert_eq!(failure.quarantine_id.as_deref(), Some("q-1"));
+    // The dead letter keeps the quarantine entry's ID, as the TypeScript SDK
+    // writes it.
+    let kept = serde_json::to_value(&flushed.dead_lettered[0]).unwrap();
+    assert_eq!(kept["last_error"]["quarantine_id"], "q-1");
+    assert_eq!(holder.count_quarantined(outbox.as_ref()).await.unwrap(), 1);
+    assert_eq!(holder.remaining_uses(), 2);
+
+    for (version, sequence) in [("v3", 3), ("v4", 4)] {
+        let use_ = used(
+            holder
+                .act(&client, rotate(30), |_| report(version))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(use_.record["use_sequence"], sequence);
+        assert_eq!(use_.submission.unwrap()["status"], "recorded");
+    }
+    let seen = server.await.unwrap();
+    assert_eq!(seen[2].target, "/grants/time-tokens");
+    assert_eq!(
+        seen.iter()
+            .filter(|r| r.target == "/evidence/grant-executions")
+            .count(),
+        4
+    );
+    // Use 5 would be a fourth admitted use: the grant's budget is spent.
+    let outcome = holder
+        .act(
+            &offline_client,
+            rotate(30).with_fallback(fallback()),
+            |_| report("v5"),
+        )
+        .await
+        .unwrap();
+    let GrantActionOutcome::FellBack { unusable, .. } = outcome else {
+        panic!("did not fall back");
+    };
+    assert_eq!(unusable.code, "grant_budget_exhausted");
+    assert_eq!(holder.uses(), 4);
+}
+
+#[tokio::test]
+async fn keeps_counting_a_use_quarantined_as_a_conflict_which_did_not_continue_the_chain() {
+    let outbox = Arc::new(MemoryRecordOutbox::default());
+    let mut holder = GrantHolder::new(
+        grant_of(-1, 60, 1),
+        token(0, None, -1),
+        recorder(),
+        vec![na_key()],
+    )
+    .unwrap();
+    let (url, _server) = scripted(vec![(409, quarantined("grant_use_conflict"))]).await;
+    let first = used(
+        holder
+            .act(&sharing(&url, outbox.clone()), rotate(30), |_| report("v1"))
+            .await
+            .unwrap(),
+    );
+    let queued = first.queued.unwrap();
+    assert_eq!(queued.state, OutboxState::DeadLetter);
+    assert_eq!(
+        queued.last_error.unwrap().quarantine_id.as_deref(),
+        Some("q-1")
+    );
+    let offline_client = sharing("http://127.0.0.1:9", outbox.clone());
+    let outcome = holder
+        .act(
+            &offline_client,
+            rotate(30).with_fallback(fallback()),
+            |_| report("v2"),
+        )
+        .await
+        .unwrap();
+    let GrantActionOutcome::FellBack { unusable, .. } = outcome else {
+        panic!("did not fall back");
+    };
+    assert_eq!(unusable.code, "grant_budget_exhausted");
+    assert_eq!(holder.count_quarantined(outbox.as_ref()).await.unwrap(), 0);
 }

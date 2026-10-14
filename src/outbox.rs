@@ -48,6 +48,11 @@ pub struct SubmissionFailure {
     pub code: String,
     /// The error message.
     pub message: String,
+    /// The NA's quarantine entry, when it refused the record for good and
+    /// kept it as one (`error.details.quarantine_id`, 1.7.0). The
+    /// TypeScript SDK reads and writes the same field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine_id: Option<String>,
 }
 
 /// Where an outbox entry stands.
@@ -428,6 +433,7 @@ fn classify(err: &GenesisMeshError, refusals: &[&str]) -> (SubmissionFailure, bo
         status,
         code: err.code().to_owned(),
         message: err.to_string(),
+        quarantine_id: None,
     };
     // A response this crate could not read strictly is not the NA's refusal:
     // the NA may have admitted the record (1.3.1).

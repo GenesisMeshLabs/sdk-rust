@@ -70,6 +70,7 @@ fn predecessor_refused(failure: SubmissionFailure) -> SubmissionFailure {
             "a record this one chains from was refused; the NA answered {}: {}",
             failure.code, failure.message
         ),
+        quarantine_id: None,
     }
 }
 
@@ -647,7 +648,7 @@ impl EvidenceStoreClient {
     async fn submit_record_waiting(
         &self,
         entry: &RecordOutboxEntry,
-    ) -> (Result<Value>, Option<Duration>) {
+    ) -> (Result<Value>, Option<Duration>, Option<String>) {
         let (path, body) = match entry.kind {
             RecordKind::Observation => (
                 "/evidence/observations",
@@ -662,7 +663,7 @@ impl EvidenceStoreClient {
                 json!({ "evidence": entry.record }),
             ),
         };
-        self.http.public_post_waiting(path, body).await
+        self.http.public_post_answered(path, body).await
     }
 
     /// Submit up to 100 signed observations in one request (v1.3.0); the NA
@@ -861,7 +862,7 @@ impl EvidenceStoreClient {
                             .fetch_min((part.len() / 2).max(1), Ordering::AcqRel);
                     }
                     for e in part {
-                        let failed = record_failed(outbox, e.clone(), &err, wait).await;
+                        let failed = record_failed(outbox, e.clone(), &err, wait, None).await;
                         settle(report, e, RecordDelivery::queued(failed));
                     }
                     stopped = true;
@@ -887,7 +888,11 @@ impl EvidenceStoreClient {
                     None => report.pending.push(e.clone()),
                     Some(answer) if answer["status"] == "refused" => {
                         let refusal = batch_refusal(&answer["error"]);
-                        let failed = record_failed(outbox, e.clone(), &refusal, None).await;
+                        let quarantine_id = answer["error"]["details"]["quarantine_id"]
+                            .as_str()
+                            .map(str::to_owned);
+                        let failed =
+                            record_failed(outbox, e.clone(), &refusal, None, quarantine_id).await;
                         settle(report, e, RecordDelivery::queued(failed));
                     }
                     Some(answer) => {
@@ -908,15 +913,17 @@ impl EvidenceStoreClient {
         entry: RecordOutboxEntry,
     ) -> RecordDelivery {
         match self.submit_record_waiting(&entry).await {
-            (Ok(ack), _) => {
+            (Ok(ack), _, _) => {
                 // The NA holds the record even if this fails: the next flush
                 // resubmits it, gets a duplicate and removes it.
                 let _ = outbox.remove(&entry.id).await;
                 RecordDelivery::admitted(ack)
             }
-            (Err(err), wait) => {
+            (Err(err), wait, quarantine_id) => {
                 self.pause_records(&err, wait);
-                RecordDelivery::queued(record_failed(outbox, entry, &err, wait).await)
+                RecordDelivery::queued(
+                    record_failed(outbox, entry, &err, wait, quarantine_id).await,
+                )
             }
         }
     }
@@ -1326,7 +1333,8 @@ impl ReviewDecision {
 }
 
 /// A record outbox entry after a failed submission: pending with a backoff,
-/// or a dead letter. Once the NA has answered, the answer stands even if the
+/// or a dead letter, naming the quarantine entry the NA kept it as, if any
+/// (1.7.0). Once the NA has answered, the answer stands even if the
 /// outbox cannot store it: the entry keeps its previous state and the next
 /// flush settles it.
 async fn record_failed(
@@ -1334,8 +1342,10 @@ async fn record_failed(
     entry: RecordOutboxEntry,
     err: &GenesisMeshError,
     wait: Option<Duration>,
+    quarantine_id: Option<String>,
 ) -> RecordOutboxEntry {
-    let (failure, transient) = classify_record_submission_error(err);
+    let (mut failure, transient) = classify_record_submission_error(err);
+    failure.quarantine_id = quarantine_id;
     let attempts = entry.attempts + 1;
     let next = if transient {
         RecordOutboxEntry {

@@ -3,7 +3,8 @@
 //! uploads the uses when it can reach the NA again.
 //!
 //! The holder checks every use offline against what it holds: the
-//! capability, the closed parameter envelope, the budget (the uses it made),
+//! capability, the closed parameter envelope, the budget (the uses it made,
+//! but those the NA quarantined once it said so, 1.7.0),
 //! the validity, the uses its latest time token may still anchor, and the
 //! revocation feed it last read. A use is signed with the grant's bearer key
 //! (the executor key of the [`ExecutionRecorder`]), chained to the previous
@@ -37,7 +38,7 @@ use crate::{
     },
     grant_client::GrantClient,
     grants::{envelope_problem, grant_digest, use_digest, use_secret_problem, GrantUseInput},
-    outbox::{RecordFlushReport, RecordOutboxEntry},
+    outbox::{OutboxState, RecordFlushReport, RecordKind, RecordOutbox, RecordOutboxEntry},
     verify::{verify_record, verify_revocation_feed, VerifyRecordOptions},
 };
 
@@ -96,6 +97,10 @@ const ENDED: [&str; 5] = [
     "grant_bearer_key_retired",
     "grant_time_token_exhausted",
 ];
+
+/// The refusals of a quarantined use that did not continue the chain: it
+/// took no place in it, so it still counts against the budget (1.7.0).
+const OFF_CHAIN: [&str; 2] = ["grant_use_conflict", "grant_use_chain_mismatch"];
 
 /// What the NA answers to a time token request for a grant that can no
 /// longer be used (`409`).
@@ -236,6 +241,8 @@ pub struct GrantUseResult<T> {
 
 /// What [`GrantHolder::act`] did.
 #[derive(Debug)]
+// Boxing the use would change the public API; one outcome per action.
+#[allow(clippy::large_enum_variant)]
 pub enum GrantActionOutcome<T> {
     /// The action ran under the grant.
     Used(GrantUseResult<T>),
@@ -273,6 +280,9 @@ pub struct GrantHolder {
     recorder: ExecutionRecorder,
     na_public_keys: Vec<String>,
     state: GrantHolderState,
+    /// Of the uses made, those the NA quarantined after they continued the
+    /// chain (1.7.0): read from the record outbox's dead letters.
+    quarantined: u64,
 }
 
 fn micros_of(value: &Value, key: &str) -> Option<i64> {
@@ -342,6 +352,7 @@ impl GrantHolder {
             recorder,
             na_public_keys,
             state,
+            quarantined: 0,
         };
         holder.check_grant()?;
         holder.check_token(&holder.state.time_token)?;
@@ -463,12 +474,53 @@ impl GrantHolder {
         self.state.uses
     }
 
-    /// Uses left in the grant's budget.
+    /// Uses left in the grant's budget: every use made counts, but those
+    /// the NA quarantined ([`GrantHolder::count_quarantined`]).
     pub fn remaining_uses(&self) -> u64 {
         self.state.grant["max_uses"]
             .as_u64()
             .unwrap_or(0)
-            .saturating_sub(self.state.uses)
+            .saturating_sub(self.counted_uses())
+    }
+
+    /// The uses that count against the budget.
+    fn counted_uses(&self) -> u64 {
+        self.state.uses.saturating_sub(self.quarantined)
+    }
+
+    /// How many of this holder's uses the NA has quarantined after they
+    /// continued the chain (1.7.0), read from `outbox`: the dead letters of
+    /// this grant's uses the NA answered with a quarantine entry
+    /// (`last_error.quarantine_id`), other than a conflict or a chain
+    /// mismatch, which did not continue it. Such a use keeps its place in
+    /// the chain but is never admitted, and the NA's budget counts admitted
+    /// uses only, so from now on it does not count against the budget
+    /// ([`GrantHolder::check`]). Offline every use the holder made counts.
+    /// [`GrantHolder::act`] and [`GrantHolder::sync`] call it; call it
+    /// after flushing the record outbox yourself.
+    pub async fn count_quarantined(&mut self, outbox: &dyn RecordOutbox) -> Result<u64> {
+        let entries = outbox.list().await.map_err(GenesisMeshError::Outbox)?;
+        self.quarantined = self.quarantined_in(&entries);
+        Ok(self.quarantined)
+    }
+
+    fn quarantined_in(&self, entries: &[RecordOutboxEntry]) -> u64 {
+        let mut positions = std::collections::BTreeSet::new();
+        for entry in entries {
+            let failure = entry.last_error.as_ref();
+            let sequence = entry.record["use_sequence"].as_u64().unwrap_or(0);
+            if entry.kind == RecordKind::GrantExecution
+                && entry.state == OutboxState::DeadLetter
+                && entry.record["grant_id"] == self.state.grant["grant_id"]
+                && (1..=self.state.uses).contains(&sequence)
+                && failure.is_some_and(|f| {
+                    f.quarantine_id.is_some() && !OFF_CHAIN.contains(&f.code.as_str())
+                })
+            {
+                positions.insert(sequence);
+            }
+        }
+        positions.len() as u64
     }
 
     /// Whether the revocation feed held, or the NA, says the grant is
@@ -505,7 +557,8 @@ impl GrantHolder {
     /// `None` when the next use may be made, checked offline in the order
     /// the NA checks a use: the bearer key's resource prefix, the
     /// capability, the envelope, revocation (the feed held, or what the NA
-    /// said), the validity, the budget (every use the holder made counts),
+    /// said), the validity, the budget (every use the holder made counts,
+    /// but those the NA quarantined, 1.7.0: [`GrantHolder::count_quarantined`]),
     /// and the uses the latest time token may still anchor (at most
     /// `max_uses_per_time_token` after the use it names).
     pub fn check(
@@ -556,7 +609,7 @@ impl GrantHolder {
             ));
         }
         let budget = grant["max_uses"].as_u64().unwrap_or(0);
-        if self.state.uses >= budget {
+        if self.counted_uses() >= budget {
             return Some(GrantCheck::new(
                 "grant_budget_exhausted",
                 format!("{budget} uses made"),
@@ -637,7 +690,7 @@ impl GrantHolder {
             feed_read: true,
             ..GrantSync::default()
         };
-        if client.evidence_store.record_outbox().is_some() {
+        if let Some(outbox) = client.evidence_store.record_outbox() {
             report.uploads = Some(
                 client
                     .evidence_store
@@ -646,6 +699,7 @@ impl GrantHolder {
                     })
                     .await?,
             );
+            self.count_quarantined(outbox.as_ref()).await?;
         }
         if !self.revoked() && self.state.ended.is_none() {
             match self.refresh_time_token(&client.grants).await {
@@ -701,7 +755,8 @@ impl GrantHolder {
         let outbox = store
             .record_outbox()
             .ok_or(GenesisMeshError::RecordOutboxRequired)?;
-        outbox.list().await.map_err(GenesisMeshError::Outbox)?;
+        let entries = outbox.list().await.map_err(GenesisMeshError::Outbox)?;
+        self.quarantined = self.quarantined_in(&entries);
         if request.resource_id.is_some() != request.resource_action.is_some() {
             return Err(GenesisMeshError::Configuration(
                 "resource_id and resource_action go together".into(),
