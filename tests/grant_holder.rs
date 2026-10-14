@@ -957,3 +957,51 @@ async fn keeps_counting_a_use_quarantined_as_a_conflict_which_did_not_continue_t
     assert_eq!(unusable.code, "grant_budget_exhausted");
     assert_eq!(holder.count_quarantined(outbox.as_ref()).await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn keeps_counting_a_use_quarantined_as_over_budget() {
+    // Budget 2, so the holder signs use 2 at all; the NA, whose view diverged
+    // (another holder used the budget), admits use 1 and quarantines use 2 as
+    // over budget: the holder's count is short, so use 2 still counts.
+    let outbox = Arc::new(MemoryRecordOutbox::default());
+    let mut holder = GrantHolder::new(
+        grant_of(-1, 60, 2),
+        token(0, None, -1),
+        recorder(),
+        vec![na_key()],
+    )
+    .unwrap();
+    let (url, _server) = scripted(vec![
+        (201, json!({"status": "recorded", "resource_sequence": 1})),
+        (422, quarantined("grant_budget_exhausted")),
+    ])
+    .await;
+    let client = sharing(&url, outbox.clone());
+    used(
+        holder
+            .act(&client, rotate(30), |_| report("v1"))
+            .await
+            .unwrap(),
+    );
+    let second = used(
+        holder
+            .act(&client, rotate(30), |_| report("v2"))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(second.queued.unwrap().state, OutboxState::DeadLetter);
+    let offline_client = sharing("http://127.0.0.1:9", outbox.clone());
+    let outcome = holder
+        .act(
+            &offline_client,
+            rotate(30).with_fallback(fallback()),
+            |_| report("v3"),
+        )
+        .await
+        .unwrap();
+    let GrantActionOutcome::FellBack { unusable, .. } = outcome else {
+        panic!("did not fall back");
+    };
+    assert_eq!(unusable.code, "grant_budget_exhausted");
+    assert_eq!(holder.count_quarantined(outbox.as_ref()).await.unwrap(), 0);
+}

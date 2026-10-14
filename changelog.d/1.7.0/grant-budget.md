@@ -8,7 +8,9 @@
   since it cannot know which the NA will admit; once the NA has answered a
   use as quarantined after it continued the chain, that use stops counting
   and keeps its place in the chain. A use quarantined as a conflict or a
-  chain mismatch did not continue the chain and still counts.
+  chain mismatch (it did not continue the chain) or as
+  `grant_budget_exhausted` (the NA counted more admitted uses than the
+  holder knew of) still counts.
   `GrantHolder::act` and `GrantHolder::sync` read this from the record
   outbox; after flushing it yourself, call
   `GrantHolder::count_quarantined`.

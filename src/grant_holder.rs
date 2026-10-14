@@ -98,9 +98,14 @@ const ENDED: [&str; 5] = [
     "grant_time_token_exhausted",
 ];
 
-/// The refusals of a quarantined use that did not continue the chain: it
-/// took no place in it, so it still counts against the budget (1.7.0).
-const OFF_CHAIN: [&str; 2] = ["grant_use_conflict", "grant_use_chain_mismatch"];
+/// The refusals of a quarantined use that still counts against the budget
+/// (1.7.0): a conflict or a chain mismatch did not continue the chain, and a
+/// use refused as over budget means the holder's count is short of the NA's.
+const STILL_COUNTED: [&str; 3] = [
+    "grant_use_conflict",
+    "grant_use_chain_mismatch",
+    "grant_budget_exhausted",
+];
 
 /// What the NA answers to a time token request for a grant that can no
 /// longer be used (`409`).
@@ -492,7 +497,8 @@ impl GrantHolder {
     /// continued the chain (1.7.0), read from `outbox`: the dead letters of
     /// this grant's uses the NA answered with a quarantine entry
     /// (`last_error.quarantine_id`), other than a conflict or a chain
-    /// mismatch, which did not continue it. Such a use keeps its place in
+    /// mismatch, which did not continue it, or an exhausted budget, which
+    /// says the holder's count is short. Such a use keeps its place in
     /// the chain but is never admitted, and the NA's budget counts admitted
     /// uses only, so from now on it does not count against the budget
     /// ([`GrantHolder::check`]). Offline every use the holder made counts.
@@ -514,7 +520,7 @@ impl GrantHolder {
                 && entry.record["grant_id"] == self.state.grant["grant_id"]
                 && (1..=self.state.uses).contains(&sequence)
                 && failure.is_some_and(|f| {
-                    f.quarantine_id.is_some() && !OFF_CHAIN.contains(&f.code.as_str())
+                    f.quarantine_id.is_some() && !STILL_COUNTED.contains(&f.code.as_str())
                 })
             {
                 positions.insert(sequence);
