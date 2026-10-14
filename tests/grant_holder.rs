@@ -290,7 +290,16 @@ async fn falls_back_to_break_glass_once_the_time_token_is_spent_and_the_na_is_un
     let GovernedActionOutcome::BrokeGlass(glass) = *outcome else {
         panic!("did not break the glass");
     };
-    assert_eq!(glass.failure, EvaluationFailure::NetworkError);
+    // Nothing listens on the port: Linux refuses at once (network_error), Windows retries the
+    // connection until the client's timeout. Either is an outage that breaks the glass.
+    assert!(
+        matches!(
+            glass.failure,
+            EvaluationFailure::NetworkError | EvaluationFailure::Timeout
+        ),
+        "{:?}",
+        glass.failure
+    );
     assert_eq!(glass.record["capability"], "secret.rotate");
     assert_eq!(
         glass.record["request_parameters"],
