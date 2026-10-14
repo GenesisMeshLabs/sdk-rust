@@ -220,9 +220,9 @@ the same reason codes, in the same order: fields the crate does not know
 
 | Signed by | Kinds |
 |---|---|
-| The NA (`--key-history` or `--na-key`) | `decision`, `justification`, `checkpoint`, `judgement`, `quarantine`, `registry`, `review`, `archive`, `policy`, `attestation` |
+| The NA (`--key-history` or `--na-key`) | `decision`, `justification`, `checkpoint`, `judgement`, `quarantine`, `registry`, `review`, `archive`, `policy`, `attestation`, `grant`, `grant-revocation`, `time-token` (1.6.0) |
 | The root key, the new key and the outgoing NA key (`--key-history`) | `key-succession` |
-| An executor key of the record's sovereign (`--executor-keys`) | `execution`, `break-glass`, `remediation` |
+| An executor key of the record's sovereign (`--executor-keys`) | `execution`, `break-glass`, `remediation`, `grant-execution` (1.6.0: its grant's bearer key; its time token by the NA, `--na-key`) |
 | An observer key of the record's sovereign (`--executor-keys`) | `observation` |
 
 Some kinds carry checks of their own:
@@ -234,10 +234,14 @@ Some kinds carry checks of their own:
 - a first retention checkpoint: the entries it removed
   (`retention_count_mismatch`);
 - a review: its embedded admin approvals (`review_approval_invalid`) and a
-  second holder (`review_same_holder`).
+  second holder (`review_same_holder`);
+- a grant use (1.6.0): its time token, signed by the NA for its grant
+  (`grant_time_token_invalid`), issued before it (`grant_time_token_mismatch`)
+  and not after it was made (`grant_use_before_time_token`).
 
 What needs the rest of the store (chains, the subject of a judgement,
-remediation or review, matched evidence) is checked in an export.
+remediation or review, matched evidence, a use's grant) is checked in an
+export.
 
 ### As of the record's own time
 
@@ -258,6 +262,8 @@ before it in store order. Read alone, a record is placed at its own time:
 |---|---|
 | Decision | `decision_made_at` |
 | Policy, attestation, treaty | `issued_at` |
+| Grant, time token (1.6.0) | `issued_at` |
+| Grant revocation (1.6.0) | `revoked_at` |
 | Retention checkpoint, audit pack manifest | `created_at` |
 | Justification | `proof_issued_at` |
 | Judgement | `judged_at` |
@@ -299,6 +305,20 @@ observation chains; judgements, matches, remediations and reviews against
 what they cite; retention checkpoints. The reason codes are the reference's
 (`verify_evidence_events`).
 
+Pre-issued grants (1.6.0): a grant use and a grant revocation name a grant the
+export holds from its start (`grant_missing`) with its digest
+(`grant_mismatch`); a use is signed by the grant's bearer key
+(`grant_bearer_mismatch`), takes its place in the grant's use chain
+(`grant_use_chain_break`) and the position the NA gave it in its resource's
+chain (`resource_chain_break`; a position without a resource is
+`envelope_mismatch`), and is checked by the use rules with the NA's codes, in
+its order (`grant_capability_mismatch`, `grant_envelope_mismatch`,
+`grant_budget_exhausted`, the time token's `grant_time_token_*`, the times'
+`grant_use_*` and `grant_revoked`); a grant is revoked once
+(`duplicate_grant_revocation`). A judgement may match a use (`governed_by:
+grant`) and a quarantine entry may hold a refused one. The readable output
+counts grants, uses and revocations.
+
 With `--known-anchors` the export is also checked against anchors held
 outside the NA: the anchors' signatures, chain and positions
 (`anchor_invalid_signature`, `anchor_chain_break`, `anchor_sequence_gap`,
@@ -329,13 +349,16 @@ outside the NA: the anchors' signatures, chain and positions
    `cited_out_of_range`, then every export reason, with the cited records as
    the range's predecessors, the chains a cited retention checkpoint pruned
    continuing from its heads, and `cited_record_missing` for what neither
-   holds);
+   holds; 1.6.0: a range's use or revocation whose grant neither holds);
 5. what the records rest on outside the store, each checked as received
    (`cited_trust_invalid`, `policy_invalid_signature`,
    `treaty_invalid_signature`, `attestation_invalid_signature`,
    `feed_invalid_signature`, `cited_policy_missing`, `cited_policy_mismatch`,
-   `cited_attestation_missing`, `cited_attestation_mismatch`);
-6. the report (`report_mismatch`);
+   `cited_attestation_missing`, `cited_attestation_mismatch`; 1.6.0: a
+   grant's policy binding and its basis attestation, as a decision's);
+6. the report (`report_mismatch`; 1.6.0: with *Grants* and *Grant
+   revocations* sections when the pack holds them, a grant use listed as a
+   change `governed_by: grant`);
 7. with `--period`, the period (`pack_period_not_covered`);
 8. with `--changes`, the completeness check (`change_unmatched`; warnings
    `changes_outside_period`, `change_duplicate`). The period runs from the
