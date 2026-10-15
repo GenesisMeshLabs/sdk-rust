@@ -1,5 +1,135 @@
 # Changelog
 
+## 1.7.0 - 2026-10-15
+
+### Security
+
+- **rustls 0.23.46.** The HTTP client (the `client` feature) and the edge agent link rustls 0.23.46, which fixes
+  RUSTSEC-2026-0346 (`Debug` output of client session values exposed TLS secrets), RUSTSEC-2026-0347 (buffered
+  data sent to the outer server after an ECH rejection), RUSTSEC-2026-0348 (Brotli certificate decompression could
+  allocate up to 1 GiB before authentication) and RUSTSEC-2026-0349 (an unauthenticated ServerHello could downgrade
+  later connections to classical key exchange). The verifier links no TLS.
+
+### Added
+
+- **The edge agent, `genesis-mesh-edge` (beta).** A device's agent, built on
+  this crate and released with it as static Linux binaries (x86-64 and
+  arm64, with `SHA256SUMS-edge` and Sigstore bundles), a systemd unit, an
+  example configuration and the image `ghcr.io/genesismeshlabs/genesis-mesh-edge`
+  (signed by digest, tagged with the version only while beta). It enrols with
+  an edge invite, registering its executor key at join; asks the NA for a
+  decision while connected; acts within pre-issued grants while not, as long
+  as its trust snapshot is fresh; refuses a request a grant names but does
+  not cover, even with a justification; and uploads every record in order,
+  200 at a time, when the NA is back. It renews its certificate, sends
+  heartbeats with its status, and stops when the NA revokes the node. Local
+  workloads ask it through a local API on a Unix socket (allowed by uid or
+  gid) or a loopback port (bearer tokens); the device never holds an
+  operator key. It needs an NA from 1.7.0 with the evidence store and
+  out-of-band records on (grants need `EVIDENCE_GRANTS=on`). See
+  docs/edge.md.
+- **What an NA error means, in three classes.** A refusal of the NA (a DENY,
+  or its JSON error with a 4xx other than 429) is final. The NA throttling or
+  failing (its JSON error with 429 or 5xx) lets a grant act but never breaks
+  the glass. Only no answer (no connection, a timeout, or a gateway's own
+  502, 503, 504 or 52x page) breaks the glass, with a justification. So a
+  flood of local requests, or a host at the same NAT, can never turn a DENY
+  into break-glass, and an NA stopped behind a reverse proxy is treated as
+  down. `/v1/status` shows `na_state` and `last_na_error`.
+- **Operating the agent.** `init` creates the keys and prints the node key
+  for a recipient-bound invite; enrolment needs https or a loopback NA;
+  `reset` starts again (refused while records are not uploaded, unless
+  `--discard-pending`, and while the agent runs: a lock in the state
+  directory); `outbox export [--dead-letters]` writes the records not
+  uploaded as JSON lines; outside systemd `enroll` reads
+  `/etc/genesis-mesh-edge/invite-token`. The agent refuses to start against
+  another NA than the one it enrolled with, or on a database a newer agent
+  wrote.
+- **A local API that holds up.** At most 64 connections, a 10-second limit to
+  send a request's headers, accept errors logged and survived, 30
+  authorizations per minute per client (`429 local_rate_limited`), outcomes
+  reported only by the client that asked, and nothing run or signed for a
+  client that disconnects before its answer.
+- **Node request signatures (beta), with or without the `client` feature.**
+  `node_auth::node_signing_payload`, `sign_node_request`,
+  `executor_proof_payload`, `sign_executor_proof` and `executor_key_id` sign
+  a node's requests as the NA verifies them (`/join`, `/heartbeat`, `/renew`
+  and the 1.7.0 `/node/*` routes, which also sign a `purpose` and the NA's
+  public key as `audience`). An edge node's executor key co-signs its `/join`
+  as proof of possession; the NA registers it under the key ID `edge-` and
+  32 hex characters of the key's SHA-256. The core's `node` conformance
+  suite (`tests/fixtures/node.json`) is reproduced byte for byte.
+- **`verify::verify_join_certificate` and `verify::verify_crl` (beta).** A
+  `JoinCertificate` verifies over exactly its signed fields (what a response
+  adds beside them, such as an edge node's `edge` block, is ignored); a CRL
+  (`GET /crl`) over everything but its signatures.
+- **The node client (beta).** `GenesisMeshClient.node` (`NodeClient`) joins
+  (`NodeJoin`, optionally with an executor key), heartbeats (with an edge
+  agent's `agent` block), renews, and reads an edge node's state
+  (`POST /node/state`) and resource heads. `NodeIdentity` holds a node's
+  certificate ID, key and NA; its debug output never shows the key.
+- **A client acting as an edge node (beta).**
+  `GenesisMeshClient::with_node_identity` sends `BoundaryClient::evaluate`
+  to `POST /node/boundary/evaluate` and `EvidenceStoreClient::resource_head`
+  and `resource_head_entry` to `POST /node/evidence/resource-head`, signed by
+  the node key: `governed_action`, break-glass and the grant holder then run
+  on a device with no operator key. These routes need an NA from 1.7.0.
+
+### Changed
+
+- **The HTTP client is the default feature `client`.** `reqwest`,
+  `percent-encoding`, every client that calls the NA (`GenesisMeshClient`,
+  the sub-clients, `governed_action` and the rest of the governance
+  composition, `GrantHolder`), and the error variants that hold a transport
+  error (`GenesisMeshError::Network`, `GenesisMeshError::ResponseBodyUnreadable`)
+  need it. Without it the crate is its offline modules only: verification,
+  canonical forms, signing, the outboxes, the grant rules, audit packs and
+  node request signatures, with no HTTP stack, no `tokio` and no TLS.
+  `genesis-mesh-verify` now depends on the SDK without it, so its build no
+  longer compiles the HTTP stack at all. With the default features the API is
+  unchanged (apart from `GovernedVerification`, see below).
+- **`ResourceHead` is defined with the offline modules.** It is still
+  `genesis_mesh_sdk::ResourceHead`; only its source module moved, so it is
+  available without the `client` feature.
+
+### Fixed
+
+- **A grant holder no longer counts a use the NA quarantined against the
+  grant's budget.** The NA's budget counts admitted uses only, but
+  `GrantHolder` counted every use it had signed, so a holder with a
+  quarantined use fell back with `grant_budget_exhausted` while the grant
+  still had uses left. Offline the holder still counts every use it signed,
+  since it cannot know which the NA will admit; once the NA has answered a
+  use as quarantined after it continued the chain, that use stops counting
+  and keeps its place in the chain. A use quarantined as a conflict or a
+  chain mismatch (it did not continue the chain) or as
+  `grant_budget_exhausted` (the NA counted more admitted uses than the
+  holder knew of) still counts.
+  `GrantHolder::act` and `GrantHolder::sync` read this from the record
+  outbox; after flushing it yourself, call
+  `GrantHolder::count_quarantined`.
+- **A dead letter names the NA's quarantine entry.** When the NA keeps a
+  refused record as a quarantine entry, the record outbox entry's
+  `last_error.quarantine_id` now holds its ID (the NA's
+  `error.details.quarantine_id`), as the TypeScript SDK writes it. Older
+  outbox files still read.
+
+### Changed (breaking)
+
+- **`GovernedVerification.any_bound_policies` (beta, default `false`).** When
+  `true`, a governed action accepts whatever policy versions the NA's
+  decision binds instead of comparing them with `expected_policies`; the
+  NA's signature, the context and the attestation are still checked. A
+  device that holds no policies, such as the edge agent, sets it. Code that
+  builds `GovernedVerification` with a struct literal naming every field must
+  add the field, or use `..GovernedVerification::default()`.
+
+### Upgrading
+
+- `default-features = false` now drops the HTTP client. If you turned the
+  default features off for another reason and call the NA, add
+  `features = ["client"]`.
+
 ## 1.6.0 - 2026-10-14
 
 ### Added

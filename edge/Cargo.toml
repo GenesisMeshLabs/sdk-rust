@@ -1,7 +1,7 @@
 [package]
 name = "genesis-mesh-edge"
 # The SDK's version: scripts/check_release.py checks that they agree.
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 # File::try_lock (the state directory's lock) needs 1.89; the MSRV job
 # builds the SDK and the verifier at 1.85.
