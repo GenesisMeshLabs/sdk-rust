@@ -179,8 +179,11 @@ jobs:
         run: |
           set -eu
           mkdir dist
-          (cd built && sha256sum --check ./*.sha256 && cat ./*.buildinfo ./footprint-*.json)
-          cp built/genesis-mesh-edge-*-x86_64-unknown-linux-musl built/genesis-mesh-edge-*-aarch64-unknown-linux-musl dist/
+          # Each build uploaded dist/* and its footprint file, so the binaries arrive under
+          # built/dist/ and the footprints under built/.
+          (cd built/dist && sha256sum --check ./*.sha256 && cat ./*.buildinfo)
+          cat built/footprint-*.json
+          cp built/dist/genesis-mesh-edge-*-x86_64-unknown-linux-musl built/dist/genesis-mesh-edge-*-aarch64-unknown-linux-musl dist/
           rm -f dist/*.sha256 dist/*.buildinfo
           cp edge/packaging/genesis-mesh-edge.service edge/packaging/edge.toml.example dist/
           (cd dist && sha256sum genesis-mesh-edge-* genesis-mesh-edge.service edge.toml.example > SHA256SUMS-edge && cat SHA256SUMS-edge)
