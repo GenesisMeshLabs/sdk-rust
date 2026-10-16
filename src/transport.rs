@@ -520,6 +520,69 @@ pub(crate) fn query_pairs(params: &Value) -> Result<Vec<(String, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn decoded(encoded: &str) -> String {
+        percent_encoding::percent_decode_str(encoded)
+            .decode_utf8()
+            .unwrap()
+            .into_owned()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// A path segment is refused exactly when it is empty, `.`, `..` or
+        /// holds a control character; otherwise it is encoded to letters,
+        /// digits and `%XX` only (no `/`, `?`, `#` or `.` survives), and
+        /// decodes to the identifier.
+        #[test]
+        fn a_segment_encodes_to_one_path_segment(id in any::<String>()) {
+            let refused = id.is_empty() || id == "." || id == ".." || id.chars().any(char::is_control);
+            match segment(&id) {
+                Err(GenesisMeshError::Configuration(_)) => prop_assert!(refused, "{:?}", id),
+                Err(other) => prop_assert!(false, "{:?}", other),
+                Ok(encoded) => {
+                    prop_assert!(!refused, "{:?}", id);
+                    prop_assert!(encoded.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'%'), "{}", encoded);
+                    prop_assert_eq!(decoded(&encoded), id);
+                }
+            }
+        }
+
+        #[test]
+        fn a_dot_segment_is_refused_and_a_dotted_one_is_not(dots in 1_usize..4, rest in "[a-z]{0,3}") {
+            let id = format!("{}{rest}", ".".repeat(dots));
+            let refused = rest.is_empty() && dots <= 2;
+            prop_assert_eq!(segment(&id).is_err(), refused, "{}", id);
+            prop_assert_eq!(resource_path(&format!("kv:a/{id}/b")).is_err(), refused, "{}", id);
+        }
+
+        /// A resource path keeps its `/` separators and nothing else: as many
+        /// segments as the identifier has, each decoding to its part.
+        #[test]
+        fn a_resource_path_keeps_its_segments(parts in prop::collection::vec(r"[^/\p{Cc}]{1,12}", 1..6)) {
+            prop_assume!(parts.iter().all(|p| p != "." && p != ".."));
+            let id = parts.join("/");
+            let path = resource_path(&id).unwrap();
+            let segments: Vec<&str> = path.split('/').collect();
+            prop_assert_eq!(segments.len(), parts.len());
+            for (segment, part) in segments.iter().zip(&parts) {
+                prop_assert_eq!(&decoded(segment), part);
+            }
+        }
+
+        /// An empty segment anywhere (`a//b`, a leading or trailing `/`) is
+        /// refused, never collapsed.
+        #[test]
+        fn an_empty_segment_is_refused(parts in prop::collection::vec("[a-z]{0,4}", 2..5)) {
+            let id = parts.join("/");
+            prop_assert_eq!(resource_path(&id).is_err(), parts.iter().any(String::is_empty), "{}", id);
+        }
+    }
 
     #[test]
     fn reads_retry_after_as_seconds_or_a_date() {
