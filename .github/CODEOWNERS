@@ -1,0 +1,49 @@
+# Every path needs a Maintainer's review. Later lines win, so the areas below
+# name the same team explicitly: they are the paths whose changes the
+# Maintainer merges (see .github/pull_request_template.md).
+
+* @GenesisMeshLabs/maintainers
+
+# Security-critical: signing, canonical form, strict JSON, offline verification
+/src/auth.rs @GenesisMeshLabs/maintainers
+/src/canonical.rs @GenesisMeshLabs/maintainers
+/src/canonical_registry.json @GenesisMeshLabs/maintainers
+/src/verify.rs @GenesisMeshLabs/maintainers
+/src/strict.rs @GenesisMeshLabs/maintainers
+/src/strict_json.rs @GenesisMeshLabs/maintainers
+/src/key_history.rs @GenesisMeshLabs/maintainers
+/src/audit_pack.rs @GenesisMeshLabs/maintainers
+/src/grants.rs @GenesisMeshLabs/maintainers
+/src/node_auth.rs @GenesisMeshLabs/maintainers
+/src/execution.rs @GenesisMeshLabs/maintainers
+/SECURITY.md @GenesisMeshLabs/maintainers
+
+# genesis-mesh-verify: no network, no signing (clippy.toml and its tests)
+/verifier/ @GenesisMeshLabs/maintainers
+
+# genesis-mesh-edge: the decision rules, the no-admin-key rule, the device database
+/edge/ @GenesisMeshLabs/maintainers
+/edge/src/decision.rs @GenesisMeshLabs/maintainers
+/edge/src/db.rs @GenesisMeshLabs/maintainers
+/edge/clippy.toml @GenesisMeshLabs/maintainers
+
+# Conformance vectors (copied from the core) and their sync scripts
+/tests/fixtures/ @GenesisMeshLabs/maintainers
+/scripts/sync_canonical_registry.py @GenesisMeshLabs/maintainers
+/scripts/generate_anchor_vectors.py @GenesisMeshLabs/maintainers
+
+# Workflows
+/.github/ @GenesisMeshLabs/maintainers
+
+# Packaging and release
+/Cargo.toml @GenesisMeshLabs/maintainers
+/Cargo.lock @GenesisMeshLabs/maintainers
+/VERSION @GenesisMeshLabs/maintainers
+/RELEASING.md @GenesisMeshLabs/maintainers
+/scripts/build_verifier.sh @GenesisMeshLabs/maintainers
+/scripts/build_edge.sh @GenesisMeshLabs/maintainers
+/scripts/check_release.py @GenesisMeshLabs/maintainers
+/scripts/changelog.py @GenesisMeshLabs/maintainers
+/edge/packaging/ @GenesisMeshLabs/maintainers
+/edge/Dockerfile @GenesisMeshLabs/maintainers
+/edge/footprint-budgets.json @GenesisMeshLabs/maintainers

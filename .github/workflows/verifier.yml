@@ -12,6 +12,8 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  # The merge queue runs the required checks on the PR on top of main.
+  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -103,6 +105,24 @@ jobs:
           name: verifier-${{ matrix.target }}
           path: first-dist/*
           if-no-files-found: error
+
+  # The required check for the matrix above: one stable name, whatever the
+  # targets. It fails when any member failed, was cancelled or was skipped.
+  verifier:
+    name: Verifier
+    if: always()
+    needs: [static]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every verifier target passed
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"(failure|cancelled|skipped)"'; then
+            echo "::error::a verifier build or its tests did not pass"; exit 1
+          fi
 
   release:
     if: github.ref_type == 'tag'
