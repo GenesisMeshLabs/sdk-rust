@@ -13,38 +13,7 @@ It wraps the Network Authority HTTP API surface documented in:
 
 ```text
 sdk-rust/
-  src/
-    auth.rs        # canonical_json, load_signing_key, build_admin_headers
-    client.rs      # ClientOptions, HttpTransport, GenesisMeshClient
-    errors.rs      # GenesisMeshError and HTTP error mapping
-    agreement.rs   # AgreementClient
-    attestation.rs # AttestationClient
-    boundary.rs    # BoundaryClient
-    consensus.rs   # ConsensusClient
-    data_usage.rs  # DataUsageClient
-    disclosure.rs  # DisclosureClient
-    evidence.rs    # EvidenceClient (trust evidence)
-    evidence_store.rs # EvidenceStoreClient, ResourceHead
-    policy.rs      # PolicyClient (boundary policies)
-    health.rs      # HealthClient
-    canonical.rs   # canonical bodies, digests, Pydantic timestamps (pure)
-    verify.rs      # offline verification, Python reason codes (pure)
-    strict.rs      # strict verification: every signed field is in the registry (1.2.0, pure)
-    strict_json.rs # strict JSON input: what parsers read differently is refused (1.2.0, pure)
-    canonical_registry.json # the field registry, generated from the core's vector
-    key_history.rs # NA key history and succession, which key is valid when (1.5.0, pure)
-    audit_pack.rs  # audit pack verification and the completeness check (1.5.0, pure)
-    execution.rs   # ExecutionRecorder, secret-material guard
-    out_of_band.rs # ObservationRecorder, break-glass records (1.3.0)
-    remediation.rs # remediation records, review checks, plans and the state table (1.4.0, pure)
-    grants.rs      # pre-issued grants: envelopes, number rules, use rules, signing (1.6.0, pure)
-    grant_client.rs # GrantClient: grant routes, time tokens, uses, the revocation feed (1.6.0)
-    grant_holder.rs # GrantHolder: acts within a grant offline, uploads, falls back (1.6.0)
-    node_auth.rs   # node request signatures, the edge join co-signature (1.7.0, pure)
-    node.rs        # NodeClient, NodeIdentity, NodeJoin: a node's routes (1.7.0)
-    outbox.rs      # evidence and record outboxes
-    governance.rs  # governed_action, governed_action_with_break_glass, rotate_forward_then_disable, summarize_decision
-    lib.rs         # public exports
+  src/             # the crate: module map and layers in docs/architecture.md
   verifier/        # genesis-mesh-verify (1.5.0): the offline verifier binary, a workspace member
     src/           # command line only; verification is the crate's verify module
     clippy.toml    # refuses network and signing code in the binary
@@ -61,24 +30,17 @@ sdk-rust/
 
 ## Layer Rule
 
-Mirror the other official SDKs:
-
-```text
-auth.rs      = pure crypto: canonical JSON, digests, Ed25519 signing and verification, admin headers
-canonical.rs = model canonical forms and digests (pure, no keys)
-strict.rs, strict_json.rs = the field registry and strict JSON input (pure)
-verify.rs, key_history.rs, audit_pack.rs = offline verification (pure, no network)
-execution.rs, out_of_band.rs, remediation.rs, grants.rs, node_auth.rs, outbox.rs
-             = records: build, sign and check them offline (no network)
-errors.rs    = typed SDK errors only
-client.rs    = HTTP transport and client composition (feature `client`)
-{domain}.rs  = route wrappers over HttpTransport (feature `client`)
-governance.rs, grant_holder.rs = orchestration over the sub-clients (feature `client`)
-```
+[docs/architecture.md](docs/architecture.md) is the module map: eight
+layers, from errors and strict JSON up to the orchestration over the
+sub-clients, and the rule that a module uses only its own layer and those
+below it, with no import cycle. `tests/architecture.rs` enforces the same
+table; a new module must be placed there. The page also lists where each
+common change goes and the test that catches a missed file.
 
 Do not mix layers. Domain clients must not contain signing logic. Auth code must
-not make HTTP calls. Nothing above `client.rs` in this list may use the
-network: they build without the `client` feature, which CI checks.
+not make HTTP calls. The offline layers (everything below the transport)
+build without the `client` feature, which CI checks. Shared helpers go down
+to a lower module (`rules`, `shape`, `outbox_entry`), never sideways.
 
 ## MVP Scope
 
