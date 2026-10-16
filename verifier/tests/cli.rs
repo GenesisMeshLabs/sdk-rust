@@ -391,6 +391,89 @@ fn the_binary_holds_no_network_or_signing_code() {
     }
 }
 
+/// The allow-list behind clippy.toml's deny-list: the binary may use the
+/// SDK's offline verification modules and its strict JSON reader, and
+/// nothing else of the SDK. A new SDK path here is a deliberate change to
+/// this list.
+#[test]
+fn the_binary_uses_only_the_sdk_verification_modules() {
+    const ALLOWED: [&str; 8] = [
+        "audit_pack",
+        "canonical",
+        "key_history",
+        "strict",
+        "verify",
+        "parse_strict_json",
+        "Value",
+        "json",
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut used = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&root).unwrap() {
+        let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        let code: String = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        let mut rest = code.as_str();
+        while let Some(at) = rest.find("genesis_mesh_sdk") {
+            rest = rest[at + "genesis_mesh_sdk".len()..].trim_start();
+            let Some(path) = rest.strip_prefix("::") else {
+                continue;
+            };
+            let path = path.trim_start();
+            // The first segment of each top-level item of a `{...}` group,
+            // or of the single path.
+            let mut items = Vec::new();
+            if let Some(group) = path.strip_prefix('{') {
+                let (mut depth, mut item) = (0, String::new());
+                for c in group.chars() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' if depth == 0 => break,
+                        '}' => depth -= 1,
+                        ',' if depth == 0 => {
+                            items.push(std::mem::take(&mut item));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    item.push(c);
+                }
+                items.push(item);
+            } else {
+                items.push(path.to_owned());
+            }
+            for item in items {
+                let first: String = item
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !first.is_empty() {
+                    used.insert(first);
+                }
+            }
+        }
+    }
+    let outside: Vec<_> = used
+        .iter()
+        .filter(|u| !ALLOWED.contains(&u.as_str()))
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "genesis-mesh-verify uses SDK paths outside its allow-list: {outside:?}"
+    );
+    assert!(
+        used.contains("verify"),
+        "the reader found no SDK use: {used:?}"
+    );
+}
+
 /// The frozen 1.5.0 pack (the core's conformance/fixtures/audit-pack-1.5.0),
 /// copied into a scratch directory so a test can change it.
 fn frozen_pack(name: &str) -> (Scratch, String, String, String) {
