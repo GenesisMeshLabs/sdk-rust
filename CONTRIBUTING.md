@@ -35,8 +35,10 @@ python scripts/check_release.py
 python scripts/changelog.py check --base origin/main --branch "$(git branch --show-current)"
 ```
 
-On Windows, add `--exclude genesis-mesh-edge` to the workspace test (the edge
-agent is Unix only).
+On Windows, add `--exclude genesis-mesh-edge` to the workspace clippy and
+test commands, before any `--` (the edge agent is Unix only):
+`cargo clippy --locked --workspace --exclude genesis-mesh-edge --all-targets -- -D warnings`
+and `cargo test --locked --workspace --exclude genesis-mesh-edge --all-targets`.
 
 The tests against a live Network Authority (`tests/live_na.rs`) and the edge
 agent's scenarios (`edge/tests/scenario.rs`) are `#[ignore]`d in a plain
