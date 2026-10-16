@@ -2,7 +2,7 @@ use std::any::Any;
 
 use serde_json::Value;
 
-use crate::outbox::{OutboxEntry, RecordOutboxEntry};
+use crate::outbox_entry::{OutboxEntry, RecordOutboxEntry};
 
 /// SDK result type.
 pub type Result<T> = std::result::Result<T, GenesisMeshError>;
@@ -307,7 +307,7 @@ impl GenesisMeshError {
             Self::Outbox(err)
                 if err
                     .get_ref()
-                    .is_some_and(|inner| inner.is::<crate::outbox::UnreadableFiles>()) =>
+                    .is_some_and(|inner| inner.is::<crate::outbox_entry::UnreadableFiles>()) =>
             {
                 "outbox_file_unreadable"
             }

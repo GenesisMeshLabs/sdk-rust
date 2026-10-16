@@ -47,6 +47,7 @@ mod node;
 pub mod node_auth;
 mod out_of_band;
 mod outbox;
+mod outbox_entry;
 #[cfg(feature = "client")]
 mod policy;
 pub mod remediation;
