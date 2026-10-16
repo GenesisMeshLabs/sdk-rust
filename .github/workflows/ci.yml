@@ -88,6 +88,9 @@ jobs:
     name: SDK against core main
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # Skipped is not green: every live part, and the core's corpus, must run.
+      GM_E2E_REQUIRED: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # name when it exists, and against main otherwise.
@@ -110,15 +113,21 @@ jobs:
           repository: GenesisMeshLabs/genesismesh
           ref: ${{ env.CORE_REF }}
           path: core
+      # A suite listed here that the core revision lacks fails: a renamed or
+      # removed suite must not turn the comparison off silently.
       - name: The signing vectors are the core's
         run: |
+          status=0
           for suite in admin_auth field_registry canonical out_of_band remediation audit grants node; do
-            if [ -f "core/conformance/vectors/$suite.json" ]; then
-              cmp "core/conformance/vectors/$suite.json" "tests/fixtures/$suite.json"
-            else
-              echo "::notice::The core revision has no $suite vectors yet; skipped."
+            if [ ! -f "core/conformance/vectors/$suite.json" ]; then
+              echo "::error::The core revision has no $suite vectors (conformance/vectors/$suite.json)."
+              status=1
+            elif ! cmp "core/conformance/vectors/$suite.json" "tests/fixtures/$suite.json"; then
+              echo "::error::tests/fixtures/$suite.json differs from the core's."
+              status=1
             fi
           done
+          exit "$status"
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
         with:
           toolchain: stable
@@ -129,24 +138,27 @@ jobs:
       # 1.5.0: the frozen audit pack is the core's, byte for byte.
       - name: The frozen audit pack is the core's
         run: |
-          if [ -d core/conformance/fixtures/audit-pack-1.5.0 ]; then
-            diff -r core/conformance/fixtures/audit-pack-1.5.0 tests/fixtures/audit-pack-1.5.0
-          else
-            echo "::notice::The core revision has no frozen 1.5.0 pack yet; skipped."
+          if [ ! -d core/conformance/fixtures/audit-pack-1.5.0 ]; then
+            echo "::error::The core revision has no frozen 1.5.0 pack."; exit 1
           fi
+          diff -r core/conformance/fixtures/audit-pack-1.5.0 tests/fixtures/audit-pack-1.5.0
       # genesis-mesh-verify against the core's verification corpus, generated
       # from the same core revision; every case must have an adapter.
       - name: genesis-mesh-verify against the reference corpus
         run: |
-          if [ -f core/scripts/export_reference_corpus.py ]; then
-            python core/scripts/export_reference_corpus.py --suite verification --out "$RUNNER_TEMP/corpus"
-            export GM_VERIFY_CORPUS="$RUNNER_TEMP/corpus/verification" GM_VERIFY_CORPUS_STRICT=1
-            cargo test --locked -p genesis-mesh-verify --test differential -- --nocapture
-          else
-            echo "::notice::The core revision has no verification corpus yet; skipped."
+          set -eu
+          if [ ! -f core/scripts/export_reference_corpus.py ]; then
+            echo "::error::The core revision has no verification corpus exporter."; exit 1
           fi
+          python core/scripts/export_reference_corpus.py --suite verification --out "$RUNNER_TEMP/corpus"
+          export GM_VERIFY_CORPUS="$RUNNER_TEMP/corpus/verification" GM_VERIFY_CORPUS_STRICT=1
+          bash scripts/require_tests.sh cargo test --locked -p genesis-mesh-verify --test differential -- --nocapture
+      # The live test is #[ignore]d in plain runs; here it must run, and pass.
       - name: Governed-action lifecycle against a live NA
-        run: cargo test --locked --test live_na -- --nocapture
+        run: >-
+          bash scripts/require_tests.sh
+          cargo test --locked --test live_na --
+          --nocapture --include-ignored --exact governed_lifecycle_against_a_live_na
         env:
           GM_E2E_PYTHON: python
 

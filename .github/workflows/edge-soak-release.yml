@@ -62,12 +62,14 @@ jobs:
       - name: Two hours with the NA stopped
         env:
           GM_E2E_PYTHON: python
+          GM_E2E_REQUIRED: "1"
           GM_EDGE_OFFLINE_SECONDS: "7200"
         run: |
           set -eu
           export GM_EDGE_BINARY="$BINARY"
           export GM_EDGE_WRAP="/usr/bin/time -v -o $RUNNER_TEMP/time.txt"
-          cargo test --locked -p genesis-mesh-edge --test scenario -- --nocapture --exact offline
+          bash scripts/require_tests.sh \
+            cargo test --locked -p genesis-mesh-edge --test scenario -- --nocapture --include-ignored --exact offline
           cat "$RUNNER_TEMP/time.txt"
           rss="$(sed -n 's/^[[:space:]]*Maximum resident set size (kbytes): //p' "$RUNNER_TEMP/time.txt")"
           jq -n --arg target "$TARGET" --argjson binary_bytes "$(stat -c %s "$BINARY")" \
