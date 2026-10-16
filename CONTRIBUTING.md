@@ -61,18 +61,12 @@ fragment (`changelog.d/README.md`) instead of editing `CHANGELOG.md`.
 
 ## Project Structure
 
-Read [AGENT.md](AGENT.md) before changing source files. The short version:
-
-| File | What goes here |
-|---|---|
-| `src/auth.rs` | Crypto only: canonical JSON, Ed25519 signing, admin headers |
-| `src/canonical.rs`, `src/verify.rs`, `src/strict.rs`, ... | Offline modules: no network, built without the `client` feature |
-| `src/client.rs` | HTTP transport and client composition |
-| `src/errors.rs` | Typed SDK errors |
-| `src/{domain}.rs` | Route wrappers over the transport (sub-clients) |
-| `src/governance.rs`, `src/grant_holder.rs` | Orchestration over the sub-clients |
-| `verifier/` | The offline verifier binary |
-| `edge/` | The edge agent (beta) |
+[docs/architecture.md](docs/architecture.md) maps the modules and their
+layers (which module may use which; `tests/architecture.rs` enforces it) and
+lists, for the common changes (a record kind, a sub-client method, an error
+code, a conformance suite, an edge endpoint or setting), the files to touch
+and the test that fails when one is missed. Read it, and
+[AGENT.md](AGENT.md), before changing source files.
 
 ## Commit Messages
 

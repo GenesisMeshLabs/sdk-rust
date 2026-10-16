@@ -890,6 +890,8 @@ the verifier's tests against them without a network. The `Edge agent`
 workflow builds the agent's static binaries, checks their size and the
 agent's memory over a scenario with the NA stopped against the core, and on a
 tag signs and attaches them and publishes the image.
+How the crate is layered, and where a change goes:
+[docs/architecture.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/docs/architecture.md).
 See [CONTRIBUTING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/CONTRIBUTING.md), [RELEASING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/RELEASING.md), and
 [SECURITY.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/SECURITY.md).
 
