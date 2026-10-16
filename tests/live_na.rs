@@ -9,6 +9,11 @@
 //! them, with a second operator key of another holder deciding reviews.
 //! Pre-issued grants (1.6.0) are exercised when the loopback NA issues them
 //! (`EVIDENCE_GRANTS=on`).
+//!
+//! The live test is `#[ignore]`d, so a plain `cargo test` reports it as
+//! ignored rather than passed; run it with `--include-ignored`. With
+//! `GM_E2E_REQUIRED=1` (set by CI) every skip is a failure: no NA, or an NA
+//! that cannot exercise a part, fails the run instead of reporting `ok`.
 
 use std::{
     collections::BTreeMap,
@@ -60,6 +65,16 @@ impl Drop for LiveNa {
             let _ = child.wait();
         }
     }
+}
+
+/// A part of the run that cannot happen here: reported on stderr, or a
+/// failure when `GM_E2E_REQUIRED=1` says every part must run (CI), so a lost
+/// NA or a missing feature can never pass as `ok`.
+fn skip(reason: &str) {
+    if std::env::var("GM_E2E_REQUIRED").is_ok_and(|v| v == "1") {
+        panic!("GM_E2E_REQUIRED=1, but this part cannot run: {reason}");
+    }
+    eprintln!("skipped: {reason}");
 }
 
 fn live_na() -> Option<LiveNa> {
@@ -127,9 +142,10 @@ fn window() -> (String, String) {
 }
 
 #[tokio::test]
+#[ignore = "needs a live NA (GM_E2E_PYTHON or GM_E2E_BASE_URL); run with --include-ignored"]
 async fn governed_lifecycle_against_a_live_na() {
     let Some(na) = live_na() else {
-        eprintln!("skipped: set GM_E2E_PYTHON or GM_E2E_BASE_URL");
+        skip("no NA: set GM_E2E_PYTHON or GM_E2E_BASE_URL");
         return;
     };
     admit_decide_record_audit_and_offboard(&na).await;
@@ -140,13 +156,38 @@ async fn governed_lifecycle_against_a_live_na() {
     act_within_grants_offline_and_upload_on_reconnect(&na).await;
 }
 
+/// Skipped is not green: the live test run with `GM_E2E_REQUIRED=1` and no
+/// NA fails rather than reporting `ok`.
+#[test]
+fn a_required_live_run_without_an_na_fails() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--include-ignored",
+            "--exact",
+            "governed_lifecycle_against_a_live_na",
+        ])
+        .env("GM_E2E_REQUIRED", "1")
+        .env_remove("GM_E2E_PYTHON")
+        .env_remove("GM_E2E_BASE_URL")
+        .output()
+        .unwrap();
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{out}");
+    assert!(out.contains("1 failed"), "{out}");
+    assert!(out.contains("GM_E2E_REQUIRED=1, but"), "{out}");
+}
+
 /// v1.4.0: a denied change cancelled by a forward rotation and a disable,
 /// recorded as two linked records; a second denied change reviewed by
 /// another holder and waived; the export verifies offline, the review's
 /// approvals with it.
 async fn remediate_review_and_verify_offline(na: &LiveNa) {
     let Some(reviewer) = &na.reviewer else {
-        eprintln!("skipped 1.4.0: the NA does not record remediations and reviews");
+        skip("1.4.0: the NA does not record remediations and reviews");
         return;
     };
     let gm = &na.client;
@@ -456,7 +497,7 @@ async fn remediate_review_and_verify_offline(na: &LiveNa) {
 /// export that verifies offline.
 async fn record_and_judge_changes_outside_the_controlled_path(na: &LiveNa) {
     if !na.out_of_band {
-        eprintln!("skipped 1.3.0: the NA does not record changes outside the controlled path");
+        skip("1.3.0: the NA does not record changes outside the controlled path");
         return;
     }
     let gm = &na.client;
@@ -1138,7 +1179,7 @@ async fn observe_enforce_rollback_failures_conflicts_and_retired_keys(na: &LiveN
 /// once the feed says so; the export and an audit pack verify offline.
 async fn act_within_grants_offline_and_upload_on_reconnect(na: &LiveNa) {
     if !na.grants {
-        eprintln!("skipped 1.6.0: the NA does not issue grants");
+        skip("1.6.0: the NA does not issue grants");
         return;
     }
     let gm = &na.client;

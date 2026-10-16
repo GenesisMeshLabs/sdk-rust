@@ -48,11 +48,22 @@ impl Drop for Na {
     }
 }
 
-/// Start a loopback NA with `GM_E2E_PYTHON`, or `None` (the test is skipped)
-/// when it is not set or the core has no edge routes.
+/// A part of a scenario that cannot happen here: reported on stderr, or a
+/// failure when `GM_E2E_REQUIRED=1` says every part must run (CI), so a lost
+/// NA or a missing feature can never pass as `ok`.
+pub fn skip(reason: &str) {
+    if std::env::var("GM_E2E_REQUIRED").is_ok_and(|v| v == "1") {
+        panic!("GM_E2E_REQUIRED=1, but this part cannot run: {reason}");
+    }
+    eprintln!("skipped: {reason}");
+}
+
+/// Start a loopback NA with `GM_E2E_PYTHON`, or `None` (the test is skipped,
+/// or fails under `GM_E2E_REQUIRED=1`) when it is not set or the core has no
+/// edge routes.
 pub fn start_na() -> Option<Na> {
     let Ok(python) = std::env::var("GM_E2E_PYTHON") else {
-        eprintln!("skipped: set GM_E2E_PYTHON to a Python with the core installed");
+        skip("no NA: set GM_E2E_PYTHON to a Python with the core installed");
         return None;
     };
     let mut child = Command::new(python)
@@ -70,9 +81,9 @@ pub fn start_na() -> Option<Na> {
         .expect("the NA printed its configuration");
     let config: Value = serde_json::from_str(&line).unwrap();
     if !config["edge"].as_bool().unwrap_or(false) || !config["grants"].as_bool().unwrap_or(false) {
-        eprintln!("skipped 1.7.0: the core has no edge routes (/node/state) or no grants");
         let _ = child.kill();
         let _ = child.wait();
+        skip("1.7.0: the core has no edge routes (/node/state) or no grants");
         return None;
     }
     let base_url = config["baseUrl"].as_str().unwrap().to_owned();

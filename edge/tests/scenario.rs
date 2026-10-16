@@ -4,6 +4,10 @@
 //! authentication (C4). Skipped unless `GM_E2E_PYTHON` names a Python with a
 //! core that has the edge routes (`scripts/e2e_na.py`).
 //!
+//! The scenarios are `#[ignore]`d, so a plain `cargo test` reports them as
+//! ignored rather than passed; run them with `--include-ignored`. With
+//! `GM_E2E_REQUIRED=1` (set by CI) every skip is a failure.
+//!
 //! `GM_EDGE_OFFLINE_SECONDS` sets how long the NA stays stopped in
 //! `offline` (120 on pull requests, 7200 in the soak); `GM_EDGE_BINARY` runs
 //! another build of the agent (the static release build) and
@@ -33,7 +37,29 @@ fn sovereign() -> String {
     format!("site-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
 }
 
+/// Skipped is not green: a scenario run with `GM_E2E_REQUIRED=1` and no NA
+/// fails rather than reporting `ok`. (Its name holds neither `offline` nor
+/// `backlog`, which CI's `--skip` filters match as substrings.)
+#[test]
+fn a_required_scenario_without_an_na_fails() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--include-ignored", "--exact", "lifecycle"])
+        .env("GM_E2E_REQUIRED", "1")
+        .env_remove("GM_E2E_PYTHON")
+        .output()
+        .unwrap();
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{out}");
+    assert!(out.contains("1 failed"), "{out}");
+    assert!(out.contains("GM_E2E_REQUIRED=1, but"), "{out}");
+}
+
 #[tokio::test]
+#[ignore = "needs a live NA (GM_E2E_PYTHON); run with --include-ignored"]
 async fn lifecycle() {
     let Some(na) = start_na() else { return };
     let proxy = Proxy::start(&na.base_url).await;
@@ -195,6 +221,7 @@ async fn lifecycle() {
 }
 
 #[tokio::test]
+#[ignore = "needs a live NA (GM_E2E_PYTHON); run with --include-ignored"]
 async fn offline() {
     let Some(na) = start_na() else { return };
     let proxy = Proxy::start(&na.base_url).await;
@@ -388,6 +415,7 @@ async fn offline() {
 }
 
 #[tokio::test]
+#[ignore = "needs a live NA (GM_E2E_PYTHON); run with --include-ignored"]
 async fn stale() {
     let Some(na) = start_na() else { return };
     let proxy = Proxy::start(&na.base_url).await;
@@ -447,6 +475,7 @@ async fn stale() {
 }
 
 #[tokio::test]
+#[ignore = "needs a live NA (GM_E2E_PYTHON); run with --include-ignored"]
 async fn local_auth() {
     use std::os::unix::fs::PermissionsExt as _;
     let Some(na) = start_na() else { return };
@@ -532,11 +561,11 @@ async fn local_auth() {
             let body: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
             assert_eq!(body["error"]["code"], "local_peer_refused", "{body}");
         }
-        Ok(output) => eprintln!(
-            "skipped (a), another uid: sudo -n setpriv is not permitted here ({})",
+        Ok(output) => support::skip(&format!(
+            "(a), another uid: sudo -n setpriv is not permitted here ({})",
             String::from_utf8_lossy(&output.stderr).trim()
-        ),
-        Err(err) => eprintln!("skipped (a), another uid: no sudo ({err})"),
+        )),
+        Err(err) => support::skip(&format!("(a), another uid: no sudo ({err})")),
     }
     assert_eq!(unix.stop().await, Some(0), "{}", unix.log());
 }
@@ -572,6 +601,7 @@ async fn connected(
 }
 
 #[tokio::test]
+#[ignore = "needs a live NA (GM_E2E_PYTHON); run with --include-ignored"]
 async fn rate_limited() {
     let Some(na) = start_na() else { return };
     let proxy = Proxy::start(&na.base_url).await;
@@ -629,6 +659,7 @@ async fn rate_limited() {
 }
 
 #[tokio::test]
+#[ignore = "needs a live NA (GM_E2E_PYTHON); run with --include-ignored"]
 async fn blackhole() {
     let Some(na) = start_na() else { return };
     let proxy = Proxy::start(&na.base_url).await;
@@ -674,6 +705,7 @@ async fn blackhole() {
 }
 
 #[tokio::test]
+#[ignore = "needs a live NA (GM_E2E_PYTHON); run with --include-ignored"]
 async fn bad_gateway() {
     // Behind a reverse proxy, a stopped NA is the proxy's own 502 page: the
     // NA is unreachable, not refusing.
@@ -719,6 +751,7 @@ async fn bad_gateway() {
 }
 
 #[tokio::test]
+#[ignore = "needs a live NA (GM_E2E_PYTHON); run with --include-ignored"]
 async fn disconnected_client() {
     // A client that goes away before its answer: nothing runs, nothing is
     // signed, no grant use is spent.
@@ -750,6 +783,7 @@ async fn disconnected_client() {
 }
 
 #[tokio::test]
+#[ignore = "needs a live NA (GM_E2E_PYTHON); run with --include-ignored"]
 async fn local_api_hardening() {
     let Some(na) = start_na() else { return };
     let proxy = Proxy::start(&na.base_url).await;
@@ -803,6 +837,7 @@ async fn local_api_hardening() {
 }
 
 #[tokio::test]
+#[ignore = "needs a live NA (GM_E2E_PYTHON); run with --include-ignored"]
 async fn backlog() {
     // A large backlog uploads page by page; its size is GM_EDGE_BACKLOG
     // (2000 by default). edge.yml measures the agent's memory here too.
@@ -856,6 +891,7 @@ async fn backlog() {
 }
 
 #[tokio::test]
+#[ignore = "needs a live NA (GM_E2E_PYTHON); run with --include-ignored"]
 async fn holder_rebuilt() {
     // A holder whose saved state is lost is rebuilt from the uses the agent
     // made, continuing the chain: never from use 0 again, which the NA
