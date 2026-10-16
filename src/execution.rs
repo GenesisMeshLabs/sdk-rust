@@ -17,94 +17,10 @@ use crate::{
         BreakGlassInput,
     },
     remediation::{sign_remediation, RemediationInput},
+    rules::secret_material,
 };
 
-/// Limit on `execution_parameters` plus `outcome_detail`, as enforced by the
-/// NA; for an observation or break-glass record (1.3.1), on the values its
-/// guard covers, counted as the NA counts them.
-pub const MAX_METADATA_BYTES: usize = 16 * 1024;
-
-const SECRET_KEYS: [&str; 18] = [
-    "value",
-    "secret",
-    "secretvalue",
-    "password",
-    "passwd",
-    "passphrase",
-    "token",
-    "accesstoken",
-    "refreshtoken",
-    "bearer",
-    "privatekey",
-    "keymaterial",
-    "credential",
-    "credentials",
-    "clientsecret",
-    "apikey",
-    "pem",
-    "connectionstring",
-];
-
-fn normalise_key(key: &str) -> String {
-    key.chars()
-        .filter(|c| !matches!(c, '-' | '_' | '.'))
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn token_chars(part: &str) -> bool {
-    part.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-fn looks_like_key_material(value: &str) -> bool {
-    // The reference's patterns end in `$`, which also matches before a final
-    // newline (1.3.1).
-    let value = value.strip_suffix('\n').unwrap_or(value);
-    let long_opaque = value.len() >= 120
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"+/=_-".contains(&b));
-    let jwt = value.strip_prefix("eyJ").is_some_and(|rest| {
-        let parts: Vec<&str> = rest.split('.').collect();
-        parts.len() == 3
-            && !parts[0].is_empty()
-            && !parts[1].is_empty()
-            && parts.iter().all(|p| token_chars(p))
-    });
-    long_opaque || jwt
-}
-
-/// The reference's `_secret_material`: the first field named like a secret,
-/// PEM block, key or token under `path`.
-pub(crate) fn secret_material(value: &Value, path: &str) -> Option<String> {
-    match value {
-        Value::Array(items) => items
-            .iter()
-            .enumerate()
-            .find_map(|(i, item)| secret_material(item, &format!("{path}{i}."))),
-        Value::Object(map) => map.iter().find_map(|(key, inner)| {
-            if SECRET_KEYS.contains(&normalise_key(key).as_str()) {
-                Some(format!(
-                    "field '{path}{key}' is not allowed in evidence metadata"
-                ))
-            } else {
-                secret_material(inner, &format!("{path}{key}."))
-            }
-        }),
-        Value::String(text) => {
-            let field = path.trim_end_matches('.');
-            if text.contains("-----BEGIN") {
-                Some(format!("field '{field}' contains a PEM block"))
-            } else if looks_like_key_material(text) {
-                Some(format!("field '{field}' looks like key or token material"))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
+pub use crate::rules::MAX_METADATA_BYTES;
 
 /// Why the metadata would be refused as secret material, or `None`. A guard,
 /// not a guarantee: send identifiers, versions and timestamps, never secret

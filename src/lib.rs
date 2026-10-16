@@ -50,6 +50,7 @@ mod outbox;
 #[cfg(feature = "client")]
 mod policy;
 pub mod remediation;
+mod rules;
 pub mod strict;
 mod strict_json;
 pub mod verify;

@@ -269,35 +269,7 @@ fn is_scalar(value: &Value) -> bool {
     )
 }
 
-/// A number as an envelope holds it (the reference's `normalize_number`):
-/// an integral number as an integer (`5.0` is `5`), within 64 bits (from
-/// -2^63 to 2^64 - 1); another number as it is. Refused: a boolean, any
-/// other non-number, and an integer beyond 64 bits.
-pub fn normalize_number(value: &Value) -> std::result::Result<Value, String> {
-    let Value::Number(n) = value else {
-        return Err("a number is expected".into());
-    };
-    if n.is_i64() || n.is_u64() {
-        return Ok(value.clone());
-    }
-    let x = n
-        .as_f64()
-        .filter(|x| x.is_finite())
-        .ok_or("numbers must be finite")?;
-    if x.fract() != 0.0 {
-        return Ok(value.clone());
-    }
-    // -2^63 <= x <= 2^64 - 1; the largest double below 2^64 is 2^64 - 2048.
-    if (-9_223_372_036_854_775_808.0..18_446_744_073_709_551_616.0).contains(&x) {
-        Ok(if x < 0.0 {
-            json!(x as i64)
-        } else {
-            json!(x as u64)
-        })
-    } else {
-        Err("integers must fit in 64 bits".into())
-    }
-}
+pub use crate::rules::normalize_number;
 
 fn normalize_scalar(value: &Value) -> std::result::Result<Value, String> {
     match value {
@@ -516,32 +488,6 @@ pub fn envelope_form_problem(envelope: &Value) -> Option<String> {
             .err()
             .map(|e| format!("parameter_envelope.{name}: {e}"))
     })
-}
-
-/// The paths of an envelope's numbers that are not written in their
-/// normalized form (`5.0` for `5`): a grant signed over them is not in the
-/// form the reference writes (`non_canonical_form`).
-pub(crate) fn envelope_number_problems(envelope: &Value) -> Vec<String> {
-    let mut found = Vec::new();
-    for (name, spec) in envelope.as_object().into_iter().flatten() {
-        let mut check = |path: String, value: &Value| {
-            if value.is_f64() && normalize_number(value).is_ok_and(|n| !n.is_f64()) {
-                found.push(path);
-            }
-        };
-        for (i, value) in spec["one_of"].as_array().into_iter().flatten().enumerate() {
-            check(format!("parameter_envelope.{name}.one_of.{i}"), value);
-        }
-        for bound in ["minimum", "maximum"] {
-            if let Some(value) = spec["number_range"].get(bound) {
-                check(
-                    format!("parameter_envelope.{name}.number_range.{bound}"),
-                    value,
-                );
-            }
-        }
-    }
-    found
 }
 
 /// Why one parameter value is outside its (normalized) envelope parameter,

@@ -31,7 +31,7 @@ use crate::{
     auth::{canonical_digest, canonical_json, load_signing_key, sha256_hex, sign_canonical},
     canonical::{out_of_band_canonical, python_timestamp},
     errors::{GenesisMeshError, Result},
-    execution::{secret_material, MAX_METADATA_BYTES},
+    rules::{secret_material, MAX_METADATA_BYTES},
     strict::canonical_timestamp,
     strict_json::check_strict_json,
 };

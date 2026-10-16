@@ -18,6 +18,8 @@ use std::sync::LazyLock;
 
 use serde_json::Value;
 
+use crate::rules::normalize_number;
+
 static REGISTRY: LazyLock<Value> = LazyLock::new(|| {
     serde_json::from_str(include_str!("canonical_registry.json"))
         .expect("the embedded canonical registry is valid JSON")
@@ -323,7 +325,7 @@ pub fn non_canonical_fields(model: &str, data: &Value) -> Vec<String> {
     // record: an envelope's integral numbers as integers (`5`, never `5.0`),
     // and a nested time token without `use_head_digest` when it has none.
     match model {
-        "CapabilityGrant" => found.extend(crate::grants::envelope_number_problems(
+        "CapabilityGrant" => found.extend(envelope_number_problems(
             &data["parameter_envelope"],
         )),
         "GrantExecutionEvidence"
@@ -337,5 +339,31 @@ pub fn non_canonical_fields(model: &str, data: &Value) -> Vec<String> {
     }
     found.sort();
     found.dedup();
+    found
+}
+
+/// The paths of an envelope's numbers that are not written in their
+/// normalized form (`5.0` for `5`): a grant signed over them is not in the
+/// form the reference writes (`non_canonical_form`).
+fn envelope_number_problems(envelope: &Value) -> Vec<String> {
+    let mut found = Vec::new();
+    for (name, spec) in envelope.as_object().into_iter().flatten() {
+        let mut check = |path: String, value: &Value| {
+            if value.is_f64() && normalize_number(value).is_ok_and(|n| !n.is_f64()) {
+                found.push(path);
+            }
+        };
+        for (i, value) in spec["one_of"].as_array().into_iter().flatten().enumerate() {
+            check(format!("parameter_envelope.{name}.one_of.{i}"), value);
+        }
+        for bound in ["minimum", "maximum"] {
+            if let Some(value) = spec["number_range"].get(bound) {
+                check(
+                    format!("parameter_envelope.{name}.number_range.{bound}"),
+                    value,
+                );
+            }
+        }
+    }
     found
 }
