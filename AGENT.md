@@ -6,7 +6,7 @@ Genesis Mesh Rust SDK.
 This SDK is a standalone crate. It does not import from the Python main repo.
 It wraps the Network Authority HTTP API surface documented in:
 
-- `genesismesh/docs/sdk/rust.md` when available
+- `genesismesh/docs/sdk/rust/` (`index.md`, `sdk.md`, `auth.md`, `usage.md`)
 - `genesismesh/docs/api/trust-http.md` for stable HTTP routes
 
 ## Repo Layout
@@ -29,6 +29,9 @@ sdk-rust/
     health.rs      # HealthClient
     canonical.rs   # canonical bodies, digests, Pydantic timestamps (pure)
     verify.rs      # offline verification, Python reason codes (pure)
+    strict.rs      # strict verification: every signed field is in the registry (1.2.0, pure)
+    strict_json.rs # strict JSON input: what parsers read differently is refused (1.2.0, pure)
+    canonical_registry.json # the field registry, generated from the core's vector
     key_history.rs # NA key history and succession, which key is valid when (1.5.0, pure)
     audit_pack.rs  # audit pack verification and the completeness check (1.5.0, pure)
     execution.rs   # ExecutionRecorder, secret-material guard
@@ -63,14 +66,19 @@ Mirror the other official SDKs:
 ```text
 auth.rs      = pure crypto: canonical JSON, digests, Ed25519 signing and verification, admin headers
 canonical.rs = model canonical forms and digests (pure, no keys)
-verify.rs    = offline verification (pure, no network)
-client.rs    = HTTP transport and client composition
+strict.rs, strict_json.rs = the field registry and strict JSON input (pure)
+verify.rs, key_history.rs, audit_pack.rs = offline verification (pure, no network)
+execution.rs, out_of_band.rs, remediation.rs, grants.rs, node_auth.rs, outbox.rs
+             = records: build, sign and check them offline (no network)
 errors.rs    = typed SDK errors only
-{domain}.rs  = thin route wrappers over HttpTransport
+client.rs    = HTTP transport and client composition (feature `client`)
+{domain}.rs  = route wrappers over HttpTransport (feature `client`)
+governance.rs, grant_holder.rs = orchestration over the sub-clients (feature `client`)
 ```
 
 Do not mix layers. Domain clients must not contain signing logic. Auth code must
-not make HTTP calls.
+not make HTTP calls. Nothing above `client.rs` in this list may use the
+network: they build without the `client` feature, which CI checks.
 
 ## MVP Scope
 
@@ -101,10 +109,14 @@ cargo test --locked --workspace --all-targets
 cargo test --locked --doc
 ```
 
+The live tests (`tests/live_na.rs`, `edge/tests/scenario.rs`) are
+`#[ignore]`d in a plain run; CONTRIBUTING.md shows how to run them.
+
 The default feature `client` (1.7.0) gates the HTTP client and every module
 that calls the NA; the offline modules (`verify`, `canonical`, `strict`,
-`auth`, `execution`, `out_of_band`, `outbox`, `grants`, `key_history`,
-`audit_pack`, `remediation`, `node_auth`) build without it. Check both:
+`strict_json`, `auth`, `errors`, `execution`, `out_of_band`, `outbox`,
+`grants`, `key_history`, `audit_pack`, `remediation`, `node_auth`) build
+without it. Check both:
 `cargo test --locked -p genesis-mesh-sdk --no-default-features`.
 
 `genesis-mesh-verify` never needs a private key and never contacts a network:
