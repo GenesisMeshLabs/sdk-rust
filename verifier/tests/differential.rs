@@ -14,7 +14,8 @@
 //!   `GM_VERIFY_CORPUS_STRICT=1` a skip fails the run.
 //!
 //! `GM_VERIFY_BINARY=<path>` runs another build of the binary, such as a
-//! static release binary.
+//! static release binary. With `GM_E2E_REQUIRED=1` (CI's run against the
+//! core), a missing `GM_VERIFY_CORPUS` fails instead of skipping the corpus.
 
 mod adapter;
 mod common;
@@ -137,6 +138,11 @@ fn the_binary_verifies_the_reference_export_as_the_na_did() {
 #[test]
 fn the_core_corpus_when_given() {
     let Some(path) = std::env::var_os("GM_VERIFY_CORPUS") else {
+        // Skipped is not green where the corpus is expected (CI's sdk-e2e).
+        assert!(
+            !std::env::var("GM_E2E_REQUIRED").is_ok_and(|v| v == "1"),
+            "GM_E2E_REQUIRED=1, but GM_VERIFY_CORPUS is not set: the core's corpus would not run"
+        );
         eprintln!("GM_VERIFY_CORPUS is not set: the core's verification corpus is not run");
         return;
     };
@@ -195,4 +201,24 @@ fn the_core_corpus_when_given() {
         tally.skipped.len()
     );
     assert!(tally.ran > 0, "the corpus holds no vector the binary runs");
+}
+
+/// Skipped is not green: with `GM_E2E_REQUIRED=1` and no corpus, the corpus
+/// test fails rather than reporting `ok`.
+#[test]
+fn a_required_corpus_run_without_a_corpus_fails() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "the_core_corpus_when_given"])
+        .env("GM_E2E_REQUIRED", "1")
+        .env_remove("GM_VERIFY_CORPUS")
+        .output()
+        .unwrap();
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{out}");
+    assert!(out.contains("1 failed"), "{out}");
+    assert!(out.contains("GM_E2E_REQUIRED=1, but"), "{out}");
 }
