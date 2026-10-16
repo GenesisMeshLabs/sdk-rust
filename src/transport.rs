@@ -521,6 +521,30 @@ pub(crate) fn query_pairs(params: &Value) -> Result<Vec<(String, String)>> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+
+    /// A fixed seed, so every run is the same; `GM_PROPTEST_SEED` names
+    /// another (tests/properties.rs describes it, and `random`).
+    fn config() -> ProptestConfig {
+        let seed = match std::env::var("GM_PROPTEST_SEED").as_deref() {
+            Err(_) => 20_261_016,
+            Ok("random") => {
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64);
+                eprintln!("proptest seed: GM_PROPTEST_SEED={seed}");
+                seed
+            }
+            Ok(seed) => seed
+                .parse()
+                .expect("GM_PROPTEST_SEED is a number or `random`"),
+        };
+        ProptestConfig {
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        }
+    }
 
     fn decoded(encoded: &str) -> String {
         percent_encoding::percent_decode_str(encoded)
@@ -530,10 +554,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig {
-            failure_persistence: None,
-            ..ProptestConfig::default()
-        })]
+        #![proptest_config(config())]
 
         /// A path segment is refused exactly when it is empty, `.`, `..` or
         /// holds a control character; otherwise it is encoded to letters,
@@ -564,8 +585,11 @@ mod tests {
         /// A resource path keeps its `/` separators and nothing else: as many
         /// segments as the identifier has, each decoding to its part.
         #[test]
-        fn a_resource_path_keeps_its_segments(parts in prop::collection::vec(r"[^/\p{Cc}]{1,12}", 1..6)) {
-            prop_assume!(parts.iter().all(|p| p != "." && p != ".."));
+        fn a_resource_path_keeps_its_segments(parts in prop::collection::vec(
+            // A dot segment is refused (the test above): drawn as `x.`/`x..`.
+            r"[^/\p{Cc}]{1,12}".prop_map(|p| if p == "." || p == ".." { format!("x{p}") } else { p }),
+            1..6,
+        )) {
             let id = parts.join("/");
             let path = resource_path(&id).unwrap();
             let segments: Vec<&str> = path.split('/').collect();

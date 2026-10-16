@@ -2,12 +2,44 @@
 //! (proptest): what every implementation must read alike is read back
 //! exactly, and what they read differently is refused by its reason. They
 //! complement the conformance vectors (`canonical`), which fix the cases the
-//! core chose; these draw new inputs on every run. `PROPTEST_CASES` raises
+//! core chose; these draw their inputs from a seed. `PROPTEST_CASES` raises
 //! the count (256 by default).
+//!
+//! The seed is fixed, so a run (and a required check) is the same every
+//! time. `GM_PROPTEST_SEED=random` draws a new seed, printed so a failure
+//! can be replayed with `GM_PROPTEST_SEED=<seed>`. Nothing is written to the
+//! tree: a failure prints its minimal input.
 
 use genesis_mesh_sdk::{canonical_json, check_strict_json, parse_strict_json, GenesisMeshError};
 use proptest::prelude::*;
+use proptest::test_runner::RngSeed;
 use serde_json::{Map, Number, Value};
+
+/// The seed CI and a plain run use.
+const SEED: u64 = 20_261_016;
+
+/// Proptest's configuration: the fixed seed unless `GM_PROPTEST_SEED` names
+/// another (or `random`), and no failure files.
+fn config() -> ProptestConfig {
+    let seed = match std::env::var("GM_PROPTEST_SEED").as_deref() {
+        Err(_) => SEED,
+        Ok("random") => {
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64);
+            eprintln!("proptest seed: GM_PROPTEST_SEED={seed}");
+            seed
+        }
+        Ok(seed) => seed
+            .parse()
+            .expect("GM_PROPTEST_SEED is a number or `random`"),
+    };
+    ProptestConfig {
+        rng_seed: RngSeed::Fixed(seed),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    }
+}
 
 /// The reason strict JSON gives for refusing `text`, or `""` when it reads it.
 fn refusal(text: &str) -> String {
@@ -26,8 +58,12 @@ fn value() -> impl Strategy<Value = Value> {
         any::<bool>().prop_map(Value::Bool),
         any::<i64>().prop_map(Value::from),
         any::<u64>().prop_map(Value::from),
-        any::<f64>()
-            .prop_filter("finite", |f| f.is_finite())
+        // Finite doubles of either sign, drawn directly: no rejected draws.
+        (prop::num::f64::POSITIVE
+            | prop::num::f64::NEGATIVE
+            | prop::num::f64::NORMAL
+            | prop::num::f64::SUBNORMAL
+            | prop::num::f64::ZERO)
             .prop_map(|f| Value::Number(Number::from_f64(f).unwrap())),
         any::<String>().prop_map(Value::String),
     ];
@@ -57,11 +93,7 @@ fn reversed_text(map: &Map<String, Value>) -> String {
 }
 
 proptest! {
-    // Failures print their minimal input; nothing is written to the tree.
-    #![proptest_config(ProptestConfig {
-        failure_persistence: None,
-        ..ProptestConfig::default()
-    })]
+    #![proptest_config(config())]
 
     // ── Round trip ──────────────────────────────────────────────────────
 
@@ -217,7 +249,7 @@ proptest! {
     }
 
     #[test]
-    fn a_reversed_surrogate_pair_is_refused(c in any::<char>().prop_filter("outside the BMP", |c| (*c as u32) > 0xffff)) {
+    fn a_reversed_surrogate_pair_is_refused(c in (0x1_0000_u32..=0x10_ffff).prop_map(|u| char::from_u32(u).unwrap())) {
         let mut units = [0_u16; 2];
         c.encode_utf16(&mut units);
         let text = format!("\"\\u{:04x}\\u{:04x}\"", units[1], units[0]);
