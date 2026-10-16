@@ -185,6 +185,95 @@ jobs:
       - run: cargo install cargo-audit --locked
       - run: cargo audit
 
+  # The public API against the latest release tag (cargo-semver-checks): an
+  # incompatible change fails unless its pull request carries the label
+  # "breaking" (the Maintainer adds it) and adds a changelog fragment with an
+  # "### Upgrading" note. In the merge queue and on main the pull request is
+  # looked up from the queue branch or the merge commit.
+  api-compatibility:
+    name: API compatibility
+    if: github.ref_type != 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # Pinned: cargo-semver-checks reads rustdoc's JSON, whose format changes
+      # with the toolchain; move both together.
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: "1.99.0"
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - name: Compatible with the latest release, or labelled breaking
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+        run: |
+          set -uo pipefail
+          baseline="$(git tag --list 'v*' --sort=-v:refname | head -n 1)"
+          echo "Baseline: $baseline"
+          # --release-type minor: only changes that need a new major version fail.
+          if cargo semver-checks check-release -p genesis-mesh-sdk \
+              --baseline-rev "$baseline" --release-type minor; then
+            exit 0
+          fi
+          number="${PR_NUMBER:-}"
+          if [ "$EVENT" = "merge_group" ]; then
+            if [[ "$QUEUE_REF" =~ /pr-([0-9]+)- ]]; then number="${BASH_REMATCH[1]}"; else number=""; fi
+          elif [ "$EVENT" = "push" ]; then
+            number="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[0].number // empty')"
+          fi
+          if [ -z "$number" ]; then
+            echo "::error::An incompatible API change against $baseline, and no pull request to read the label breaking from."
+            exit 1
+          fi
+          labels="$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name] | join(",")')"
+          case ",$labels," in
+            *,breaking,*) ;;
+            *)
+              echo "::error::Pull request #$number changes the public API incompatibly against $baseline (above). Keep it compatible, or ask the Maintainer for the label breaking and add a changelog fragment with an ### Upgrading note."
+              exit 1 ;;
+          esac
+          upgrading=""
+          while IFS= read -r file; do
+            case "$file" in
+              changelog.d/*.md)
+                if [ -f "$file" ] && grep -q '^### Upgrading' "$file"; then upgrading="$file"; fi ;;
+            esac
+          done < <(gh pr view "$number" --repo "$GITHUB_REPOSITORY" --json files --jq '.files[].path')
+          if [ -z "$upgrading" ]; then
+            echo "::error::Pull request #$number is labelled breaking but adds no changelog fragment with an ### Upgrading note."
+            exit 1
+          fi
+          echo "Incompatible change accepted: labelled breaking, Upgrading note in $upgrading."
+
+  # Line coverage of the SDK crate (cargo-llvm-cov) with a floor at the
+  # measured value rounded down (88.34% when set): raise it as tests grow,
+  # never lower it.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - name: SDK line coverage at or above the floor
+        run: cargo llvm-cov --locked -p genesis-mesh-sdk --all-targets --summary-only --fail-under-lines 88
+
   release-train:
     runs-on: ubuntu-latest
     steps:
