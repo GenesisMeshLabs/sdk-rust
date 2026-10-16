@@ -2,10 +2,10 @@ name: Regression test
 
 # A bug fix carries the test that fails without it. A pull request titled
 # "fix: ..." or "fix(scope): ..." that changes source files fails this check
-# unless it also changes a test (a file under a tests/ directory other than
-# tests/fixtures/, or a #[test] added to a source file) or carries the label
-# "no-test-needed", which only the Maintainer adds. Other pull requests and
-# the merge queue pass.
+# unless it also adds or changes a test (a file under a tests/ directory other
+# than tests/fixtures/, or a line in a module's #[cfg(test)] tests; deleting
+# a test never counts) or carries the label "no-test-needed", which only the
+# Maintainer adds. Other pull requests and the merge queue pass.
 
 on:
   pull_request:
@@ -59,9 +59,29 @@ jobs:
           # fragments, the lockfile, the vectors copied from the core
           # (tests/fixtures/) and the tests themselves.
           source="$(echo "$changed" | grep -Ev '(^|/)[^/]*\.md$|^\.github/|^changelog\.d/|(^|/)tests/|^(Cargo\.lock|LICENSE|VERSION|\.gitignore|\.gitattributes)$' || true)"
-          tests="$(echo "$changed" | grep -E '(^|/)tests/' | grep -Ev '^tests/fixtures/' || true)"
-          # Rust also keeps unit tests in the module they test.
-          unit="$(git diff "$BASE_SHA...$HEAD_SHA" -- '*.rs' | grep -E '^\+[[:space:]]*#\[(tokio::)?test' || true)"
+          # Tests: files added or changed (never deleted) under a tests/
+          # directory, other than the vectors in tests/fixtures/.
+          tests="$(git diff --name-only --diff-filter=ACMR "$BASE_SHA...$HEAD_SHA" | grep -E '(^|/)tests/' | grep -Ev '^tests/fixtures/' || true)"
+          # Rust also keeps unit tests in the module they test: a source file
+          # whose added or changed lines reach its inline test module (from
+          # the #[cfg(test)] that opens a `mod`) changes a test too.
+          unit=""
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            start="$(git show "$HEAD_SHA:$file" | awk '
+              /^[[:space:]]*#\[cfg\(test\)\]/ { c = NR; next }
+              c && /^[[:space:]]*(pub(\([^)]*\))? )?mod / { print c; exit }
+              c && /^[[:space:]]*#\[/ { next }
+              { c = 0 }')"
+            [ -n "$start" ] || continue
+            if git diff -U0 "$BASE_SHA...$HEAD_SHA" -- "$file" | awk -v start="$start" '
+                /^@@ / { split($3, a, ","); first = substr(a[1], 2) + 0
+                         count = (a[2] == "") ? 1 : a[2] + 0
+                         if (count > 0 && first + count - 1 >= start) found = 1 }
+                END { exit !found }'; then
+              unit="$unit$file"$'\n'
+            fi
+          done <<< "$(git diff --name-only --diff-filter=ACMR "$BASE_SHA...$HEAD_SHA" -- '*.rs' | grep -Ev '(^|/)tests/' || true)"
           if [ -z "$source" ]; then
             echo "No source file changed: no regression test required."
             exit 0
@@ -69,10 +89,10 @@ jobs:
           if [ -n "$tests" ] || [ -n "$unit" ]; then
             echo "Fix with test changes:"
             [ -z "$tests" ] || echo "$tests" | sed 's/^/  /'
-            [ -z "$unit" ] || echo "  $(echo "$unit" | wc -l) #[test] functions added in source files"
+            [ -z "$unit" ] || printf '%s' "$unit" | sed 's/^/  (inline tests) /'
             exit 0
           fi
-          echo "::error::A fix pull request changes source files but no test. Add the test that fails without the fix (under tests/, or a #[test] in the module), or, when no test can show it, ask the Maintainer for the label no-test-needed."
+          echo "::error::A fix pull request changes source files but no test. Add or change the test that fails without the fix (under tests/, or in the module's #[cfg(test)] tests), or, when no test can show it, ask the Maintainer for the label no-test-needed."
           echo "Source files changed:"
           echo "$source" | sed 's/^/  /'
           exit 1
