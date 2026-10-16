@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::{client::HttpTransport, Result};
+use crate::{transport::HttpTransport, Result};
 
 /// Trust evidence client.
 #[derive(Debug, Clone)]

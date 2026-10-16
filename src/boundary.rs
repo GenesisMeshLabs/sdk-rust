@@ -3,9 +3,9 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::{
-    client::HttpTransport,
     execution::ensure_metadata_only,
     node::{NodeClient, NodeIdentity},
+    transport::HttpTransport,
     GenesisMeshError, Result,
 };
 

@@ -14,13 +14,13 @@ use uuid::Uuid;
 
 use crate::{
     auth::load_signing_key,
-    client::HttpTransport,
     errors::{GenesisMeshError, Result},
     execution::{ensure_metadata_only, ResourceHead},
     node_auth::{
         node_timestamp, sign_executor_proof, sign_node_request, PURPOSE_BOUNDARY_EVALUATE,
         PURPOSE_RESOURCE_HEAD, PURPOSE_STATE,
     },
+    transport::HttpTransport,
 };
 
 /// An enrolled node's identity (1.7.0, beta): its certificate, its node key

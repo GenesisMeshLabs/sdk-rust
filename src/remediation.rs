@@ -35,8 +35,11 @@ use crate::{
     canonical::{out_of_band_canonical, parse_timestamp, python_timestamp},
     errors::Result,
     out_of_band::{length_problem, record_metadata_problem, refused, signed, time_problem},
+    shape::{
+        absent, bounded, one_of, optional, present, shape, signature, str_field, utc_timestamp,
+        validator,
+    },
     strict::{non_canonical_fields, unknown_fields},
-    verify::valid_remediation_record,
 };
 
 // ── The state table ──────────────────────────────────────────────────────────
@@ -837,7 +840,7 @@ pub fn check_remediation(record: &Value, key: Option<&Value>) -> Option<(&'stati
             })
     });
     if !exact
-        || !valid_remediation_record(record)
+        || !valid_remediation(Some(record))
         || !unknown_fields(model, record).is_empty()
         || !non_canonical_fields(model, record).is_empty()
     {
@@ -1447,3 +1450,57 @@ pub fn emergency_map(policies: &[Value], at: DateTime<Utc>) -> BTreeMap<String, 
     }
     map
 }
+
+// The remediation record's form (1.4.0): an absent optional field is left
+// out of the signed form; a null reads as absent.
+
+/// A remediation's outcome, steps and versions agree (the reference's model
+/// rules): `alerted` exactly when nothing changed (`none`); a forward
+/// rotation names its evidence, the version it issued and the one it
+/// disabled, two different versions; nothing else names rotation evidence or
+/// a new version; `none` disables nothing.
+fn remediation_consistent(record: &Value) -> bool {
+    let outcome = str_field(record, "outcome");
+    let steps = str_field(record, "steps");
+    let versions = if steps == Some("rotate_forward_then_disable") {
+        present(record, "rotation_evidence_id")
+            && present(record, "version_id")
+            && present(record, "disabled_version_id")
+            && record["version_id"] != record["disabled_version_id"]
+    } else {
+        !present(record, "rotation_evidence_id") && !present(record, "version_id")
+    };
+    (outcome == Some("alerted")) == (steps == Some("none"))
+        && versions
+        && !(steps == Some("none") && present(record, "disabled_version_id"))
+}
+
+validator!(pub(crate) valid_remediation, {
+    let fields = shape(
+        vec![
+            ("remediation_id", bounded(128, 1)),
+            ("executor_sovereign_id", bounded(256, 1)),
+            ("subject_kind", one_of(&["judgement", "decision"])),
+            ("subject_id", bounded(128, 1)),
+            (
+                "change_kind",
+                one_of(&["observation", "break_glass", "execution"]),
+            ),
+            ("change_id", bounded(128, 1)),
+            ("resource_id", bounded(256, 1)),
+            ("outcome", one_of(&["cancelled", "alerted"])),
+            (
+                "steps",
+                one_of(&["rotate_forward_then_disable", "disable", "delete", "none"]),
+            ),
+            ("rotation_evidence_id", absent(bounded(128, 1))),
+            ("version_id", absent(bounded(256, 1))),
+            ("disabled_version_id", absent(bounded(256, 1))),
+            ("remediated_at", utc_timestamp()),
+            ("detail", absent(bounded(1024, 1))),
+            ("signature", optional(signature())),
+        ],
+        false,
+    );
+    Box::new(move |v| fields(v) && v.is_some_and(remediation_consistent))
+});

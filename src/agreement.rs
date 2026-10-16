@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::{client::HttpTransport, Result};
+use crate::{transport::HttpTransport, Result};
 
 /// Agreement lifecycle client: offer, counter, accept, verify.
 #[derive(Debug, Clone)]

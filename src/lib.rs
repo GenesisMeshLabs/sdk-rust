@@ -47,11 +47,16 @@ mod node;
 pub mod node_auth;
 mod out_of_band;
 mod outbox;
+mod outbox_entry;
 #[cfg(feature = "client")]
 mod policy;
 pub mod remediation;
+mod rules;
+mod shape;
 pub mod strict;
 mod strict_json;
+#[cfg(feature = "client")]
+mod transport;
 pub mod verify;
 
 #[cfg(feature = "client")]
@@ -66,7 +71,7 @@ pub use auth::{
 #[cfg(feature = "client")]
 pub use boundary::BoundaryClient;
 #[cfg(feature = "client")]
-pub use client::{ClientOptions, GenesisMeshClient, HttpTransport};
+pub use client::GenesisMeshClient;
 #[cfg(feature = "client")]
 pub use consensus::ConsensusClient;
 #[cfg(feature = "client")]
@@ -129,3 +134,5 @@ pub use remediation::{
 };
 pub use serde_json::{json, Value};
 pub use strict_json::{check_strict_json, parse_strict_json};
+#[cfg(feature = "client")]
+pub use transport::{ClientOptions, HttpTransport};

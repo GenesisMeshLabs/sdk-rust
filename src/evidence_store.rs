@@ -12,7 +12,6 @@ use serde_json::{json, Value};
 
 use crate::{
     canonical::{execution_digest, out_of_band_digest},
-    client::{query_pairs, resource_path, segment, HttpTransport},
     errors::{GenesisMeshError, Result},
     execution::{ensure_metadata_only, ResourceHead},
     node::{NodeClient, NodeIdentity},
@@ -22,6 +21,7 @@ use crate::{
         RecordFlushReport, RecordKind, RecordOutbox, RecordOutboxEntry, SubmissionFailure,
         PREDECESSOR_DEAD_LETTERED,
     },
+    transport::{query_pairs, resource_path, segment, HttpTransport},
     verify::parse_export_lines,
 };
 

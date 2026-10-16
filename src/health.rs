@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::{client::HttpTransport, errors::from_http_error, Result};
+use crate::{errors::from_http_error, transport::HttpTransport, Result};
 
 /// Liveness, readiness and health of the Network Authority (v0.60).
 #[derive(Debug, Clone)]

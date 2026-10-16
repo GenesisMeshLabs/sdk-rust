@@ -185,6 +185,27 @@ jobs:
       - run: cargo install cargo-audit --locked
       - run: cargo audit
 
+  # Line coverage of the SDK crate (cargo-llvm-cov) with a floor at the
+  # measured value rounded down (88.34% when set): raise it as tests grow,
+  # never lower it.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Pinned, with the API compatibility job's toolchain: a new rustc can
+      # change which lines count, so the measure moves only when this does.
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: "1.99.0"
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - name: SDK line coverage at or above the floor
+        run: cargo llvm-cov --locked -p genesis-mesh-sdk --all-targets --summary-only --fail-under-lines 88
+
   release-train:
     runs-on: ubuntu-latest
     steps:

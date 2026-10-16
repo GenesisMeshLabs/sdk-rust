@@ -1,0 +1,53 @@
+name: API compatibility
+
+# The public API against the latest release tag (scripts/check_api_compatibility.sh):
+# a change that needs a new major version fails unless it is already in the
+# base commit, or its pull request carries the label "breaking" and adds a
+# changelog fragment with an "### Upgrading" note. Its own workflow, so that
+# adding or removing the label re-runs this check alone.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: api-compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api-compatibility:
+    name: API compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # Pinned: cargo-semver-checks reads rustdoc's JSON, whose format changes
+      # with the toolchain; move both together (and the Coverage job's).
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: "1.99.0"
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - name: Compatible with the latest release, or already incompatible at the base, or labelled breaking
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: bash scripts/check_api_compatibility.sh

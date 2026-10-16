@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::{
-    client::{segment, HttpTransport},
+    transport::{segment, HttpTransport},
     Result,
 };
 
