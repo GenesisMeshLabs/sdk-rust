@@ -14,6 +14,8 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  # The merge queue runs the required checks on the PR on top of main.
+  merge_group:
 
 permissions:
   contents: read
@@ -35,6 +37,8 @@ jobs:
     timeout-minutes: 60
     env:
       TARGET: ${{ matrix.target }}
+      # Skipped is not green: every scenario, and every part of one, must run.
+      GM_E2E_REQUIRED: "1"
       # SQLite (bundled) and ring are C, compiled for the target.
       CC_x86_64_unknown_linux_musl: musl-gcc
       CC_aarch64_unknown_linux_musl: musl-gcc
@@ -105,7 +109,8 @@ jobs:
           set -eu
           export GM_EDGE_BINARY="$BINARY"
           export GM_EDGE_WRAP="/usr/bin/time -v -o $RUNNER_TEMP/time.txt"
-          cargo test --locked -p genesis-mesh-edge --test scenario -- --nocapture --exact offline
+          bash scripts/require_tests.sh \
+            cargo test --locked -p genesis-mesh-edge --test scenario -- --nocapture --include-ignored --exact offline
           cat "$RUNNER_TEMP/time.txt"
           rss="$(sed -n 's/^[[:space:]]*Maximum resident set size (kbytes): //p' "$RUNNER_TEMP/time.txt")"
           budget="$(jq -r --arg t "$TARGET" '.[$t].max_rss_kib' edge/footprint-budgets.json)"
@@ -128,7 +133,8 @@ jobs:
           set -eu
           export GM_EDGE_BINARY="$BINARY"
           export GM_EDGE_WRAP="/usr/bin/time -v -o $RUNNER_TEMP/backlog-time.txt"
-          cargo test --locked -p genesis-mesh-edge --test scenario -- --nocapture --exact backlog
+          bash scripts/require_tests.sh \
+            cargo test --locked -p genesis-mesh-edge --test scenario -- --nocapture --include-ignored --exact backlog
           rss="$(sed -n 's/^[[:space:]]*Maximum resident set size (kbytes): //p' "$RUNNER_TEMP/backlog-time.txt")"
           budget="$(jq -r --arg t "$TARGET" '.[$t].max_rss_kib' edge/footprint-budgets.json)"
           echo "maximum RSS with a backlog of $GM_EDGE_BACKLOG records: $rss KiB (budget $budget)"
@@ -142,9 +148,13 @@ jobs:
       - name: The other scenarios, with the static binary (C1, C2, C4; a proxy's 502, a blackholed network, a throttling NA, a stale snapshot, a disconnected client, the local API under load)
         env:
           GM_E2E_PYTHON: python
+        # The nine other scenarios (#[ignore]d in plain runs); --skip matches
+        # substrings, and a_required skips the harness's own self-test.
         run: |
           export GM_EDGE_BINARY="$BINARY"
-          cargo test --locked -p genesis-mesh-edge --test scenario -- --nocapture --skip offline --skip backlog
+          bash scripts/require_tests.sh --min 9 \
+            cargo test --locked -p genesis-mesh-edge --test scenario -- --nocapture --include-ignored \
+            --skip offline --skip backlog --skip a_required
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: edge-${{ matrix.target }}
@@ -152,6 +162,24 @@ jobs:
             dist/*
             footprint-${{ matrix.target }}.json
           if-no-files-found: error
+
+  # The required check for the matrix above: one stable name, whatever the
+  # targets. It fails when any member failed, was cancelled or was skipped.
+  edge-agent:
+    name: Edge agent
+    if: always()
+    needs: [static]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every edge target passed
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"(failure|cancelled|skipped)"'; then
+            echo "::error::an edge agent build or scenario did not pass"; exit 1
+          fi
 
   release:
     if: github.ref_type == 'tag'
