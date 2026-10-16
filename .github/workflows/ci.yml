@@ -239,7 +239,8 @@ jobs:
           awk -v v="$version" '/^## /{ if (p) exit; if (index($0, "[" v "]") || index($0, "## " v " ")) p = 1; next } p' CHANGELOG.md > release-notes.md
           [ -s release-notes.md ] || echo "Coordinated Genesis Mesh $tag release." > release-notes.md
           # The Verifier workflow may create it meanwhile, to attach its binaries.
-          gh release create "$tag" --title "$tag" --notes-file release-notes.md --verify-tag \n            || gh release view "$tag" > /dev/null
+          gh release create "$tag" --title "$tag" --notes-file release-notes.md --verify-tag \
+            || gh release view "$tag" > /dev/null
 
   changelog:
     name: Changelog fragments
