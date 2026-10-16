@@ -6,6 +6,8 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  # The merge queue runs the required checks on the PR on top of main.
+  merge_group:
 
 permissions:
   contents: read
@@ -36,6 +38,25 @@ jobs:
       # 1.7.0: Unix only, Rust 1.89 or newer; its live scenarios run in edge.yml).
       - run: cargo test --locked --workspace --all-targets ${{ (runner.os == 'Windows' || matrix.rust == '1.85.0') && '--exclude genesis-mesh-edge' || '' }}
       - run: cargo test --locked --doc
+
+  # The required check for the matrix above: one stable name, whatever the
+  # toolchains and platforms. It fails when any member failed, was cancelled
+  # or was skipped.
+  rust:
+    name: Rust
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every Rust toolchain and platform passed
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"(failure|cancelled|skipped)"'; then
+            echo "::error::a Rust test job did not pass"; exit 1
+          fi
 
   # 1.7.0: the SDK without its default `client` feature is the offline
   # modules only, and genesis-mesh-verify depends on it so: neither may

@@ -14,6 +14,8 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  # The merge queue runs the required checks on the PR on top of main.
+  merge_group:
 
 permissions:
   contents: read
@@ -152,6 +154,24 @@ jobs:
             dist/*
             footprint-${{ matrix.target }}.json
           if-no-files-found: error
+
+  # The required check for the matrix above: one stable name, whatever the
+  # targets. It fails when any member failed, was cancelled or was skipped.
+  edge-agent:
+    name: Edge agent
+    if: always()
+    needs: [static]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every edge target passed
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"(failure|cancelled|skipped)"'; then
+            echo "::error::an edge agent build or scenario did not pass"; exit 1
+          fi
 
   release:
     if: github.ref_type == 'tag'
