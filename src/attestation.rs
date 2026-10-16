@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::{client::HttpTransport, Result};
+use crate::{transport::HttpTransport, Result};
 
 /// Membership attestation and recognition policy client.
 #[derive(Debug, Clone)]

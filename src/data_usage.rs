@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::{client::HttpTransport, Result};
+use crate::{transport::HttpTransport, Result};
 
 /// Data usage licensing and verification client.
 #[derive(Debug, Clone)]
