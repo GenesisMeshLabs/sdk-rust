@@ -52,6 +52,7 @@ mod outbox_entry;
 mod policy;
 pub mod remediation;
 mod rules;
+mod shape;
 pub mod strict;
 mod strict_json;
 pub mod verify;

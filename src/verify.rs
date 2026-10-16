@@ -12,10 +12,7 @@
 //!
 //! No network access; every key is supplied by the caller.
 
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    sync::OnceLock,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -28,6 +25,11 @@ use crate::key_history::{
     succession_form_refusal, succession_signed_by, NaKeyHistory, NaKeys,
     SUCCESSION_MIN_LEAD_SECONDS,
 };
+use crate::shape::{
+    absent, action, array, boolean, bounded, dictionary, filled, int_where, integer, nonnegative,
+    nullable, object, one_of, optional, positive, present, sha256, shape, signature, str_field,
+    string, timestamp, utc_timestamp, validator, verdict, Check,
+};
 use crate::strict::{
     is_known_entry_kind, non_canonical_fields, prefixed_unknown_fields, unknown_fields,
     without_unknown_fields,
@@ -38,122 +40,18 @@ use crate::{
         anchor_canonical, anchor_digest, attestation_digest, checkpoint_canonical,
         decision_canonical, entry_digest, execution_canonical, execution_digest,
         freshness_proof_canonical, justification_canonical, key_succession_digest, micros,
-        out_of_band_canonical, parse_timestamp, payload_digest, policy_canonical, policy_digest,
-        policy_set_digest,
+        out_of_band_canonical, payload_digest, policy_canonical, policy_digest, policy_set_digest,
     },
     errors::{GenesisMeshError, Result},
     execution::ResourceHead,
     remediation::{
-        review_approval_problem, review_holder_problem, rotation_problem, ReviewHolders,
-        RotationFacts,
+        review_approval_problem, review_holder_problem, rotation_problem, valid_remediation,
+        ReviewHolders, RotationFacts,
     },
 };
 
 // ── Structural checks (no coercion or mutation of signed JSON) ───────────────
 
-type Check = Box<dyn Fn(Option<&Value>) -> bool + Send + Sync>;
-
-const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
-
-fn string() -> Check {
-    Box::new(|v| matches!(v, Some(Value::String(_))))
-}
-fn boolean() -> Check {
-    Box::new(|v| matches!(v, Some(Value::Bool(_))))
-}
-fn int_where(predicate: fn(i64) -> bool) -> Check {
-    Box::new(move |v| {
-        v.and_then(Value::as_i64)
-            .is_some_and(|n| n.abs() <= MAX_SAFE_INTEGER && predicate(n))
-    })
-}
-fn integer() -> Check {
-    int_where(|_| true)
-}
-fn positive() -> Check {
-    int_where(|n| n > 0)
-}
-fn nonnegative() -> Check {
-    int_where(|n| n >= 0)
-}
-fn object() -> Check {
-    Box::new(|v| matches!(v, Some(Value::Object(_))))
-}
-fn timestamp() -> Check {
-    Box::new(|v| {
-        v.and_then(Value::as_str)
-            .is_some_and(|s| parse_timestamp(s).is_ok())
-    })
-}
-fn nullable(check: Check) -> Check {
-    Box::new(move |v| matches!(v, Some(Value::Null)) || check(v))
-}
-fn optional(check: Check) -> Check {
-    Box::new(move |v| v.is_none() || check(v))
-}
-fn array(check: Check) -> Check {
-    Box::new(
-        move |v| matches!(v, Some(Value::Array(items)) if items.iter().all(|i| check(Some(i)))),
-    )
-}
-fn one_of(values: &'static [&'static str]) -> Check {
-    Box::new(move |v| {
-        v.and_then(Value::as_str)
-            .is_some_and(|s| values.contains(&s))
-    })
-}
-fn dictionary(check: Check) -> Check {
-    Box::new(move |v| matches!(v, Some(Value::Object(map)) if map.values().all(|i| check(Some(i)))))
-}
-fn shape(fields: Vec<(&'static str, Check)>, exact: bool) -> Check {
-    Box::new(move |v| {
-        let Some(Value::Object(map)) = v else {
-            return false;
-        };
-        fields.iter().all(|(key, check)| check(map.get(*key)))
-            && (!exact || map.keys().all(|k| fields.iter().any(|(f, _)| f == k)))
-    })
-}
-fn signature() -> Check {
-    nullable(shape(vec![("key_id", string()), ("sig", string())], false))
-}
-/// Absent, `null` (read as absent) or valid. Since 1.3.1 also for a field
-/// the reference always writes, `null` when it has no value: a record without
-/// it is then refused by its signature or its form, as the reference refuses
-/// it, not as `payload_invalid`.
-fn absent(check: Check) -> Check {
-    optional(nullable(check))
-}
-/// A string of `min..=max` characters.
-fn bounded(max: usize, min: usize) -> Check {
-    Box::new(move |v| {
-        v.and_then(Value::as_str)
-            .is_some_and(|s| (min..=max).contains(&s.chars().count()))
-    })
-}
-fn sha256() -> Check {
-    bounded(64, 64)
-}
-fn action() -> Check {
-    one_of(&["create", "rotate", "revoke", "update", "delete"])
-}
-fn verdict() -> Check {
-    one_of(&["allow", "deny", "indeterminate"])
-}
-/// v1.3.0 records' timestamps are UTC, as the reference requires.
-fn utc_timestamp() -> Check {
-    Box::new(|v| {
-        v.and_then(Value::as_str).is_some_and(|s| {
-            parse_timestamp(s).is_ok()
-                && (s.ends_with('Z') || s.ends_with("+00:00") || s.ends_with("-00:00"))
-        })
-    })
-}
-/// A field the reference fills when absent: left out, the record is not in
-/// the form the reference writes (`non_canonical_form`), not malformed.
-fn filled(check: Check) -> Check {
-    optional(check)
-}
 fn gate_result() -> Check {
     shape(
         vec![
@@ -212,15 +110,6 @@ fn policy_binding() -> Check {
         ],
         false,
     )
-}
-
-macro_rules! validator {
-    ($name:ident, $build:expr) => {
-        fn $name(value: Option<&Value>) -> bool {
-            static CHECK: OnceLock<Check> = OnceLock::new();
-            CHECK.get_or_init(|| $build)(value)
-        }
-    };
 }
 
 validator!(
@@ -590,61 +479,6 @@ validator!(
 // v1.4.0: remediation and review records. An absent optional field is left
 // out of the signed form; a null reads as absent.
 
-fn present(record: &Value, key: &str) -> bool {
-    record.get(key).is_some_and(|v| !v.is_null())
-}
-
-/// A remediation's outcome, steps and versions agree (the reference's model
-/// rules): `alerted` exactly when nothing changed (`none`); a forward
-/// rotation names its evidence, the version it issued and the one it
-/// disabled, two different versions; nothing else names rotation evidence or
-/// a new version; `none` disables nothing.
-fn remediation_consistent(record: &Value) -> bool {
-    let outcome = str_field(record, "outcome");
-    let steps = str_field(record, "steps");
-    let versions = if steps == Some("rotate_forward_then_disable") {
-        present(record, "rotation_evidence_id")
-            && present(record, "version_id")
-            && present(record, "disabled_version_id")
-            && record["version_id"] != record["disabled_version_id"]
-    } else {
-        !present(record, "rotation_evidence_id") && !present(record, "version_id")
-    };
-    (outcome == Some("alerted")) == (steps == Some("none"))
-        && versions
-        && !(steps == Some("none") && present(record, "disabled_version_id"))
-}
-
-validator!(valid_remediation, {
-    let fields = shape(
-        vec![
-            ("remediation_id", bounded(128, 1)),
-            ("executor_sovereign_id", bounded(256, 1)),
-            ("subject_kind", one_of(&["judgement", "decision"])),
-            ("subject_id", bounded(128, 1)),
-            (
-                "change_kind",
-                one_of(&["observation", "break_glass", "execution"]),
-            ),
-            ("change_id", bounded(128, 1)),
-            ("resource_id", bounded(256, 1)),
-            ("outcome", one_of(&["cancelled", "alerted"])),
-            (
-                "steps",
-                one_of(&["rotate_forward_then_disable", "disable", "delete", "none"]),
-            ),
-            ("rotation_evidence_id", absent(bounded(128, 1))),
-            ("version_id", absent(bounded(256, 1))),
-            ("disabled_version_id", absent(bounded(256, 1))),
-            ("remediated_at", utc_timestamp()),
-            ("detail", absent(bounded(1024, 1))),
-            ("signature", optional(signature())),
-        ],
-        false,
-    );
-    Box::new(move |v| fields(v) && v.is_some_and(remediation_consistent))
-});
-
 /// Whether a record reads as its model (1.5.0, for the audit pack checks):
 /// well formed with no field the model does not define, as the reference's
 /// models (which forbid unknown fields) read it.
@@ -659,11 +493,6 @@ pub(crate) fn reads_as(model: &str, record: &Value) -> bool {
         _ => false,
     };
     valid && unknown_fields(model, record).is_empty()
-}
-
-/// Whether a remediation record is well formed (1.4.0), for the record checks.
-pub(crate) fn valid_remediation_record(record: &Value) -> bool {
-    valid_remediation(Some(record))
 }
 
 /// An operator's signed admin request, kept whole in a review (1.4.0).
@@ -1295,10 +1124,6 @@ pub struct DecisionVerification {
     pub decision_id: Option<String>,
     /// The decision authorizes the action.
     pub authorized: bool,
-}
-
-fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value.get(key).and_then(Value::as_str)
 }
 
 /// Verify a decision's signature, expiry and bindings offline.

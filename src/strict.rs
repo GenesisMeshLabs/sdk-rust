@@ -325,9 +325,7 @@ pub fn non_canonical_fields(model: &str, data: &Value) -> Vec<String> {
     // record: an envelope's integral numbers as integers (`5`, never `5.0`),
     // and a nested time token without `use_head_digest` when it has none.
     match model {
-        "CapabilityGrant" => found.extend(envelope_number_problems(
-            &data["parameter_envelope"],
-        )),
+        "CapabilityGrant" => found.extend(envelope_number_problems(&data["parameter_envelope"])),
         "GrantExecutionEvidence"
             if data["time_token"]
                 .get("use_head_digest")
