@@ -17,7 +17,7 @@ use genesis_mesh_sdk::{
     check_metadata_only, evaluation_failure, governed_action,
     grants::{envelope_problem, use_digest},
     json,
-    key_history::verify_key_history,
+    key_history::{verify_key_history, NaKeys},
     node_auth::executor_key_id,
     verify::{verify_attestation_signature, verify_crl, verify_join_certificate},
     without_refused_metadata, ActionError, ActionReport, BreakGlassInput, ClientOptions,
@@ -150,7 +150,9 @@ struct Shared {
     identity: Option<NodeIdentity>,
     recorder: Option<ExecutionRecorder>,
     snapshot: Value,
-    na_keys: Vec<String>,
+    /// The NA's key history: each record is checked with the keys valid at
+    /// its own time (1.7.1), never with every key the NA ever had.
+    na_keys: NaKeys,
     revoked: bool,
     /// The NA's own last answer (not a proxy's page).
     last_contact: Option<DateTime<Utc>>,
@@ -348,7 +350,7 @@ impl Agent {
                 identity: None,
                 recorder: None,
                 snapshot: json!({}),
-                na_keys: Vec::new(),
+                na_keys: NaKeys::Any(Vec::new()),
                 revoked: false,
                 last_contact: None,
                 heartbeat_ok: None,
@@ -421,7 +423,9 @@ impl Agent {
             SqliteRecordOutbox::windowed(self.db.clone(), UPLOAD_PAGE),
         )?;
         let snapshot = self.dir.read_json(SNAPSHOT)?.unwrap_or_else(|| json!({}));
-        let na_keys = self.keys_of(&snapshot["key_history"]).unwrap_or_default();
+        let na_keys = self
+            .keys_of(&snapshot["key_history"])
+            .unwrap_or_else(|| NaKeys::Any(Vec::new()));
         let revoked = self.db.meta("revoked").map_err(internal)?.is_some()
             || crl_names(&snapshot["crl"], cert_id);
         let mut shared = lock(&self.shared);
@@ -437,7 +441,7 @@ impl Agent {
     }
 
     /// The NA's keys from a key history, verified from the pinned root key.
-    fn keys_of(&self, key_history: &Value) -> Option<Vec<String>> {
+    fn keys_of(&self, key_history: &Value) -> Option<NaKeys> {
         let successions: Vec<Value> = key_history["successions"]
             .as_array()
             .cloned()
@@ -447,7 +451,7 @@ impl Agent {
             &successions,
             Some(&self.config.root_public_key),
         );
-        verified.history.map(|h| h.all_keys())
+        verified.history.map(NaKeys::History)
     }
 
     fn resource_prefix(&self) -> Option<String> {
@@ -508,7 +512,8 @@ impl Agent {
                 }
             };
             self.advance(&grant_id, &mut state, &uses);
-            match GrantHolder::restore(state, recorder.clone(), keys.clone()) {
+            let holder_keys = grant_keys(&keys, &state.grant);
+            match GrantHolder::restore(state, recorder.clone(), holder_keys) {
                 Ok(mut holder) => {
                     holder.set_resource_prefix(prefix.clone());
                     holders.insert(grant_id, holder);
@@ -962,7 +967,7 @@ impl Agent {
         };
         let crl = read(transport.public_get("/crl").await, "crl_failed")?;
         let feed = read(client.grants.revocation_feed().await, "feed_failed")?;
-        if !verify_crl(&crl, &na_keys) {
+        if !verify_crl(&crl, &keys_for(&na_keys, &crl)) {
             log::error("crl_unverified", json!({}));
             return Err(GenesisMeshError::Verification(
                 "the CRL does not verify".into(),
@@ -1020,7 +1025,7 @@ impl Agent {
         client: &GenesisMeshClient,
         node_state: &Value,
         feed: &Value,
-        na_keys: &[String],
+        na_keys: &NaKeys,
     ) {
         let Some(recorder) = lock(&self.shared).recorder.clone() else {
             return;
@@ -1072,7 +1077,8 @@ impl Agent {
                 }
             };
             state.time_token = token;
-            match GrantHolder::restore(state, recorder.clone(), na_keys.to_vec()) {
+            let holder_keys = grant_keys(na_keys, &state.grant);
+            match GrantHolder::restore(state, recorder.clone(), holder_keys) {
                 Ok(holder) => {
                     log::info(
                         "grant_held",
@@ -1540,7 +1546,7 @@ impl Agent {
             })
         });
         let verify = GovernedVerification {
-            operator_public_keys: na_keys,
+            operator_public_keys: na_keys.at(Some(Utc::now().timestamp_micros())),
             expected_attestation: attestation.clone(),
             any_bound_policies: true,
             ..GovernedVerification::default()
@@ -2131,11 +2137,34 @@ fn crl_names(crl: &Value, cert_id: &str) -> bool {
         .is_some_and(|entries| entries.iter().any(|e| e["certificate_id"] == cert_id))
 }
 
+/// The NA keys a record may be signed with: those valid at its own
+/// `issued_at` (1.7.1). A record without a readable `issued_at` gets none, so
+/// it does not verify.
+fn keys_for(na_keys: &NaKeys, record: &Value) -> Vec<String> {
+    match record["issued_at"].as_str().map(parse_timestamp) {
+        Some(Ok(at)) => na_keys.at(Some(at.timestamp_micros())),
+        _ => Vec::new(),
+    }
+}
+
+/// The NA keys a grant holder checks its grant, time tokens and revocation
+/// feeds with (1.7.1): the keys valid when the grant was issued, and those
+/// valid now. A key that has been succeeded signs nothing new for it.
+fn grant_keys(na_keys: &NaKeys, grant: &Value) -> Vec<String> {
+    let mut keys = keys_for(na_keys, grant);
+    for key in na_keys.at(Some(Utc::now().timestamp_micros())) {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
 /// The attestations in a `/node/state` answer that verify, are the node's
 /// and are active.
 fn verified_attestations(
     node_state: &Value,
-    na_keys: &[String],
+    na_keys: &NaKeys,
     identity: &NodeIdentity,
 ) -> Vec<Value> {
     let sovereign = node_state["node"]["node_sovereign_id"].as_str();
@@ -2148,7 +2177,8 @@ fn verified_attestations(
             let ours = attestation["subject_id"].as_str() == sovereign
                 && (attestation["subject_public_key"].is_null()
                     || attestation["subject_public_key"] == identity.node_public_key());
-            let verified = verify_attestation_signature(attestation, na_keys);
+            let verified =
+                verify_attestation_signature(attestation, &keys_for(na_keys, attestation));
             if !(ours && verified) {
                 log::warn(
                     "attestation_refused",
@@ -2175,11 +2205,11 @@ fn strip_edge(cert: &Value) -> Value {
 /// block.
 fn check_certificate(
     cert: &Value,
-    na_keys: &[String],
+    na_keys: &NaKeys,
     node_public_key: &str,
     executor_public_key: &str,
 ) -> Result<Value, Exit> {
-    if !verify_join_certificate(cert, na_keys) {
+    if !verify_join_certificate(cert, &keys_for(na_keys, cert)) {
         return Err(Exit::Refused(
             "the certificate does not verify under the NA's keys".into(),
         ));
@@ -2240,5 +2270,66 @@ mod tests {
         drop(open);
         // The open authorization's end is still seen while stopping.
         assert_eq!(slot.available_permits(), 1);
+    }
+
+    /// A history where `old` was succeeded by `new` one hour ago.
+    fn succeeded_history() -> (NaKeys, i64) {
+        use genesis_mesh_sdk::key_history::{NaKey, NaKeyHistory};
+        let succeeded = Utc::now().timestamp_micros() - 3_600_000_000;
+        let key = |sequence, public_key: &str, valid_from, succeeded_at| NaKey {
+            key_sequence: sequence,
+            public_key: public_key.into(),
+            key_id: Some(format!("na-{sequence}")),
+            valid_from,
+            succeeded_at,
+            valid_to: None,
+            valid_to_enforced: false,
+        };
+        let history = NaKeyHistory {
+            sovereign_id: "TEST".into(),
+            root_public_key: None,
+            keys: vec![
+                key(1, "old", None, Some(succeeded)),
+                key(2, "new", Some(succeeded), None),
+            ],
+            succession_digests: vec![],
+        };
+        (NaKeys::History(history), succeeded)
+    }
+
+    fn dated(at: i64) -> Value {
+        json!({"issued_at": python_timestamp(DateTime::from_timestamp_micros(at).unwrap())})
+    }
+
+    #[test]
+    fn a_record_is_checked_with_the_keys_valid_at_its_own_time() {
+        // 1.7.1: the agent used every key of the history at every time, so a
+        // succeeded key could sign a CRL, certificate or attestation dated
+        // after its hand-over.
+        let (keys, succeeded) = succeeded_history();
+        assert_eq!(
+            keys_for(&keys, &dated(succeeded - 60_000_000)),
+            vec!["old".to_owned()]
+        );
+        assert_eq!(
+            keys_for(&keys, &dated(succeeded + 600_000_000)),
+            vec!["new".to_owned()]
+        );
+        assert!(keys_for(&keys, &json!({"issued_at": "not a time"})).is_empty());
+        assert!(keys_for(&keys, &json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_grant_holder_gets_the_keys_of_its_grant_and_of_now_only() {
+        let (keys, succeeded) = succeeded_history();
+        // A grant issued under the old key keeps it; time tokens come from the new one.
+        let mut held = grant_keys(&keys, &dated(succeeded - 60_000_000));
+        held.sort();
+        assert_eq!(held, vec!["new".to_owned(), "old".to_owned()]);
+        // A grant dated after the hand-over is never checked with the old key.
+        assert_eq!(
+            grant_keys(&keys, &dated(succeeded + 600_000_000)),
+            vec!["new".to_owned()]
+        );
     }
 }
