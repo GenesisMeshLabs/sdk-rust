@@ -894,9 +894,10 @@ impl Agent {
     }
 
     /// Sync with the NA: the key history, the CRL, the revocation feed and
-    /// the node's state; new grants get a holder; then the uploads (they run
-    /// even when a read failed: records are signed with the executor key,
-    /// not the node key) and a fresh time token for every usable holder.
+    /// the node's state; then the uploads (they run even when a read failed:
+    /// records are signed with the executor key, not the node key); then,
+    /// when the reads succeeded, a fresh time token for every usable holder
+    /// and a holder for each new grant.
     /// `reconnected` uploads past the NA's backoff once.
     pub async fn sync(&self, reconnected: bool) -> Result<(), GenesisMeshError> {
         let state = self.state();

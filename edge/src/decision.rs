@@ -10,9 +10,10 @@ use genesis_mesh_sdk::{evaluation_failure, EvaluationFailure, GenesisMeshError, 
 pub enum Answer {
     /// The NA answered and refused: final. No grant, no break-glass.
     Refused,
-    /// The NA answered `429` or `5xx` with its own error body: it is there
-    /// but throttling or failing. Grants (bounded by the operator) may be
-    /// used; break-glass may not.
+    /// The NA answered `429` or `5xx`, with or without its own error body,
+    /// and the answer is not a gateway's own page: it is there but
+    /// throttling or failing. Grants (bounded by the operator) may be used;
+    /// break-glass may not.
     Throttled {
         /// The HTTP status.
         status: u16,

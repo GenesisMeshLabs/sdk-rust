@@ -96,9 +96,15 @@ can also be verified locally (see [Governed actions](#governed-actions)).
 | `disclosure` | `commit`, `nullifier` | `prove`, `verify` |
 | `evidence` | `build` | `verify` |
 | `policy` | `validate`, `publish`, `list`, `active`, `history`, `activate`, `deactivate` | `verify` |
-| `evidence_store` | `search`, `search_all`, `status`, `verify`, `resource_history`, `vendor_history`, `resource_head`, `export_text`, `export`, `export_all`, `list_executor_keys`, `register_executor_key`, `retire_executor_key`, `apply_retention`, `latest_checkpoint`, `judge_observation`, `judge_break_glass`, `resource_changes`, `operator_holders`, `propose_holder`, `approve_holder`, `remediations`, `remediations_all`, `remediation`, `mark_notified`, `request_review`, `review`, `decide_review` | `submit` (executor-signed), `submit_observation`, `submit_observations` (observer-signed), `submit_break_glass`, `submit_remediation` (executor-signed) |
-| `grants` (1.6.0, beta) | `issue`, `list`, `get`, `revoke` | `request_time_token`, `submit_use` (bearer-signed), `revocation_feed` |
+| `evidence_store` | `search`, `search_all`, `status`, `verify`, `resource_history`, `vendor_history`, `resource_head`, `resource_head_entry`, `export_text`, `export`, `export_all`, `list_executor_keys`, `register_executor_key`, `retire_executor_key`, `apply_retention`, `latest_checkpoint`, `judge_observation`, `judge_break_glass`, `resource_changes`, `resource_changes_page`, `operator_holders`, `propose_holder`, `approve_holder`, `remediations`, `remediations_all`, `remediation`, `mark_notified`, `request_review`, `review`, `decide_review` | `submit` (executor-signed), `submit_observation`, `submit_observations` (observer-signed), `submit_break_glass`, `submit_remediation` (executor-signed) |
+| `grants` (1.6.0, beta) | `issue`, `list`, `get`, `uses`, `revoke` | `request_time_token`, `submit_use` (bearer-signed), `revocation_feed` |
 | `health` | | `liveness`, `readiness`, `health` |
+| `node` (1.7.0, beta) | | `join`, `heartbeat`, `renew`, `state`, `resource_head`, `resource_head_entry`, `evaluate` (node-signed) |
+
+The outbox methods of `evidence_store` submit what they keep: `enqueue`,
+`flush_pending` and `pending_head` for the evidence outbox
+([Evidence outbox](#evidence-outbox)), `enqueue_record` and `flush_records`
+for the record outbox ([Record outbox](#record-outbox)).
 
 `evidence.build(decision)` wraps its argument as `{"decision": decision}`.
 `attestation.revoke(id, None)` sends an empty JSON object; pass `Some(json!(...))`
@@ -382,6 +388,16 @@ resource's changes, with its justification; a policy can forbid it for a
 capability (a `denylist.v1` gate on `parent_kind` with the value
 `break_glass`).
 
+In the library, a `429` or `5xx` from the NA counts as no answer, apart from
+the three codes above, even when it carries the NA's own error body. The
+edge agent is stricter: it breaks the glass only when the NA itself gives no
+answer (no connection, a timeout, or a proxy's own error page), never on a
+`429` or another `5xx`
+([docs/edge.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/docs/edge.md),
+*Decision order*). Both rules are deliberate. A controller whose local
+clients could flood the NA, and that must not turn a throttled NA into
+break-glass, should apply the agent's rule before it calls this function.
+
 ### Judgements and the state of a resource
 
 The NA judges each record at admission unless that is turned off; the
@@ -427,8 +443,7 @@ credential is never rolled back. The NA must run with
 `EVIDENCE_REMEDIATION=on` (with `EVIDENCE_OUT_OF_BAND=on`); until then these
 routes answer `404 remediation_disabled`. The operator's side is described in
 *Remediation and Reviews* and *Emergency Changes and Break-Glass* in the NA
-runbooks. The routes are beta until 1.5.0; the records' signed forms are
-stable.
+runbooks. The routes and the records' signed forms are stable from 1.5.0.
 
 ### The due queue and notices
 
@@ -552,7 +567,8 @@ blocked, and each is judged and reviewed (`UrgentActionResult::path`):
   justification in its justification parameter. The NA decides it under the
   emergency policy before the change, and opens a review of the decision.
 - **`BreakGlass`**: the NA does not answer for it either (a network error, a
-  timeout, `5xx` or `429`): the change runs under break-glass naming the
+  timeout, `5xx` or `429`, as `evaluation_failure` counts them; see
+  [Break-glass](#break-glass)): the change runs under break-glass naming the
   emergency capability, and the NA judges it under the emergency policy when
   the record arrives.
 
@@ -598,8 +614,6 @@ rules are in `remediation` (`remediation_plan`, `decision_plan`,
 `remediation`.
 
 ## Pre-issued grants
-
-*Unreleased.*
 
 A grant (1.6.0) is an authorisation the NA signs in advance, so a device can
 make a known, bounded kind of change while it cannot reach the NA. Where
@@ -695,8 +709,9 @@ When the grant has ended, its budget or its time token is spent (and no new
 one came), it is revoked or its bearer key is retired, `act` falls back with
 the request's `GrantFallback` to `governed_action_with_break_glass` with the
 grant's capability: the NA's decision when it answers (a DENY does not run
-the action), break-glass when it does not, so an urgent change is recorded
-and judged, never blocked. Pending uses are uploaded first. Without a
+the action), break-glass when it does not (a network error, a timeout,
+`5xx` or `429`, as in [Break-glass](#break-glass)), so an urgent change is
+recorded and judged, never blocked. Pending uses are uploaded first. Without a
 fallback the request is refused (`GrantRefused` with the reason). A grant on
 an agreement needs `GrantFallback::evaluate`.
 
@@ -721,8 +736,6 @@ every verifier that reads your exports, packs and feed runs 1.6: a 1.5
 verifier refuses the new kinds and the feed's field.
 
 ## Edge nodes
-
-*Unreleased.*
 
 From Genesis Mesh 1.7.0 (beta) a device enrolled with an edge invite acts
 with its own node key instead of an operator key. `node_auth` signs node
@@ -754,17 +767,22 @@ let client = GenesisMeshClient::new(ClientOptions::new("https://na.example.org")
 for a device: enrolment, renewal, heartbeats, the trust snapshot, grants
 offline, break-glass and ordered uploads, behind a local API. It is released
 with the crate as static Linux binaries and a container image; see
-[docs/edge.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/docs/edge.md).
+[docs/edge.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/docs/edge.md),
+and [docs/examples/edge-agent.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/docs/examples/edge-agent.md)
+for a run from enrolment through an outage and back.
 
-## Independent verification
+## Offline verification
 
 From Genesis Mesh 1.5.0 an auditor verifies records, evidence exports and
 audit packs on its own machines, years later, with `genesis-mesh-verify`: a
 static Linux binary built from this crate's `verify`, `key_history` and
 `audit_pack` modules, released with checksums and Sigstore bundles, and
 reproducible from source. It never needs a private key and never contacts a
-network. "Independent" means separate code by the same project: a difference
-from the Python reference is a bug in one of them.
+network. These modules are a port of the Python reference to Rust by the
+same project, not a clean-room reimplementation, checked against the
+reference's vectors and corpus: a difference from the reference is a bug in
+one of them, while a rule both read the same wrong way goes unnoticed, so the
+core's specification pages stay normative.
 
 ```sh
 genesis-mesh-verify pack pack-2026 --anchor root.pub --known-anchors /audit/anchors
@@ -777,7 +795,9 @@ genesis-mesh-verify key-history key-history.json --root-key root.pub
 Exit codes: 0 verified, 1 not verified, 2 usage error, 3 an input could not
 be read. [docs/verifier.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/docs/verifier.md)
 says what is checked, how to rebuild a release and compare digests, and how to
-read a mismatch.
+read a mismatch;
+[docs/examples/verify-audit-pack.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/docs/examples/verify-audit-pack.md)
+verifies a pack, then the same pack with one byte changed.
 
 ### In the library
 
@@ -868,21 +888,14 @@ signed. `ClientOptions` debug output redacts the seed.
 
 ## Development and release
 
-```sh
-python scripts/check_release.py
-cargo fmt --all -- --check
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets
-cargo test --locked --doc
-cargo doc --locked --workspace --no-deps
-cargo package --locked
-```
+[CONTRIBUTING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/CONTRIBUTING.md)
+lists the checks to run before a pull request: formatting, clippy, the tests
+(with and without the `client` feature, and against a live NA), the API docs
+and the changelog fragments.
 
 The workspace holds the crate, `genesis-mesh-verify` (`verifier/`) and
 `genesis-mesh-edge` (`edge/`), neither published to crates.io; the edge
-agent's tests and builds are Unix only. `cargo test --locked -p
-genesis-mesh-sdk --no-default-features` checks the crate without its HTTP
-client. CI tests stable Rust on Linux, Windows, and macOS plus
+agent's tests and builds are Unix only. CI tests stable Rust on Linux, Windows, and macOS plus
 Rust 1.85 on Linux, checks release metadata and packaging, and audits
 dependencies with `cargo audit`. The `Verifier` workflow builds the static
 binaries twice and compares them, checks they need no shared library, and runs
@@ -892,7 +905,7 @@ agent's memory over a scenario with the NA stopped against the core, and on a
 tag signs and attaches them and publishes the image.
 How the crate is layered, and where a change goes:
 [docs/architecture.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/docs/architecture.md).
-See [CONTRIBUTING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/CONTRIBUTING.md), [RELEASING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/RELEASING.md), and
+See [RELEASING.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/RELEASING.md) and
 [SECURITY.md](https://github.com/GenesisMeshLabs/sdk-rust/blob/main/SECURITY.md).
 
 ## License

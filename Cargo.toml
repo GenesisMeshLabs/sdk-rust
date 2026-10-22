@@ -12,7 +12,7 @@ categories = ["api-bindings", "authentication"]
 include = ["src/**", "examples/**", "tests/**", "scripts/check_release.py", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "CHANGELOG.md", "CONTRIBUTING.md", "RELEASING.md", "AGENT.md", "SECURITY.md", "VERSION"]
 resolver = "3"
 
-# The independent verifier, genesis-mesh-verify (1.5.0): a binary built on this
+# The offline verifier, genesis-mesh-verify (1.5.0): a binary built on this
 # crate's offline modules, never published to crates.io (docs/verifier.md).
 # The edge agent, genesis-mesh-edge (1.7.0, beta): a device's agent over the
 # SDK, never published to crates.io (docs/edge.md).
@@ -21,7 +21,8 @@ members = ["verifier", "edge"]
 
 # `client` (default, 1.7.0): the HTTP client and everything that calls the NA.
 # Without it the crate is its offline modules only: verification, canonical
-# forms, signing, the outboxes and the grant rules, with no HTTP stack.
+# forms, signing, the outboxes, the grant rules, audit packs and node request
+# signatures, with no HTTP stack.
 [features]
 default = ["client"]
 client = ["dep:reqwest", "dep:percent-encoding"]
@@ -80,4 +81,8 @@ required-features = ["client"]
 
 [[example]]
 name = "issue_attestation"
+required-features = ["client"]
+
+[[example]]
+name = "edge_site"
 required-features = ["client"]

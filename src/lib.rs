@@ -3,7 +3,7 @@
 // documented by this line and its modules.
 #![cfg_attr(
     not(feature = "client"),
-    doc = "The Genesis Mesh Rust SDK without its HTTP client (the `client` feature): offline verification, canonical forms, signing, the outboxes and the grant rules."
+    doc = "The Genesis Mesh Rust SDK without its HTTP client (the `client` feature): offline verification, canonical forms, signing, the outboxes, the grant rules, audit packs and node request signatures."
 )]
 #![forbid(unsafe_code)]
 // Without `client` (1.7.0), helpers only the HTTP clients call are unused.
