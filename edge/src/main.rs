@@ -403,10 +403,22 @@ fn command_check(args: &Args) -> Result<(), Exit> {
     Ok(())
 }
 
+/// `--help`, `-h` or `help` anywhere prints the usage and exits 0 (1.7.1: it
+/// was an unknown option, exit 2).
+fn wants_help(arguments: &[String]) -> bool {
+    arguments
+        .iter()
+        .any(|a| matches!(a.as_str(), "--help" | "-h" | "help"))
+}
+
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.iter().any(|a| a == "--version") {
         println!("genesis-mesh-edge {VERSION}");
+        return ExitCode::SUCCESS;
+    }
+    if wants_help(&arguments) {
+        println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
     let result = parse(arguments).and_then(|args| {
@@ -436,5 +448,22 @@ fn main() -> ExitCode {
             }
             ExitCode::from(exit.code())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_is_asked_for_by_any_of_its_spellings() {
+        for spelling in ["--help", "-h", "help"] {
+            assert!(wants_help(&[spelling.to_owned()]), "{spelling}");
+            assert!(
+                wants_help(&["status".to_owned(), spelling.to_owned()]),
+                "{spelling}"
+            );
+        }
+        assert!(!wants_help(&["status".to_owned(), "--json".to_owned()]));
     }
 }
