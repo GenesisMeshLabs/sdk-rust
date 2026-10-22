@@ -1,7 +1,5 @@
 # genesis-mesh-edge: the edge agent
 
-*Unreleased.*
-
 `genesis-mesh-edge` (Genesis Mesh 1.7.0, **beta**) runs on a device that must
 make governed changes whether or not it can reach its Network Authority (NA).
 It holds the device's node key and executor key, asks the NA for a decision
@@ -15,6 +13,10 @@ target; it builds on macOS; Windows is not supported.
 
 The agent's configuration keys, its local API, its exit codes and its state
 files are beta: they may change in a minor release, with a changelog entry.
+
+[examples/edge-agent.md](examples/edge-agent.md) walks through a real run:
+enrolment with a bound invite, a decision, the NA stopped (a grant, then
+break-glass), and the uploads once it is back.
 
 ## What the device holds, and what it never holds
 
@@ -39,14 +41,17 @@ request from the agent carries an `X-Admin-*` header.
 An operator creates an **edge invite** with the privileged tier:
 
 ```sh
-genesis-mesh admin invite --node-sovereign-id site7-17 --executor-resource-prefix edge:site7-17/
+genesis-mesh admin invite --role client \
+  --node-sovereign-id site7-17 --executor-resource-prefix edge:site7-17/ \
+  --recipient-key <node public key printed by genesis-mesh-edge init>
 ```
 
 The invite token is a bearer secret for a privileged act. To bind the
 invite to the device, run `genesis-mesh-edge init` on the device first: it
 creates the state directory and both keys and prints the node public key
-(`--json` adds the executor key) for the invite's `recipient_public_key`.
-`enroll` then uses those keys.
+(`--json` adds the executor key) for the invite's `recipient_public_key`
+(`--recipient-key`). `enroll` then uses those keys, and the NA refuses the
+invite from any other node key.
 
 The agent enrols with the invite's token (`genesis-mesh-edge enroll`, or on
 its first `run`):
@@ -79,10 +84,18 @@ again: the file may be removed.
 while records are not uploaded unless `--discard-pending` is given
 (`outbox export` saves them first), and while the agent runs: `run` holds a
 lock in the state directory (`agent.lock`), and `enroll`, `init` and `reset`
-take it too. To start again with a recipient-bound invite: stop the agent,
-`reset`, `init` (prints the new node key), have the operator create the
-invite for that key, then `enroll`. `enroll --reset` remains a shortcut that
-checks for a token before it deletes anything.
+take it too. To start again with a recipient-bound invite:
+
+1. Stop the agent.
+2. `genesis-mesh-edge reset`.
+3. `genesis-mesh-edge init`: it prints the new node key.
+4. The operator creates the invite bound to that key (`--recipient-key`).
+5. `genesis-mesh-edge enroll`.
+
+`enroll --reset` deletes the state and enrols at once, with new keys: it
+checks that a token is available before it deletes anything, but no invite
+can be bound to keys that do not exist yet. Use it only with an invite that
+is not bound to a node key.
 
 The agent refuses to start (exit 2) when `enrollment.json` names another NA
 than the configured `authority.url` (reset to enrol with another NA), and
@@ -94,7 +107,8 @@ The configuration file is `--config`, or `GM_EDGE_CONFIG`, or
 `/etc/genesis-mesh-edge/edge.toml` when it exists; it is optional when the
 environment gives the required keys. The environment wins over the file,
 the file over the defaults. `edge/packaging/edge.toml.example` (released as
-`edge.toml.example`) shows every key. `genesis-mesh-edge check-config`
+`edge.toml.example`) shows every key; the tables below give each key's
+environment variable and bounds. `genesis-mesh-edge check-config`
 prints the effective configuration without secrets.
 
 ### `[authority]`
@@ -132,7 +146,7 @@ supported in 1.7.0.
 | `[[local_api.tokens]]` `name`, `sha256` | `GM_EDGE_TOKENS="name:hex,..."` | none |
 | `local_api.report_timeout_seconds` | `GM_EDGE_REPORT_TIMEOUT_SECONDS` | 300 (at most 86400) |
 | `local_api.queue_timeout_seconds` | `GM_EDGE_QUEUE_TIMEOUT_SECONDS` | 30 (at most 3600) |
-| `local_api.rate_limit_per_minute` | `GM_EDGE_RATE_LIMIT_PER_MINUTE` | 30 authorizations per minute per local client |
+| `local_api.rate_limit_per_minute` | `GM_EDGE_RATE_LIMIT_PER_MINUTE` | 30 authorizations per minute per local client (1 to 100000) |
 | `log.level` | `GM_EDGE_LOG_LEVEL` | `info` |
 
 The agent refuses to start (exit 2) when the listener is a Unix socket and
@@ -181,10 +195,13 @@ connection (`connected`, `last_na_contact_at`; `na_state`: `answering`,
  "attributes": {}, "attestation_id": null, "justification": null}
 ```
 
-The resource and its action are required; the resource must start with the
-node's resource prefix (`400 resource_out_of_scope`). Parameters and
-attributes carry identifiers and versions only (`400 secret_material`). The
-answer:
+The capability, the resource and its action are required; the action is
+`create`, `rotate`, `revoke`, `update` or `delete`, and the resource must
+start with the node's resource prefix (`400 resource_out_of_scope`). Text
+fields (`capability`, `resource_id`, `attestation_id`, `justification`) are
+1 to 1024 characters. Unknown fields are refused (`400 invalid_request`).
+Parameters and attributes are JSON objects that carry identifiers and
+versions only (`400 secret_material`). The answer:
 
 ```json
 {"authorization_id": "…", "allowed": true, "authority": "decision", "code": null,
@@ -210,7 +227,9 @@ false, `code` says why:
 {"outcome": "success", "execution_parameters": {"version_id": "v8"}, "outcome_detail": "rotated"}
 ```
 
-The answer names the record: `{authorization_id, record_kind` (`execution`,
+`outcome` is `success`, `failure` or `partial`; `execution_parameters` is
+a JSON object; `outcome_detail` is 1 to 1024 characters. The answer names
+the record: `{authorization_id, record_kind` (`execution`,
 `grant_execution` or `break_glass`)`, record_id, queued, dropped}`.
 Metadata the secret guard refuses is left out and named in `dropped`. Only the
 client that asked (the same uid, or the same token) may report the outcome;
@@ -226,8 +245,9 @@ it later is `410 authorization_expired`. Other errors: `400 invalid_request`,
 `403 node_revoked`, `404 authorization_not_found`,
 `409 outcome_already_reported`, `413 request_too_large`,
 `429 local_rate_limited` (more than `rate_limit_per_minute` authorizations
-from one client, by uid or token name, counted before the NA is asked),
-`503 not_enrolled`.
+from one client, by uid or token name, counted in a fixed one-minute window
+that starts with the client's first request, before the NA is asked),
+`404 not_found` (an unknown route), `503 not_enrolled`.
 
 ## Decision order
 
@@ -243,12 +263,19 @@ What an NA error means falls in three classes:
 | Class | What the agent got | Grants | Break-glass |
 |---|---|---|---|
 | **Refused** | A DENY, or an error with the NA's JSON error body and a 4xx status other than 429 | No: final | No |
-| **Throttled or failing** | The NA's JSON error body with `429` or `5xx` | Yes (bounded by the operator) | No: `na_refused` |
+| **Throttled or failing** | A `429` or `5xx` that is not a gateway's own page (see the next row), with or without the NA's JSON error body | Yes (bounded by the operator) | No: `na_refused` |
 | **Unreachable** | No connection, no response within `timeout_seconds`, or a gateway's own page (`502`, `503`, `504`, `520` to `527` without the NA's JSON error body) | Yes | Yes, with a justification |
 
 So a local client that floods the NA, or a host sharing the device's address
 at a NAT, can never turn a DENY into break-glass, while an NA stopped behind
-nginx or a load balancer (whose own 502 page answers) is treated as down.
+nginx or a load balancer (whose own 502 page answers) is treated as down. A
+`500` page without the NA's body counts as the NA failing, not as a gateway.
+
+The SDK's own break-glass (`governed_action_with_break_glass`, the grant
+holder's fallback and `urgent_action`) is wider by design: it counts any
+`429` or `5xx` as no answer, apart from `429 admin_auth_throttled`,
+`503 evidence_store_unavailable` and an unreadable body (the README's
+*Break-glass*). The agent applies the stricter rule above.
 
 1. **Connected** (an answer of the NA itself within two heartbeat intervals,
    state `active`): the NA decides through the node route. ALLOW runs the
@@ -296,12 +323,14 @@ before the operator revokes.
 
 A sync reads the key history, the CRL (`GET /crl`) and the revocation feed,
 then `POST /node/state`: the attestations and grants issued to the node, each
-verified. Each new grant gets a holder and a time token; a grant the agent
-already used (its holder lost) is rebuilt from those uses, never from use 0.
-Then the record outbox is uploaded (break-glass records, then grant uses in
-chain order), then execution evidence, 200 records at a time, and every
-usable grant gets a fresh time token. The uploads run even when a read
-failed: records are signed with the executor key, not the node key. Records
+verified. Then the record outbox is uploaded (break-glass records, then
+grant uses in chain order), then execution evidence, 200 records at a time.
+After the uploads every usable grant already held gets a fresh time token,
+and each new grant gets a holder and its first time token; a grant the
+agent already used (its holder lost) is rebuilt from those uses, never from
+use 0. The uploads run even when a read failed: records are signed with the
+executor key, not the node key; the time tokens and new holders wait for a
+sync whose reads succeeded. Records
 the NA throttled (`429`, its `Retry-After`) wait for it, except once on
 reconnecting; a decision uploads a few pages first, so its evidence follows
 the records before it. The agent moves to `revoked` when the CRL lists its
@@ -359,7 +388,7 @@ letters are evidence of actions that ran.
 ### Commands
 
 `init [--json]`, `enroll [--invite-token-file F] [--reset [--discard-pending]]`,
-`run`, `reset [--discard-pending]`, `status [--json]`,
+`run [--invite-token-file F]`, `reset [--discard-pending]`, `status [--json]`,
 `outbox export [--dead-letters]`, `token new --name N`, `check-config`,
 `--version`.
 
@@ -377,7 +406,7 @@ uid of a refused peer.
 | 2 | Usage or configuration error (also: another process holds the state, another NA, a newer database) |
 | 3 | Not enrolled (`run` without a token) |
 | 4 | Enrolment refused for good |
-| 5 | The NA could not be reached during `enroll` |
+| 5 | The NA could not be reached during `enroll`, or answered `429` or `5xx` (try again later) |
 | 6 | Insecure permissions on the keys |
 
 ## Install
@@ -404,6 +433,12 @@ cosign verify-blob --bundle SHA256SUMS-edge.sigstore.json \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS-edge
 sha256sum --check --ignore-missing SHA256SUMS-edge
 ```
+
+The binaries are built by `scripts/build_edge.sh` with the verifier's pinned
+toolchain, `SOURCE_DATE_EPOCH` and path remapping; the script writes a
+`.buildinfo` file beside the binary, which the release does not attach.
+Unlike the verifier's, CI builds each edge binary once: it does not check
+that two builds are identical.
 
 ### systemd
 

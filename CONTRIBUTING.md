@@ -28,6 +28,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
 cargo test --locked --doc
+cargo doc --locked --workspace --no-deps
 cargo check --locked -p genesis-mesh-sdk --no-default-features --all-targets
 cargo test --locked -p genesis-mesh-sdk --no-default-features
 cargo package --locked
@@ -35,10 +36,11 @@ python scripts/check_release.py
 python scripts/changelog.py check --base origin/main --branch "$(git branch --show-current)"
 ```
 
-On Windows, add `--exclude genesis-mesh-edge` to the workspace clippy and
-test commands, before any `--` (the edge agent is Unix only):
-`cargo clippy --locked --workspace --exclude genesis-mesh-edge --all-targets -- -D warnings`
-and `cargo test --locked --workspace --exclude genesis-mesh-edge --all-targets`.
+On Windows, add `--exclude genesis-mesh-edge` to the workspace clippy, test
+and doc commands, before any `--` (the edge agent is Unix only):
+`cargo clippy --locked --workspace --exclude genesis-mesh-edge --all-targets -- -D warnings`,
+`cargo test --locked --workspace --exclude genesis-mesh-edge --all-targets`
+and `cargo doc --locked --workspace --exclude genesis-mesh-edge --no-deps`.
 
 The tests against a live Network Authority (`tests/live_na.rs`) and the edge
 agent's scenarios (`edge/tests/scenario.rs`) are `#[ignore]`d in a plain

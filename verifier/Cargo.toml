@@ -5,7 +5,7 @@ version = "1.7.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
-description = "Independent offline verifier for Genesis Mesh records and evidence exports."
+description = "Offline verifier for Genesis Mesh records, evidence exports and audit packs."
 repository = "https://github.com/GenesisMeshLabs/sdk-rust"
 publish = false
 

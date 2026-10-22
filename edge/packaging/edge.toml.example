@@ -32,6 +32,8 @@ max_snapshot_age_seconds = 86400
 [local_api]
 # A Unix socket, open to the users and groups listed (root is not implied),
 listen = "unix:/run/genesis-mesh-edge/agent.sock"
+# At least one uid or gid is required: the agent refuses to start with both
+# empty (exit 2).
 allowed_uids = []
 allowed_gids = []
 socket_mode = "0660"
@@ -43,6 +45,9 @@ socket_mode = "0660"
 # sha256 = "..."
 report_timeout_seconds = 300
 queue_timeout_seconds = 30
+# Authorizations per minute per local client (a uid or a token's name),
+# 1 to 100000; more are refused with 429 before the NA is asked.
+rate_limit_per_minute = 30
 
 [log]
 level = "info"

@@ -1,4 +1,4 @@
-# genesis-mesh-verify: independent verification
+# genesis-mesh-verify: offline verification
 
 `genesis-mesh-verify` verifies Genesis Mesh records and evidence exports
 offline, on the auditor's own machines, from keys and anchors the auditor
@@ -7,12 +7,19 @@ verifies with, and ships from Genesis Mesh 1.5.0 as static Linux binaries
 (x86-64 and arm64) with checksums, Sigstore bundles and a documented
 reproducible build.
 
-"Independent" means separate code by the same project: the Python reference
-(`genesis-mesh evidence verify-export`, `genesis-mesh audit verify`) and this
-verifier are two implementations of one specification. Each verdict and
-reason code is the reference's; a difference between them is a bug in one of
-them, resolved against the specification (see
-[Reading a mismatch](#reading-a-mismatch)).
+The verifier is separate code by the same project: a port of the Python
+reference (`genesis-mesh evidence verify-export`, `genesis-mesh audit
+verify`) to Rust, not a clean-room reimplementation, checked against the
+reference's vectors and corpus ([The differential harness](#the-differential-harness)).
+Each verdict and reason code is the reference's; a difference between them
+is a bug in one of them, resolved against the specification (see
+[Reading a mismatch](#reading-a-mismatch)). A rule that both read the same
+wrong way does not show as a difference, so the core's specification pages
+stay normative.
+
+[examples/verify-audit-pack.md](examples/verify-audit-pack.md) verifies the
+frozen 1.5.0 audit pack, then the same pack with one byte changed, and
+compares the verdict with the reference's.
 
 ## What it never does
 
@@ -21,11 +28,15 @@ key, record, export and anchor is given on the command line, as a file or a
 value. This is enforced, not only intended:
 
 - `verifier/clippy.toml` refuses, in the binary's code, the SDK's HTTP
-  clients, network sockets (`std::net`), the recorders that sign and every
-  function that reads a private key or signs; CI runs clippy with
-  `-D warnings`.
+  clients, network sockets (`std::net`), the recorders that sign
+  (`ExecutionRecorder`, `ObservationRecorder`) and the functions that read a
+  private key or sign (`load_signing_key`, `sign_canonical`,
+  `public_key_from_seed`, `build_admin_headers`, `build_admin_headers_at`);
+  CI runs clippy with `-D warnings`.
 - A test refuses any mention of an HTTP or network crate, a socket, a signing
-  key, or an `allow` of those clippy rules in the binary's sources.
+  key (the word `SigningKey`, which the other offline signers take, such as
+  `node_auth::sign_node_request` and `node_auth::sign_executor_proof`), or an
+  `allow` of those clippy rules in the binary's sources.
 - The verifier depends on the SDK without its `client` feature (1.7.0), so
   no HTTP, async or TLS crate is even compiled into it (CI checks its
   dependency tree), and the released binary is checked to link none.
@@ -50,7 +61,7 @@ architecture and need no shared library. Check the signature and the digest
 before you use one:
 
 ```sh
-version=1.5.0
+version=1.7.0   # the release you verify
 binary=genesis-mesh-verify-$version-x86_64-unknown-linux-musl
 cosign verify-blob --bundle "$binary.sigstore.json" \
   --certificate-identity "https://github.com/GenesisMeshLabs/sdk-rust/.github/workflows/verifier.yml@refs/tags/v$version" \
@@ -185,7 +196,7 @@ hand-over).
 | 1 | Not verified: each failure names its reason code |
 | 2 | Usage error: an unknown option, kind or command, or a key that is not one |
 | 3 | An input could not be read: missing, not UTF-8, not strict JSON, or not the document it should be |
-| 4 | Not available in this version (no command uses it in 1.5.0) |
+| 4 | Not available in this version (reserved: no command uses it yet) |
 
 `pack` also exits 1 when `--require-anchors` is given without anchors, or a
 `--prior` pack does not verify.
@@ -403,16 +414,17 @@ in two directories, and fails unless they are identical.
 To rebuild a release on Ubuntu 24.04 (x86-64 or arm64), as CI does:
 
 ```sh
+version=1.7.0                               # the release you rebuild
 git clone https://github.com/GenesisMeshLabs/sdk-rust && cd sdk-rust
-git checkout v1.5.0
+git checkout "v$version"
 target=x86_64-unknown-linux-musl            # or aarch64-unknown-linux-musl
 toolchain="$(sed -n 's/^RUST_TOOLCHAIN=//p' scripts/build_verifier.sh)"
 rustup toolchain install "$toolchain" --profile minimal --target "$target"
 sudo apt-get install -y musl-tools          # musl-gcc, for C code in the SDK's dependencies
 CC_x86_64_unknown_linux_musl=musl-gcc CC_aarch64_unknown_linux_musl=musl-gcc \
   sh scripts/build_verifier.sh "$target" rebuilt
-grep "genesis-mesh-verify-1.5.0-$target\$" SHA256SUMS   # from the release, signature checked
-cat rebuilt/genesis-mesh-verify-1.5.0-$target.sha256
+grep "genesis-mesh-verify-$version-$target\$" SHA256SUMS   # from the release, signature checked
+cat "rebuilt/genesis-mesh-verify-$version-$target.sha256"
 ```
 
 The two digests must be equal. The rebuild also writes a `.buildinfo` file:
@@ -461,8 +473,8 @@ reference's vectors (`tests/fixtures`, the `audit` suite's packs, key
 histories and exports among them) and compares each verdict and reason code
 with the reference's. `GM_VERIFY_CORPUS=<dir>` also runs the core's
 verification corpus: the `verification/` directory the core's
-`scripts/export_reference_corpus.py --suite verification` writes (169 cases
-in 1.5.0: one signed record of every kind, valid and in each way refused,
+`scripts/export_reference_corpus.py --suite verification` writes (one
+signed record of every kind, valid and in each way refused,
 exports across a key succession, ranges with their cited entries, key
 histories, packs, changes files and the time each record is read at), and
 checks that
@@ -471,13 +483,14 @@ runs a release binary instead of the one cargo built:
 
 ```sh
 python genesismesh/scripts/export_reference_corpus.py --suite verification --out corpus
-GM_VERIFY_BINARY=./genesis-mesh-verify-1.5.0-x86_64-unknown-linux-musl \
+GM_VERIFY_BINARY=./genesis-mesh-verify-1.7.0-x86_64-unknown-linux-musl \
 GM_VERIFY_CORPUS=corpus/verification GM_VERIFY_CORPUS_STRICT=1 \
   cargo test -p genesis-mesh-verify --test differential
 ```
 
 CI generates the corpus from the core revision it tests against and runs it
-this way.
+this way. With `GM_E2E_REQUIRED=1`, as CI runs it, a missing
+`GM_VERIFY_CORPUS` fails the run instead of skipping the corpus.
 
 The vectors are read through a format adapter
 (`verifier/tests/adapter/mod.rs`); a vector kind without one is reported as
