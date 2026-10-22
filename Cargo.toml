@@ -82,3 +82,7 @@ required-features = ["client"]
 [[example]]
 name = "issue_attestation"
 required-features = ["client"]
+
+[[example]]
+name = "edge_site"
+required-features = ["client"]

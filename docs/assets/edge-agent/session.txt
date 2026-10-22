@@ -1,0 +1,37 @@
+==> 1. On the device: create the node and executor keys
+$ genesis-mesh-edge init
+tlKtmAPbja/Q80yVWfisTnfQUfaiQ0/po9KB6FywU8I=
+==> 2. The operator: an edge invite bound to that node key
+$ genesis-mesh admin invite --config local/genesis-mesh.toml --role client --node-sovereign-id site7-17 --executor-resource-prefix edge:site7-17/ --recipient-key "$(genesis-mesh-edge init)" > invite-token
+==> 3. On the device: enrol
+$ genesis-mesh-edge enroll --invite-token-file invite-token 2>enroll.log; echo "exit $?"
+!ok exit 0
+$ genesis-mesh-edge status --json | jq -c "{enrolled, node_sovereign_id, executor_key_id, resource_prefix}"
+{"enrolled":true,"node_sovereign_id":"site7-17","executor_key_id":"edge-e0eb8aff744851aa389d0513408e978b","resource_prefix":"edge:site7-17/"}
+==> 4. The operator: an attestation, then a grant to the executor key
+$ ATT=$(edge_site attest site7-17 secret.rotate secret.revoke)
+$ KEY=$(genesis-mesh-edge status --json | jq -r .executor_key_id)
+$ edge_site grant "$KEY" "$ATT" secret.rotate
+7c71d800-e267-4960-81ca-f0e06ab6f6cc
+==> 5. Run the agent; the NA decides
+$ genesis-mesh-edge run 2>agent.log &
+$ ask "$ROTATE"
+!ok {"allowed":true,"authority":"decision","code":null}
+!dim {"record_kind":"execution","queued":false}
+==> 6. The NA stops: the grant, then break-glass
+$ kill $NA_PID
+$ ask "$ROTATE"
+!ok {"allowed":true,"authority":"grant","code":null}
+!dim {"record_kind":"grant_execution","queued":true}
+$ ask "$REVOKE"
+!no {"allowed":false,"authority":null,"code":"justification_required"}
+$ ask "$GLASS"
+!ok {"allowed":true,"authority":"break_glass","code":"no_grant"}
+!dim {"record_kind":"break_glass","queued":true}
+$ status | jq -c "{na_state, pending_uploads}"
+{"na_state":"unreachable","pending_uploads":2}
+==> 7. The NA is back: the records upload in order
+$ genesis-mesh na start --env-file local/na.env >>na.log 2>&1 &
+$ until [ "$(status | jq .pending_uploads)" = 0 ]; do sleep 1; done
+$ status | jq -c "{connected, na_state, pending_uploads, dead_letters}"
+!ok {"connected":true,"na_state":"answering","pending_uploads":0,"dead_letters":0}
