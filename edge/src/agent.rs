@@ -151,7 +151,7 @@ struct Shared {
     recorder: Option<ExecutionRecorder>,
     snapshot: Value,
     /// The NA's key history: each record is checked with the keys valid at
-    /// its own time (1.7.1), never with every key the NA ever had.
+    /// its own time (1.8.0), never with every key the NA ever had.
     na_keys: NaKeys,
     revoked: bool,
     /// The NA's own last answer (not a proxy's page).
@@ -2139,7 +2139,7 @@ fn crl_names(crl: &Value, cert_id: &str) -> bool {
 }
 
 /// The NA keys a record may be signed with: those valid at its own
-/// `issued_at` (1.7.1). A record without a readable `issued_at` gets none, so
+/// `issued_at` (1.8.0). A record without a readable `issued_at` gets none, so
 /// it does not verify.
 fn keys_for(na_keys: &NaKeys, record: &Value) -> Vec<String> {
     match record["issued_at"].as_str().map(parse_timestamp) {
@@ -2149,7 +2149,7 @@ fn keys_for(na_keys: &NaKeys, record: &Value) -> Vec<String> {
 }
 
 /// The NA keys a grant holder checks its grant, time tokens and revocation
-/// feeds with (1.7.1): the keys valid when the grant was issued, and those
+/// feeds with (1.8.0): the keys valid when the grant was issued, and those
 /// valid now. A key that has been succeeded signs nothing new for it.
 fn grant_keys(na_keys: &NaKeys, grant: &Value) -> Vec<String> {
     let mut keys = keys_for(na_keys, grant);
@@ -2304,7 +2304,7 @@ mod tests {
 
     #[test]
     fn a_record_is_checked_with_the_keys_valid_at_its_own_time() {
-        // 1.7.1: the agent used every key of the history at every time, so a
+        // 1.8.0: the agent used every key of the history at every time, so a
         // succeeded key could sign a CRL, certificate or attestation dated
         // after its hand-over.
         let (keys, succeeded) = succeeded_history();

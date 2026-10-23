@@ -403,7 +403,7 @@ fn command_check(args: &Args) -> Result<(), Exit> {
     Ok(())
 }
 
-/// `--help`, `-h` or `help` anywhere prints the usage and exits 0 (1.7.1: it
+/// `--help`, `-h` or `help` anywhere prints the usage and exits 0 (1.8.0: it
 /// was an unknown option, exit 2).
 fn wants_help(arguments: &[String]) -> bool {
     arguments

@@ -1,5 +1,67 @@
 # Changelog
 
+## 1.8.0 - 2026-10-23
+
+### Security
+
+- **The edge agent checks each record with the NA keys valid at its time.**
+  The agent flattened the NA's key history into every key it ever had, valid
+  at any time. After a key succession, whoever still held the outgoing key
+  could sign a CRL, a join certificate or an attestation the agent accepted.
+  Each of these is now checked with the keys valid at its own `issued_at`.
+  Decisions are checked with the keys valid now. A grant holder gets the
+  keys of its grant's issue time and of now.
+- **TLS certificate checks updated (RUSTSEC-2026-0381, RUSTSEC-2026-0382).**
+  The lockfile moves `rustls-webpki` to 0.103.16 and `webpki-roots` to
+  1.0.10, so the HTTP client and the edge agent no longer accept the
+  distrusted emSign intermediates. Applications that build with their own
+  `Cargo.lock` run `cargo update -p rustls-webpki -p webpki-roots`.
+
+### Added
+
+- **Two walkthroughs, each with a recorded run.** `docs/examples/edge-agent.md`
+  takes `genesis-mesh-edge` from a bound invite through a decision, an
+  outage (a grant, then break-glass) and the uploads afterwards;
+  `docs/examples/verify-audit-pack.md` verifies the frozen audit pack, the
+  same pack with one byte changed, and compares the Python reference's
+  verdict. The new `edge_site` example issues the walkthrough's policy,
+  attestation and grant. `edge/` and `verifier/` gained a README.
+
+### Changed
+
+- **Documentation corrected against the code.** `enroll --reset` is
+  documented as unusable with an invite bound to a node key (reset, `init`,
+  a new invite, then `enroll`). The edge agent's "throttled or failing"
+  class covers any `429` or `5xx` that is not a gateway's page, with or
+  without the NA's body, and exit 5 covers an NA that answers `429` or
+  `5xx` during `enroll`. The README states that the SDK's break-glass counts
+  a `429` or `5xx` as no answer while the edge agent does not; both are
+  deliberate. The API table lists `node`, `grants.uses` and the outbox
+  methods; the verifier page pins 1.7.0, describes itself as a port of the
+  Python reference rather than an independent implementation, and names the
+  functions its clippy rules refuse. `edge.toml.example` shows
+  `rate_limit_per_minute` and says the allow-lists must not both be empty.
+- **Security policy.** Acknowledgement within 5 business days and a
+  remediation plan within 30 days for confirmed issues, as for the core; a
+  verifier that accepts what the reference refuses is in scope.
+- **Live tests no longer pass when they did not run.** `tests/live_na.rs`
+  and the edge agent's scenarios (`edge/tests/scenario.rs`) are
+  `#[ignore]`d, so a plain `cargo test` reports them as ignored instead of
+  `ok`; run them with `--include-ignored`. With `GM_E2E_REQUIRED=1`, which
+  CI sets, a missing NA, an NA that cannot exercise a part, or (for the
+  verifier's differential test) a missing `GM_VERIFY_CORPUS` fails the run.
+
+### Fixed
+
+- **`genesis-mesh-edge --help` prints the usage.** `--help`, `-h` and `help`
+  print the usage and exit 0; they were an unknown option (exit 2).
+
+### Upgrading
+
+- Contributors who run the live tests locally add `--include-ignored`, for
+  example `GM_E2E_PYTHON=python cargo test --test live_na -- --include-ignored`.
+  The crate's API is unchanged.
+
 ## 1.7.0 - 2026-10-15
 
 ### Security
