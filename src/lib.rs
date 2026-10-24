@@ -58,6 +58,7 @@ mod strict_json;
 #[cfg(feature = "client")]
 mod transport;
 pub mod verify;
+pub mod vouching;
 
 #[cfg(feature = "client")]
 pub use agreement::AgreementClient;

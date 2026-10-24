@@ -2294,6 +2294,8 @@ mod tests {
                 key(2, "new", Some(succeeded), None),
             ],
             succession_digests: vec![],
+            vouching_grace_seconds:
+                genesis_mesh_sdk::key_history::SUCCESSION_VOUCHING_GRACE_SECONDS,
         };
         (NaKeys::History(history), succeeded)
     }

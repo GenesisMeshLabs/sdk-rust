@@ -38,7 +38,10 @@ const LAYERS: &[(&str, &[&str])] = &[
         ],
     ),
     // Offline verification.
-    ("verification", &["audit_pack", "key_history", "verify"]),
+    (
+        "verification",
+        &["audit_pack", "key_history", "verify", "vouching"],
+    ),
     // From here on: the `client` feature.
     ("transport", &["transport"]),
     (

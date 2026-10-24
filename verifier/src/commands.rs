@@ -186,6 +186,8 @@ fn record(args: &RecordArgs, json: bool) -> Result<u8, Stop> {
             Keys::Ready(history) => history,
             Keys::Refused(refused) => return Ok(history_refused(&refused, json)),
         },
+        // An audit judges a record at its own time: the vouching horizon (1.8.0) is for the present.
+        now: None,
     };
     let result = verify_record(&args.kind, &record, &options);
     if json {

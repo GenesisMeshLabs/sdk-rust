@@ -725,12 +725,17 @@ validator!(valid_grant, {
         ],
         false,
     );
-    // At most 24 hours, ending after it starts.
+    // At most 24 hours, ending after it starts; 1.8.0: starting within 24 hours of its issue,
+    // with the clock skew either side, as the reference requires.
     let validity = |record: &Value| {
         let at = |key: &str| micros(str_field(record, key).unwrap_or_default());
-        matches!((at("valid_from"), at("valid_until")), (Ok(from), Ok(until))
+        let max = crate::grants::GRANT_MAX_VALIDITY_SECONDS * 1_000_000;
+        let skew = crate::grants::GRANT_CLOCK_SKEW_SECONDS * 1_000_000;
+        matches!((at("issued_at"), at("valid_from"), at("valid_until")), (Ok(issued), Ok(from), Ok(until))
             if from < until
-                && until - from <= crate::grants::GRANT_MAX_VALIDITY_SECONDS * 1_000_000)
+                && until - from <= max
+                && issued - skew <= from
+                && from <= issued + max + skew)
     };
     Box::new(move |v| fields(v) && v.is_some_and(validity))
 });
@@ -3438,6 +3443,11 @@ pub struct VerifyRecordOptions {
     /// `issued_at`); another record read alone is accepted under any key of
     /// the history. A key succession must be one of its successions.
     pub key_history: Option<NaKeyHistory>,
+    /// Judge an attestation or a grant for the present (1.8.0): with the
+    /// key history, one signed by a key whose vouching horizon has passed by
+    /// `now` is refused as `outlives_key`. `None`, the default: judged at its
+    /// own time only.
+    pub now: Option<DateTime<Utc>>,
 }
 
 /// The time an NA-signed record read on its own is placed at in the key
@@ -3680,6 +3690,23 @@ pub fn verify_record(
                 }
                 _ => {}
             }
+        }
+    }
+    // 1.8.0: judged for the present, an attestation or a grant of a key past its vouching horizon no
+    // longer vouches, though it verifies at its own time.
+    if let (true, Some(now), Some(at)) = (out.verified, options.now, at) {
+        let vouching = na.vouching_at(Some(at), now.timestamp_micros());
+        let still = match kind {
+            "attestation" => any_signed(
+                crate::canonical::attestation_canonical(record),
+                record.get("signatures"),
+                &vouching,
+            ),
+            "grant" => crate::grants::signed_as_received("CapabilityGrant", record, &vouching),
+            _ => true,
+        };
+        if !still {
+            out.fail("outlives_key", kind);
         }
     }
     out
