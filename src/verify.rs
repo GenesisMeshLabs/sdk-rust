@@ -725,12 +725,17 @@ validator!(valid_grant, {
         ],
         false,
     );
-    // At most 24 hours, ending after it starts.
+    // At most 24 hours, ending after it starts; 1.8.0: starting within 24 hours of its issue,
+    // with the clock skew either side, as the reference requires.
     let validity = |record: &Value| {
         let at = |key: &str| micros(str_field(record, key).unwrap_or_default());
-        matches!((at("valid_from"), at("valid_until")), (Ok(from), Ok(until))
+        let max = crate::grants::GRANT_MAX_VALIDITY_SECONDS * 1_000_000;
+        let skew = crate::grants::GRANT_CLOCK_SKEW_SECONDS * 1_000_000;
+        matches!((at("issued_at"), at("valid_from"), at("valid_until")), (Ok(issued), Ok(from), Ok(until))
             if from < until
-                && until - from <= crate::grants::GRANT_MAX_VALIDITY_SECONDS * 1_000_000)
+                && until - from <= max
+                && issued - skew <= from
+                && from <= issued + max + skew)
     };
     Box::new(move |v| fields(v) && v.is_some_and(validity))
 });
@@ -3516,10 +3521,39 @@ fn payload_model(kind: &str) -> Option<&'static str> {
 /// export's. A decision is verified by [`verify_boundary_decision`], its
 /// expiry as of its own time unless [`VerifyRecordOptions::at`] says
 /// otherwise; a policy or an attestation by its signature and fields.
+///
+/// The record is judged at its own time, as an audit judges it; see
+/// [`verify_record_for_present`] for a record about to be relied on.
 pub fn verify_record(
     kind: &str,
     record: &Value,
     options: &VerifyRecordOptions,
+) -> RecordVerification {
+    verify_record_judged(kind, record, options, None)
+}
+
+/// [`verify_record`], then judged for the present (1.8.0): with
+/// [`VerifyRecordOptions::key_history`], an attestation or a grant signed by
+/// a key whose vouching horizon has passed at `now` is refused as
+/// `outlives_key`, though it verifies at its own time. The horizon is the
+/// key's end, the 300-second hand-over and `grace_seconds`
+/// ([`vouching_grace`](crate::key_history::vouching_grace)). Without the key
+/// history, as [`verify_record`].
+pub fn verify_record_for_present(
+    kind: &str,
+    record: &Value,
+    options: &VerifyRecordOptions,
+    now: DateTime<Utc>,
+    grace_seconds: i64,
+) -> RecordVerification {
+    verify_record_judged(kind, record, options, Some((now, grace_seconds)))
+}
+
+fn verify_record_judged(
+    kind: &str,
+    record: &Value,
+    options: &VerifyRecordOptions,
+    present: Option<(DateTime<Utc>, i64)>,
 ) -> RecordVerification {
     let mut out = RecordVerification {
         kind: kind.to_owned(),
@@ -3680,6 +3714,23 @@ pub fn verify_record(
                 }
                 _ => {}
             }
+        }
+    }
+    // 1.8.0: judged for the present, an attestation or a grant of a key past its vouching horizon no
+    // longer vouches, though it verifies at its own time.
+    if let (true, Some((now, grace)), Some(at)) = (out.verified, present, at) {
+        let vouching = na.vouching_at(Some(at), now.timestamp_micros(), grace);
+        let still = match kind {
+            "attestation" => any_signed(
+                crate::canonical::attestation_canonical(record),
+                record.get("signatures"),
+                &vouching,
+            ),
+            "grant" => crate::grants::signed_as_received("CapabilityGrant", record, &vouching),
+            _ => true,
+        };
+        if !still {
+            out.fail("outlives_key", kind);
         }
     }
     out

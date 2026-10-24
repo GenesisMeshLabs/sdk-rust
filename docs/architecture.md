@@ -26,7 +26,7 @@ behind it.
 | 1. foundation | `errors`, `strict_json`, `rules`, `outbox_entry` | Typed errors; strict JSON input; value rules shared by the records (metadata limit, secret-material guard, number normalization); the outboxes' entry types. |
 | 2. canonical | `auth`, `canonical`, `strict`, `shape` | Canonical JSON, Ed25519 signing and verification, admin headers; canonical forms and digests of each model; the field registry; structural checks of signed JSON. |
 | 3. records | `execution`, `out_of_band`, `remediation`, `grants`, `node_auth`, `outbox` | Building, signing and checking records offline; the evidence and record outboxes. |
-| 4. verification | `verify`, `key_history`, `audit_pack` | Offline verification of NA-signed artifacts, exports, key histories and audit packs. |
+| 4. verification | `verify`, `key_history`, `audit_pack`, `vouching` | Offline verification of NA-signed artifacts, exports, key histories and audit packs; the vouching horizon (1.8.0). |
 | 5. transport (`client`) | `transport` | `ClientOptions`, `HttpTransport`: admin request signing, retries, error mapping, path segment encoding. |
 | 6. sub-clients (`client`) | `agreement`, `attestation`, `boundary`, `consensus`, `data_usage`, `disclosure`, `evidence`, `evidence_store`, `grant_client`, `health`, `node`, `policy` | One sub-client per NA route group, over the transport. |
 | 7. client (`client`) | `client` | `GenesisMeshClient`: one transport shared by every sub-client. |
@@ -34,7 +34,7 @@ behind it.
 
 `lib.rs` declares the modules and re-exports the public API; the public
 paths are the crate root plus the `pub mod`s (`audit_pack`, `canonical`,
-`grants`, `key_history`, `node_auth`, `remediation`, `strict`, `verify`).
+`grants`, `key_history`, `node_auth`, `remediation`, `strict`, `verify`, `vouching`).
 
 Shared code goes down, never sideways into a cycle: when two modules of a
 layer need the same helper, it moves to a lower module (`rules`, `shape`,
@@ -61,7 +61,8 @@ shrink.
 | `node_auth` | Node request signatures, the edge join co-signature. |
 | `outbox` | Evidence and record outboxes (memory and file), retry and refusal rules. |
 | `verify` | Offline verification of decisions, exports, records and anchors (Python reason codes). |
-| `key_history` | NA key history and succession: which key was valid when. |
+| `key_history` | NA key history and succession: which key was valid when, and until when it vouches for the present (1.8.0). |
+| `vouching` | `na_record_refusal`: an NA-signed record judged at its own time and for the present, the `vouching` suite (1.8.0). |
 | `audit_pack` | Audit pack verification and the completeness check. |
 | `transport` | `ClientOptions`, `HttpTransport`, `segment`/`resource_path`. |
 | `client` | `GenesisMeshClient`. |

@@ -35,7 +35,9 @@ failures() {
     cargo semver-checks check-release --manifest-path "$1/Cargo.toml" -p "$package" \
         --baseline-root "$work/baseline" --release-type minor > "$2.log" 2>&1
     local status=$?
+    # The log is colored in CI (CARGO_TERM_COLOR): drop the escapes first.
     awk '
+        { gsub(/\033\[[0-9;]*m/, "") }
         /^--- failure / { lint = $3; sub(/:$/, "", lint); next }
         /^Failed in:/ { listing = 1; next }
         listing && /^  / {

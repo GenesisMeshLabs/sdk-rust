@@ -813,6 +813,32 @@ verifies a pack, then the same pack with one byte changed.
   (`na_key_not_valid_at_time` for another key of the history), and
   `verify_store_anchors` takes `NaKeys`. Without a history every key given is
   valid at every time, as before.
+- **The vouching horizon** (1.8.0): judged for the present, a record of a key
+  that has ended vouches only until that key's end, the 300-second hand-over
+  and a grace of at most 24 hours (`SUCCESSION_VOUCHING_GRACE_SECONDS`); the
+  NA re-issues what is still valid under the new key. Judged at its own time,
+  a record is unchanged.
+  - `NaKey::end`, and on `NaKeyHistory`: `vouches_until`,
+    `record_outlives_key` and `keys_vouching_at`, each given the grace.
+    `NaKeys::vouching_at` and `NaKeys::outlives` cover both kinds of keys.
+    `key_history::vouching_grace` turns the NA's published
+    `vouching_grace_seconds` into the grace (it only shortens).
+  - `verify_record_for_present` judges an attestation or a grant for the
+    present: one of a key past its horizon is `outlives_key`.
+    `verify_record` keeps judging a record at its own time.
+  - `vouching::na_record_refusal` gives the reference's verdict on an
+    attestation, treaty, revocation feed or grant, with `record_malformed`
+    for a record its kind's time rules refuse, such as a grant that starts
+    more than 24 hours after its issue (now refused by the grant checks too).
+    The shared `vouching` suite pins it.
+  - `GrantHolder` takes a key history as well as a list of keys
+    (`impl Into<NaKeys>`): with it, the grant is refused past its key's
+    horizon, ends as `grant_expired` when it passes the horizon, and
+    revocation feeds are ordered by their signer's key, then by `sequence`.
+    `GrantHolder::with_vouching_grace` shortens its grace.
+
+  Upgrade the NA to 1.8.0 first and let it re-issue (`reissue_pending: false`
+  on its `/readyz`) before judging records for the present.
 - **Decisions as of their own time**: `VerifyDecisionOptions::at_record_time`
   judges a decision as of its `decision_made_at` instead of now, so an
   archived decision verifies at any later audit. It is off by default: a

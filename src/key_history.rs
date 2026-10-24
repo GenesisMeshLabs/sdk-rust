@@ -54,6 +54,22 @@ pub const SUCCESSION_MIN_LEAD_SECONDS: i64 = 60;
 /// (`decision_outlives_key`).
 pub const MAX_DECISION_LIFETIME_SECONDS: i64 = 300;
 
+/// The vouching horizon's grace (1.8.0, seconds): how long past its end and
+/// the hand-over a record of a key that has ended still vouches for the
+/// present. Also the most a verifier allows: see [`vouching_grace`].
+pub const SUCCESSION_VOUCHING_GRACE_SECONDS: i64 = 86_400;
+
+/// The grace a verifier uses (1.8.0, seconds), given the NA's published
+/// `vouching_grace_seconds` (`GET /na/key-history`). The value is unsigned,
+/// so it may only shorten the grace: it is clamped to 0 to
+/// [`SUCCESSION_VOUCHING_GRACE_SECONDS`], and `None` is the most. A
+/// verifier that sets its own grace takes the smaller of the two.
+pub fn vouching_grace(published: Option<i64>) -> i64 {
+    published.map_or(SUCCESSION_VOUCHING_GRACE_SECONDS, |s| {
+        s.clamp(0, SUCCESSION_VOUCHING_GRACE_SECONDS)
+    })
+}
+
 /// The time an NA-signed record read on its own (outside the store) is
 /// placed at in the key history, by model: the reference's
 /// `NA_RECORD_TIME_FIELDS` (1.5.0 review fixes). In the store every entry is
@@ -119,6 +135,18 @@ impl NaKey {
             || (self.valid_to_enforced && self.valid_to.is_some_and(|to| at >= to)))
     }
 
+    /// The key's end (1.8.0): the earlier of its succession and its enforced
+    /// `valid_to`; `None` for a key with neither.
+    pub fn end(&self) -> Option<i64> {
+        [
+            self.succeeded_at,
+            self.valid_to.filter(|_| self.valid_to_enforced),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
     /// True when the NA may sign with this key at `at` (no hand-over).
     pub fn signs_at(&self, at: i64) -> bool {
         !(self.valid_from.is_some_and(|from| at < from)
@@ -182,16 +210,38 @@ impl NaKeyHistory {
     /// review fixes): the key's end (its succession, or its enforced
     /// `valid_to`), the hand-over and [`MAX_DECISION_LIFETIME_SECONDS`].
     pub fn decision_outlives_key(&self, public_key: &str, valid_until: i64) -> bool {
-        let Some(key) = self.key_for(public_key) else {
-            return false;
-        };
-        let ends = [
-            key.succeeded_at,
-            key.valid_to.filter(|_| key.valid_to_enforced),
-        ];
-        ends.into_iter().flatten().min().is_some_and(|end| {
-            valid_until > end + HANDOVER_MICROS + MAX_DECISION_LIFETIME_SECONDS * 1_000_000
-        })
+        self.key_for(public_key)
+            .and_then(NaKey::end)
+            .is_some_and(|end| {
+                valid_until > end + HANDOVER_MICROS + MAX_DECISION_LIFETIME_SECONDS * 1_000_000
+            })
+    }
+
+    /// Until when a record signed by `public_key` vouches for the present
+    /// (1.8.0, microseconds): its key's end, the hand-over and the grace
+    /// (`grace_seconds`, from [`vouching_grace`]). `None` for a key with no
+    /// end, or not in this history.
+    pub fn vouches_until(&self, public_key: &str, grace_seconds: i64) -> Option<i64> {
+        let end = self.key_for(public_key)?.end()?;
+        Some(end + HANDOVER_MICROS + grace_seconds.max(0) * 1_000_000)
+    }
+
+    /// True when a record signed by `public_key` no longer vouches for the
+    /// present at `now` (1.8.0, microseconds): its key ended more than the
+    /// hand-over and the grace ago.
+    pub fn record_outlives_key(&self, public_key: &str, now: i64, grace_seconds: i64) -> bool {
+        self.vouches_until(public_key, grace_seconds)
+            .is_some_and(|until| now >= until)
+    }
+
+    /// The public keys a record dated `at` may be signed with and that still
+    /// vouch at `now` (1.8.0): [`NaKeyHistory::keys_at`] without the keys
+    /// whose horizon has passed.
+    pub fn keys_vouching_at(&self, at: i64, now: i64, grace_seconds: i64) -> Vec<String> {
+        self.keys_at(at)
+            .into_iter()
+            .filter(|k| !self.record_outlives_key(k, now, grace_seconds))
+            .collect()
     }
 
     /// The key the NA signs with at `at` (`None` in a gap after an enforced
@@ -643,5 +693,43 @@ impl NaKeys {
             NaKeys::History(history) => Some(history),
             NaKeys::Any(_) => None,
         }
+    }
+
+    /// The keys a record dated `at` may be signed with and that still vouch
+    /// at `now` (1.8.0, microseconds): [`NaKeys::at`] without the keys of
+    /// the history whose horizon has passed. Keys valid at every time have no
+    /// horizon.
+    pub fn vouching_at(&self, at: Option<i64>, now: i64, grace_seconds: i64) -> Vec<String> {
+        self.at(at)
+            .into_iter()
+            .filter(|k| !self.outlives(k, now, grace_seconds))
+            .collect()
+    }
+
+    /// True when a record signed by `public_key` no longer vouches at `now`
+    /// (1.8.0): its key of the history is past its horizon.
+    pub fn outlives(&self, public_key: &str, now: i64, grace_seconds: i64) -> bool {
+        self.history()
+            .is_some_and(|h| h.record_outlives_key(public_key, now, grace_seconds))
+    }
+
+    /// The key sequence of `public_key` in the history (1.8.0); 0 for keys
+    /// valid at every time, or a key outside the history.
+    pub fn key_sequence(&self, public_key: &str) -> i64 {
+        self.history()
+            .and_then(|h| h.key_for(public_key))
+            .map_or(0, |k| k.key_sequence)
+    }
+}
+
+impl From<Vec<String>> for NaKeys {
+    fn from(keys: Vec<String>) -> Self {
+        NaKeys::Any(keys)
+    }
+}
+
+impl From<NaKeyHistory> for NaKeys {
+    fn from(history: NaKeyHistory) -> Self {
+        NaKeys::History(history)
     }
 }
