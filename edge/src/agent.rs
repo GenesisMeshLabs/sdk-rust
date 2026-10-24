@@ -17,7 +17,7 @@ use genesis_mesh_sdk::{
     check_metadata_only, evaluation_failure, governed_action,
     grants::{envelope_problem, use_digest},
     json,
-    key_history::{verify_key_history, NaKeys},
+    key_history::{verify_key_history, vouching_grace, NaKeys, SUCCESSION_VOUCHING_GRACE_SECONDS},
     node_auth::executor_key_id,
     verify::{verify_attestation_signature, verify_crl, verify_join_certificate},
     without_refused_metadata, ActionError, ActionReport, BreakGlassInput, ClientOptions,
@@ -38,6 +38,11 @@ use crate::{
 
 /// How far the device's clock may be behind the NA's signing time.
 const CLOCK_SKEW_SECONDS: i64 = 300;
+
+/// After a key succession takes effect, a certificate the succeeded key
+/// signed is renewed within this many seconds, each agent at its own share
+/// of them, and within half the grace (1.8.0, as the core node does).
+const SUCCESSION_RENEW_JITTER_SECONDS: i64 = 600;
 
 /// Records submitted per upload page: an upload never loads a whole backlog.
 const UPLOAD_PAGE: usize = 200;
@@ -153,6 +158,9 @@ struct Shared {
     /// The NA's key history: each record is checked with the keys valid at
     /// its own time (1.8.0), never with every key the NA ever had.
     na_keys: NaKeys,
+    /// The vouching horizon's grace (1.8.0): the NA's published
+    /// `vouching_grace_seconds`, which only shortens it.
+    vouching_grace_seconds: i64,
     revoked: bool,
     /// The NA's own last answer (not a proxy's page).
     last_contact: Option<DateTime<Utc>>,
@@ -168,6 +176,9 @@ struct Shared {
 struct Holders {
     map: BTreeMap<String, GrantHolder>,
     out: Option<String>,
+    /// The NA's keys changed while a holder was out: it is rebuilt with the
+    /// new keys when it comes back (1.8.0).
+    stale_out: bool,
 }
 
 /// The agent.
@@ -351,6 +362,7 @@ impl Agent {
                 recorder: None,
                 snapshot: json!({}),
                 na_keys: NaKeys::Any(Vec::new()),
+                vouching_grace_seconds: SUCCESSION_VOUCHING_GRACE_SECONDS,
                 revoked: false,
                 last_contact: None,
                 heartbeat_ok: None,
@@ -435,6 +447,7 @@ impl Agent {
         shared.identity = Some(identity);
         shared.recorder = Some(recorder);
         shared.na_keys = na_keys;
+        shared.vouching_grace_seconds = grace_of(&snapshot["key_history"]);
         shared.snapshot = snapshot;
         shared.revoked = revoked;
         Ok(())
@@ -452,6 +465,46 @@ impl Agent {
             Some(&self.config.root_public_key),
         );
         verified.history.map(NaKeys::History)
+    }
+
+    /// What the grant holders were built with: the key history's successions
+    /// and the grace (1.8.0).
+    fn key_generation(&self) -> (Option<Vec<String>>, i64) {
+        let shared = lock(&self.shared);
+        (
+            shared
+                .na_keys
+                .history()
+                .map(|h| h.succession_digests.clone()),
+            shared.vouching_grace_seconds,
+        )
+    }
+
+    /// `holder` rebuilt from its state with the NA's keys and grace now
+    /// (1.8.0); the holder as it was when it does not restore, so a grant
+    /// past its key's horizon ends as `grant_expired` at its next use.
+    fn rekeyed(&self, holder: &GrantHolder) -> GrantHolder {
+        let (recorder, keys, grace) = {
+            let shared = lock(&self.shared);
+            (
+                shared.recorder.clone(),
+                shared.na_keys.clone(),
+                shared.vouching_grace_seconds,
+            )
+        };
+        let Some(recorder) = recorder else {
+            return holder.clone();
+        };
+        match GrantHolder::restore(holder.state().clone(), recorder, keys) {
+            Ok(rebuilt) => rebuilt.with_vouching_grace(grace),
+            Err(err) => {
+                log::warn(
+                    "grant_holder_not_rekeyed",
+                    json!({"grant_id": holder.grant_id(), "code": err.code()}),
+                );
+                holder.clone()
+            }
+        }
     }
 
     fn resource_prefix(&self) -> Option<String> {
@@ -490,9 +543,13 @@ impl Agent {
     /// Restore the grant holders, each advanced to its newest use. A holder
     /// that does not restore is rebuilt at the next sync, from its uses.
     fn restore_holders(&self) -> Result<(), Exit> {
-        let (recorder, keys) = {
+        let (recorder, keys, grace) = {
             let shared = lock(&self.shared);
-            (shared.recorder.clone(), shared.na_keys.clone())
+            (
+                shared.recorder.clone(),
+                shared.na_keys.clone(),
+                shared.vouching_grace_seconds,
+            )
         };
         let Some(recorder) = recorder else {
             return Ok(());
@@ -512,9 +569,9 @@ impl Agent {
                 }
             };
             self.advance(&grant_id, &mut state, &uses);
-            let holder_keys = grant_keys(&keys, &state.grant);
-            match GrantHolder::restore(state, recorder.clone(), holder_keys) {
-                Ok(mut holder) => {
+            match GrantHolder::restore(state, recorder.clone(), keys.clone()) {
+                Ok(holder) => {
+                    let mut holder = holder.with_vouching_grace(grace);
                     holder.set_resource_prefix(prefix.clone());
                     holders.insert(grant_id, holder);
                 }
@@ -779,26 +836,36 @@ impl Agent {
         ) {
             return;
         }
-        let (expires, node_public_key, executor_public_key, keys) = {
+        let (expires, node_public_key, executor_public_key, keys, succession_due) = {
             let shared = lock(&self.shared);
             let Some(enrollment) = &shared.enrollment else {
                 return;
             };
+            let node_public_key = enrollment["cert"]["node_public_key"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
             (
                 micros(&enrollment["cert"]["expires_at"]).unwrap_or(0),
-                enrollment["cert"]["node_public_key"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
+                node_public_key.clone(),
                 enrollment["executor_key"]["public_key"]
                     .as_str()
                     .unwrap_or_default()
                     .to_owned(),
                 shared.na_keys.clone(),
+                succession_renewal_due(
+                    &enrollment["cert"],
+                    &shared.na_keys,
+                    shared.vouching_grace_seconds,
+                    renewal_fraction(&node_public_key),
+                ),
             )
         };
-        let left = expires - Utc::now().timestamp_micros();
-        if left >= self.config.renew_before.as_micros() as i64 {
+        let now = Utc::now().timestamp_micros();
+        let left = expires - now;
+        // 1.8.0: also once a succession has taken effect, for a certificate the succeeded key signed.
+        let after_succession = succession_due.is_some_and(|due| now >= due);
+        if left >= self.config.renew_before.as_micros() as i64 && !after_succession {
             return;
         }
         let Some((client, identity)) = self.node() else {
@@ -907,6 +974,7 @@ impl Agent {
         let Some((client, identity)) = self.node() else {
             return Ok(());
         };
+        let generation = self.key_generation();
         let reads = self.read_snapshot(&client, &identity, state).await;
         if self.state() == AgentState::Revoked {
             return Ok(());
@@ -915,6 +983,13 @@ impl Agent {
         let _ = self.db.prune_authorizations();
         let na_keys = lock(&self.shared).na_keys.clone();
         let mut holders = self.holders.lock().await;
+        // 1.8.0: a succession, or a new grace, rebuilds every holder with the NA's keys now.
+        if self.key_generation() != generation {
+            for holder in holders.map.values_mut() {
+                *holder = self.rekeyed(holder);
+            }
+            holders.stale_out = holders.out.is_some();
+        }
         let outbox = SqliteRecordOutbox::new(self.db.clone());
         for holder in holders.map.values_mut() {
             let _ = holder.count_quarantined(&outbox).await;
@@ -966,9 +1041,11 @@ impl Agent {
                 "the NA's key history does not verify".into(),
             ));
         };
+        let grace = grace_of(&key_history);
         let crl = read(transport.public_get("/crl").await, "crl_failed")?;
         let feed = read(client.grants.revocation_feed().await, "feed_failed")?;
-        if !verify_crl(&crl, &keys_for(&na_keys, &crl)) {
+        // 1.8.0: a CRL is relied on now, so its key must still vouch.
+        if !verify_crl(&crl, &vouching_keys_for(&na_keys, &crl, grace)) {
             log::error("crl_unverified", json!({}));
             return Err(GenesisMeshError::Verification(
                 "the CRL does not verify".into(),
@@ -996,11 +1073,16 @@ impl Agent {
             }
         }
         if !node_state.is_null() {
-            node_state["attestations"] =
-                Value::Array(verified_attestations(&node_state, &na_keys, identity));
+            node_state["attestations"] = Value::Array(verified_attestations(
+                &node_state,
+                &na_keys,
+                grace,
+                identity,
+            ));
         }
         let mut shared = lock(&self.shared);
         shared.na_keys = na_keys;
+        shared.vouching_grace_seconds = grace;
         if node_state.is_null() {
             node_state = shared.snapshot["node_state"].clone();
         }
@@ -1078,9 +1160,10 @@ impl Agent {
                 }
             };
             state.time_token = token;
-            let holder_keys = grant_keys(na_keys, &state.grant);
-            match GrantHolder::restore(state, recorder.clone(), holder_keys) {
+            let grace = lock(&self.shared).vouching_grace_seconds;
+            match GrantHolder::restore(state, recorder.clone(), na_keys.clone()) {
                 Ok(holder) => {
+                    let holder = holder.with_vouching_grace(grace);
                     log::info(
                         "grant_held",
                         json!({"grant_id": grant_id, "capabilities": grant["capabilities"], "uses": holder.uses()}),
@@ -1923,7 +2006,12 @@ impl Agent {
         {
             let mut holders = self.holders.lock().await;
             holders.out = None;
-            holders.map.insert(holder.grant_id().to_owned(), *holder);
+            let holder = if std::mem::take(&mut holders.stale_out) {
+                self.rekeyed(&holder)
+            } else {
+                *holder
+            };
+            holders.map.insert(holder.grant_id().to_owned(), holder);
         }
         match acted {
             Ok(GrantActionOutcome::Used(used)) => Ok(Finished::Ran {
@@ -2140,7 +2228,8 @@ fn crl_names(crl: &Value, cert_id: &str) -> bool {
 
 /// The NA keys a record may be signed with: those valid at its own
 /// `issued_at` (1.8.0). A record without a readable `issued_at` gets none, so
-/// it does not verify.
+/// it does not verify. For the agent's own certificate from `/join` or
+/// `/renew`; what it relies on is checked with [`vouching_keys_for`].
 fn keys_for(na_keys: &NaKeys, record: &Value) -> Vec<String> {
     match record["issued_at"].as_str().map(parse_timestamp) {
         Some(Ok(at)) => na_keys.at(Some(at.timestamp_micros())),
@@ -2148,17 +2237,54 @@ fn keys_for(na_keys: &NaKeys, record: &Value) -> Vec<String> {
     }
 }
 
-/// The NA keys a grant holder checks its grant, time tokens and revocation
-/// feeds with (1.8.0): the keys valid when the grant was issued, and those
-/// valid now. A key that has been succeeded signs nothing new for it.
-fn grant_keys(na_keys: &NaKeys, grant: &Value) -> Vec<String> {
-    let mut keys = keys_for(na_keys, grant);
-    for key in na_keys.at(Some(Utc::now().timestamp_micros())) {
-        if !keys.contains(&key) {
-            keys.push(key);
-        }
+/// The NA keys a record relied on now may be signed with (1.8.0): those
+/// valid at its own `issued_at` that still vouch, so a key past its vouching
+/// horizon signs nothing the agent acts on.
+fn vouching_keys_for(na_keys: &NaKeys, record: &Value, grace_seconds: i64) -> Vec<String> {
+    match record["issued_at"].as_str().map(parse_timestamp) {
+        Some(Ok(at)) => na_keys.vouching_at(
+            Some(at.timestamp_micros()),
+            Utc::now().timestamp_micros(),
+            grace_seconds,
+        ),
+        _ => Vec::new(),
     }
-    keys
+}
+
+/// The grace from a key history view: its `vouching_grace_seconds` (1.8.0),
+/// which may only shorten the grace.
+fn grace_of(key_history: &Value) -> i64 {
+    vouching_grace(key_history["vouching_grace_seconds"].as_i64())
+}
+
+/// When to renew a certificate a key that has ended signed (1.8.0,
+/// microseconds): that key's end, plus `fraction` of the renewal window
+/// ([`SUCCESSION_RENEW_JITTER_SECONDS`], at most half the grace). `None`
+/// without a key history, or for a certificate of a key with no end.
+fn succession_renewal_due(
+    cert: &Value,
+    na_keys: &NaKeys,
+    grace_seconds: i64,
+    fraction: f64,
+) -> Option<i64> {
+    let history = na_keys.history()?;
+    let signer = history
+        .keys_at(micros(&cert["issued_at"])?)
+        .into_iter()
+        .find(|k| verify_join_certificate(cert, std::slice::from_ref(k)))?;
+    let end = history.key_for(&signer)?.end()?;
+    let window = SUCCESSION_RENEW_JITTER_SECONDS.min(grace_seconds.max(0) / 2) * 1_000_000;
+    Some(end + (window as f64 * fraction.clamp(0.0, 1.0)) as i64)
+}
+
+/// This node's share of the renewal window, from its public key: stable
+/// across restarts, and spread over the nodes.
+fn renewal_fraction(node_public_key: &str) -> f64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(node_public_key.as_bytes());
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(first) as f64 / u64::MAX as f64
 }
 
 /// The attestations in a `/node/state` answer that verify, are the node's
@@ -2166,6 +2292,7 @@ fn grant_keys(na_keys: &NaKeys, grant: &Value) -> Vec<String> {
 fn verified_attestations(
     node_state: &Value,
     na_keys: &NaKeys,
+    grace_seconds: i64,
     identity: &NodeIdentity,
 ) -> Vec<Value> {
     let sovereign = node_state["node"]["node_sovereign_id"].as_str();
@@ -2178,8 +2305,11 @@ fn verified_attestations(
             let ours = attestation["subject_id"].as_str() == sovereign
                 && (attestation["subject_public_key"].is_null()
                     || attestation["subject_public_key"] == identity.node_public_key());
-            let verified =
-                verify_attestation_signature(attestation, &keys_for(na_keys, attestation));
+            // 1.8.0: relied on now, so its key must still vouch.
+            let verified = verify_attestation_signature(
+                attestation,
+                &vouching_keys_for(na_keys, attestation, grace_seconds),
+            );
             if !(ours && verified) {
                 log::warn(
                     "attestation_refused",
@@ -2321,16 +2451,102 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_holder_gets_the_keys_of_its_grant_and_of_now_only() {
+    fn a_record_relied_on_now_needs_a_key_that_still_vouches() {
+        // 1.8.0: the old key was succeeded an hour ago.
         let (keys, succeeded) = succeeded_history();
-        // A grant issued under the old key keeps it; time tokens come from the new one.
-        let mut held = grant_keys(&keys, &dated(succeeded - 60_000_000));
-        held.sort();
-        assert_eq!(held, vec!["new".to_owned(), "old".to_owned()]);
-        // A grant dated after the hand-over is never checked with the old key.
+        let before = dated(succeeded - 60_000_000);
+        // Within the hand-over and a two-hour grace, the old key still vouches.
         assert_eq!(
-            grant_keys(&keys, &dated(succeeded + 600_000_000)),
+            vouching_keys_for(&keys, &before, 7200),
+            vec!["old".to_owned()]
+        );
+        // With a ten-minute grace its horizon has passed.
+        assert!(vouching_keys_for(&keys, &before, 600).is_empty());
+        assert_eq!(
+            vouching_keys_for(&keys, &dated(succeeded + 600_000_000), 600),
             vec!["new".to_owned()]
         );
+        assert!(vouching_keys_for(&keys, &json!({}), 600).is_empty());
+        // The NA's published grace only shortens the grace.
+        assert_eq!(grace_of(&json!({"vouching_grace_seconds": 3600})), 3600);
+        assert_eq!(grace_of(&json!({})), SUCCESSION_VOUCHING_GRACE_SECONDS);
+        assert_eq!(
+            grace_of(&json!({"vouching_grace_seconds": 864_000})),
+            SUCCESSION_VOUCHING_GRACE_SECONDS
+        );
+        assert_eq!(grace_of(&json!({"vouching_grace_seconds": -5})), 0);
+    }
+
+    /// A certificate signed with the key of `seed` under `key_id`.
+    fn certificate(seed: [u8; 32], key_id: &str, issued_at: i64) -> Value {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let at = |micros: i64| python_timestamp(DateTime::from_timestamp_micros(micros).unwrap());
+        let mut cert = json!({
+            "cert_id": "certificate-1",
+            "node_public_key": "node",
+            "network_name": "TEST",
+            "roles": ["edge"],
+            "issued_at": at(issued_at),
+            "expires_at": at(issued_at + 30 * 86_400_000_000),
+            "issued_by": key_id,
+        });
+        let key = genesis_mesh_sdk::load_signing_key(&STANDARD.encode(seed)).unwrap();
+        let canonical = genesis_mesh_sdk::canonical_json(&cert).unwrap();
+        cert["signatures"] = json!([genesis_mesh_sdk::sign_canonical(&canonical, key_id, &key)]);
+        cert
+    }
+
+    #[test]
+    fn a_certificate_of_a_succeeded_key_is_renewed_soon_after_the_succession() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use genesis_mesh_sdk::key_history::{NaKey, NaKeyHistory};
+        let public = |seed: [u8; 32]| {
+            genesis_mesh_sdk::public_key_from_seed(&STANDARD.encode(seed)).unwrap()
+        };
+        let succeeded = Utc::now().timestamp_micros() - 3_600_000_000;
+        let key = |sequence: i64, seed, valid_from, succeeded_at| NaKey {
+            key_sequence: sequence,
+            public_key: public(seed),
+            key_id: Some(format!("na-{sequence}")),
+            valid_from,
+            succeeded_at,
+            valid_to: None,
+            valid_to_enforced: false,
+        };
+        let keys = NaKeys::History(NaKeyHistory {
+            sovereign_id: "TEST".into(),
+            root_public_key: None,
+            keys: vec![
+                key(1, [3; 32], None, Some(succeeded)),
+                key(2, [9; 32], Some(succeeded), None),
+            ],
+            succession_digests: vec![],
+        });
+        let old = certificate([3; 32], "na-1", succeeded - 86_400_000_000);
+        let day = SUCCESSION_VOUCHING_GRACE_SECONDS;
+        // At its share of ten minutes after the succession, and within half the grace.
+        assert_eq!(
+            succession_renewal_due(&old, &keys, day, 0.0),
+            Some(succeeded)
+        );
+        assert_eq!(
+            succession_renewal_due(&old, &keys, day, 1.0),
+            Some(succeeded + 600_000_000)
+        );
+        assert_eq!(
+            succession_renewal_due(&old, &keys, 600, 1.0),
+            Some(succeeded + 300_000_000)
+        );
+        assert_eq!(succession_renewal_due(&old, &keys, 0, 1.0), Some(succeeded));
+        // A certificate of the new key, or keys without a history: not renewed for a succession.
+        let new = certificate([9; 32], "na-2", succeeded + 60_000_000);
+        assert_eq!(succession_renewal_due(&new, &keys, day, 1.0), None);
+        let flat = NaKeys::Any(vec![public([3; 32])]);
+        assert_eq!(succession_renewal_due(&old, &flat, day, 1.0), None);
+        // Each node has its own stable share.
+        let share = renewal_fraction("node-a");
+        assert!((0.0..=1.0).contains(&share));
+        assert_eq!(share, renewal_fraction("node-a"));
+        assert_ne!(share, renewal_fraction("node-b"));
     }
 }
