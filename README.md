@@ -818,12 +818,14 @@ verifies a pack, then the same pack with one byte changed.
   and a grace of at most 24 hours (`SUCCESSION_VOUCHING_GRACE_SECONDS`); the
   NA re-issues what is still valid under the new key. Judged at its own time,
   a record is unchanged.
-  - `NaKey::end`, and on `NaKeyHistory`: `with_vouching_grace` (only
-    shortens; use it for the NA's `vouching_grace_seconds`), `vouches_until`,
-    `record_outlives_key` and `keys_vouching_at`. `NaKeys::vouching_at` and
-    `NaKeys::outlives` cover both kinds of keys.
-  - `VerifyRecordOptions::now` judges an attestation or a grant for the
+  - `NaKey::end`, and on `NaKeyHistory`: `vouches_until`,
+    `record_outlives_key` and `keys_vouching_at`, each given the grace.
+    `NaKeys::vouching_at` and `NaKeys::outlives` cover both kinds of keys.
+    `key_history::vouching_grace` turns the NA's published
+    `vouching_grace_seconds` into the grace (it only shortens).
+  - `verify_record_for_present` judges an attestation or a grant for the
     present: one of a key past its horizon is `outlives_key`.
+    `verify_record` keeps judging a record at its own time.
   - `vouching::na_record_refusal` gives the reference's verdict on an
     attestation, treaty, revocation feed or grant, with `record_malformed`
     for a record its kind's time rules refuse, such as a grant that starts
@@ -833,8 +835,7 @@ verifies a pack, then the same pack with one byte changed.
     (`impl Into<NaKeys>`): with it, the grant is refused past its key's
     horizon, ends as `grant_expired` when it passes the horizon, and
     revocation feeds are ordered by their signer's key, then by `sequence`.
-  - `GovernedVerification::key_history` checks a decision with the key valid
-    when it was made and the 1.5.0 decision bound.
+    `GrantHolder::with_vouching_grace` shortens its grace.
 
   Upgrade the NA to 1.8.0 first and let it re-issue (`reissue_pending: false`
   on its `/readyz`) before judging records for the present.

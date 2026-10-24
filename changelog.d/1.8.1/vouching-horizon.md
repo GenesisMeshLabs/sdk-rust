@@ -4,19 +4,18 @@
   record signed by an NA key that has ended vouches only until that key's end,
   the 300-second hand-over and a grace of at most 24 hours. Judged at its own
   time, it is unchanged.
-  - `SUCCESSION_VOUCHING_GRACE_SECONDS`.
-  - `NaKey::end`, and on `NaKeyHistory`: `vouching_grace_seconds`,
-    `with_vouching_grace` (only shortens), `vouches_until`,
-    `record_outlives_key` and `keys_vouching_at`.
+  - `SUCCESSION_VOUCHING_GRACE_SECONDS`, and `key_history::vouching_grace`:
+    the grace from the NA's published `vouching_grace_seconds`, which may
+    only shorten it.
+  - `NaKey::end`, and on `NaKeyHistory`: `vouches_until`,
+    `record_outlives_key` and `keys_vouching_at`, each given the grace.
   - On `NaKeys`: `vouching_at`, `outlives` and `key_sequence`;
     `From<Vec<String>>` and `From<NaKeyHistory>`.
-  - `VerifyRecordOptions::now`: an attestation or a grant of a key past its
-    horizon is `outlives_key`. `genesis-mesh-verify` keeps judging records at
-    their own time.
+  - `verify::verify_record_for_present`: an attestation or a grant of a key
+    past its horizon is `outlives_key`. `verify_record`, and
+    `genesis-mesh-verify`, keep judging records at their own time.
   - `vouching::na_record_refusal` and `model_times_accepted`, with the shared
     `vouching` conformance suite (32 vectors).
-  - `GovernedVerification::key_history`: a decision checked with the key
-    valid when it was made, and the 1.5.0 decision bound.
 
 ### Changed
 
@@ -25,7 +24,7 @@
   - With the history, the grant is checked with the key valid at its time
     and judged for the present. A grant past its key's horizon is refused
     when the holder is built, and ends as `grant_expired` when it passes the
-    horizon later.
+    horizon later. `GrantHolder::with_vouching_grace` shortens its grace.
   - Revocation feeds are ordered by their signer's key sequence, then by
     `sequence`, so a feed with a forged high `sequence` signed by a
     succeeded key no longer blocks the NA's later feeds.
@@ -38,10 +37,6 @@
 
 - **Upgrade the Network Authority to 1.8.0 first** and let it re-issue its
   records (`reissue_pending: false` on its `/readyz`) before judging records
-  for the present with `now` or a key history in `GrantHolder`.
-- `VerifyRecordOptions` gains `now`, `GovernedVerification` gains
-  `key_history` and `NaKeyHistory` gains `vouching_grace_seconds`: code that
-  builds them field by field must name the new fields (`None`, `None` and
-  `SUCCESSION_VOUCHING_GRACE_SECONDS` keep the behaviour of 1.8.0), or use
-  `..Default::default()` for the first two. `verify_key_history` sets the
-  grace.
+  for the present with `verify_record_for_present` or a key history in
+  `GrantHolder`.
+- The public API is compatible with 1.8.0: no struct gains a field.

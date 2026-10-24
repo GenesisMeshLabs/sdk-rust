@@ -9,10 +9,10 @@ use genesis_mesh_sdk::{
     canonical::parse_timestamp,
     json,
     key_history::{
-        verify_key_history, NaKey, NaKeyHistory, NaKeys, SUCCESSION_HANDOVER_SECONDS,
-        SUCCESSION_VOUCHING_GRACE_SECONDS,
+        verify_key_history, vouching_grace, NaKey, NaKeyHistory, NaKeys,
+        SUCCESSION_HANDOVER_SECONDS, SUCCESSION_VOUCHING_GRACE_SECONDS,
     },
-    verify::{verify_record, VerifyRecordOptions},
+    verify::{verify_record, verify_record_for_present, VerifyRecordOptions},
     vouching::na_record_refusal,
     Value,
 };
@@ -22,17 +22,18 @@ fn suite() -> Value {
 }
 
 fn history(input: &Value) -> NaKeyHistory {
-    let history = verify_key_history(
+    verify_key_history(
         &input["genesis"],
         input["successions"].as_array().unwrap(),
         input["root_public_key"].as_str(),
     )
     .history
-    .expect("the vector's key history verifies");
-    match input["grace_seconds"].as_i64() {
-        Some(grace) => history.with_vouching_grace(grace),
-        None => history,
-    }
+    .expect("the vector's key history verifies")
+}
+
+/// The vector's grace: its `grace_seconds`, or the most.
+fn grace(input: &Value) -> i64 {
+    vouching_grace(input["grace_seconds"].as_i64())
 }
 
 fn micros(value: &Value) -> i64 {
@@ -60,12 +61,13 @@ fn every_vouching_vector_matches_the_reference() {
     for v in vectors {
         assert_eq!(v["kind"], "record_vouching", "{}", v["id"]);
         let input = &v["input"];
-        let h = history(input);
+        let (h, g) = (history(input), grace(input));
         let model = v["model"].as_str().unwrap();
         let record = &input["record"];
+        let now = Some(micros(&input["now"]));
         let got = json!({
-            "at_record_time": na_record_refusal(model, record, &h, None).unwrap(),
-            "now": na_record_refusal(model, record, &h, Some(micros(&input["now"]))).unwrap(),
+            "at_record_time": na_record_refusal(model, record, &h, None, g).unwrap(),
+            "now": na_record_refusal(model, record, &h, now, g).unwrap(),
         });
         assert_eq!(got, v["expected"], "{}: {}", v["id"], v["description"]);
     }
@@ -92,38 +94,40 @@ fn the_horizon_is_the_end_the_hand_over_and_the_grace() {
             key(2, "new", Some(succeeded), None, Some(valid_to), true),
         ],
         succession_digests: vec![],
-        vouching_grace_seconds: SUCCESSION_VOUCHING_GRACE_SECONDS,
     };
-    let short = h.with_vouching_grace(3600);
-    let horizon = succeeded + (SUCCESSION_HANDOVER_SECONDS + 3600) * 1_000_000;
-    assert_eq!(short.vouches_until("old"), Some(horizon));
-    assert!(!short.record_outlives_key("old", horizon - 1));
-    assert!(short.record_outlives_key("old", horizon));
+    let g = 3600;
+    let horizon = succeeded + (SUCCESSION_HANDOVER_SECONDS + g) * 1_000_000;
+    assert_eq!(h.vouches_until("old", g), Some(horizon));
+    assert!(!h.record_outlives_key("old", horizon - 1, g));
+    assert!(h.record_outlives_key("old", horizon, g));
     assert_eq!(
-        short.keys_vouching_at(succeeded - 1, horizon - 1),
+        h.keys_vouching_at(succeeded - 1, horizon - 1, g),
         vec!["old".to_owned()]
     );
-    assert!(short.keys_vouching_at(succeeded - 1, horizon).is_empty());
+    assert!(h.keys_vouching_at(succeeded - 1, horizon, g).is_empty());
     // The new key ends at its enforced valid_to; a key outside the history has no horizon.
     assert_eq!(
-        short.vouches_until("new"),
-        Some(valid_to + (SUCCESSION_HANDOVER_SECONDS + 3600) * 1_000_000)
+        h.vouches_until("new", g),
+        Some(valid_to + (SUCCESSION_HANDOVER_SECONDS + g) * 1_000_000)
     );
-    assert_eq!(short.vouches_until("stranger"), None);
-    // The grace only shortens, and keys valid at every time have no horizon.
+    assert_eq!(h.vouches_until("stranger", g), None);
+    // The published grace only shortens.
+    assert_eq!(vouching_grace(None), SUCCESSION_VOUCHING_GRACE_SECONDS);
+    assert_eq!(vouching_grace(Some(g)), g);
     assert_eq!(
-        short.with_vouching_grace(36_000).vouching_grace_seconds,
-        3600
+        vouching_grace(Some(10 * 86_400)),
+        SUCCESSION_VOUCHING_GRACE_SECONDS
     );
-    assert_eq!(h.with_vouching_grace(-5).vouching_grace_seconds, 0);
+    assert_eq!(vouching_grace(Some(-5)), 0);
+    // Keys valid at every time have no horizon.
     let any = NaKeys::from(vec!["old".to_owned()]);
-    assert!(!any.outlives("old", i64::MAX));
+    assert!(!any.outlives("old", i64::MAX, g));
     assert_eq!(any.key_sequence("old"), 0);
-    let history = NaKeys::from(short.clone());
-    assert!(history.outlives("old", horizon));
+    let history = NaKeys::from(h.clone());
+    assert!(history.outlives("old", horizon, g));
     assert_eq!(history.key_sequence("new"), 2);
     assert_eq!(
-        history.vouching_at(Some(succeeded - 1), horizon),
+        history.vouching_at(Some(succeeded - 1), horizon, g),
         Vec::<String>::new()
     );
 }
@@ -133,31 +137,23 @@ fn verify_record_judges_attestations_and_grants_for_the_present_with_now() {
     for slug in ["attestation", "grant"] {
         let inside = vector(&format!("{slug}-old-key-within-grace"));
         let past = vector(&format!("{slug}-old-key-after-horizon"));
-        let options = |now: &Value| VerifyRecordOptions {
+        let options = VerifyRecordOptions {
             key_history: Some(history(&inside["input"])),
-            now: Some(parse_timestamp(now.as_str().unwrap()).unwrap()),
             ..VerifyRecordOptions::default()
         };
-        let checked = verify_record(
-            slug,
-            &inside["input"]["record"],
-            &options(&inside["input"]["now"]),
-        );
+        let for_present = |v: &Value| {
+            let input = &v["input"];
+            let now = parse_timestamp(input["now"].as_str().unwrap()).unwrap();
+            verify_record_for_present(slug, &input["record"], &options, now, grace(input))
+        };
+        let checked = for_present(&inside);
         assert!(checked.verified, "{slug} inside the grace: {checked:?}");
-        let refused = verify_record(
-            slug,
-            &past["input"]["record"],
-            &options(&past["input"]["now"]),
-        );
+        let refused = for_present(&past);
         assert!(!refused.verified);
         assert_eq!(refused.reason, "outlives_key", "{slug}");
-        // At its own time (no now) it still verifies.
-        let own = VerifyRecordOptions {
-            now: None,
-            ..options(&past["input"]["now"])
-        };
+        // At its own time it still verifies.
         assert!(
-            verify_record(slug, &past["input"]["record"], &own).verified,
+            verify_record(slug, &past["input"]["record"], &options).verified,
             "{slug}"
         );
     }
@@ -221,8 +217,8 @@ mod holder {
         python_timestamp(Utc::now() + chrono::Duration::minutes(minutes))
     }
 
-    /// The old key succeeded `succeeded_minutes_ago`, with a grace of `grace` seconds.
-    fn two_keys(succeeded_minutes_ago: i64, grace: i64) -> NaKeyHistory {
+    /// The old key succeeded `succeeded_minutes_ago`.
+    fn two_keys(succeeded_minutes_ago: i64) -> NaKeyHistory {
         let succeeded =
             (Utc::now() - chrono::Duration::minutes(succeeded_minutes_ago)).timestamp_micros();
         NaKeyHistory {
@@ -249,9 +245,7 @@ mod holder {
                 },
             ],
             succession_digests: vec![],
-            vouching_grace_seconds: SUCCESSION_VOUCHING_GRACE_SECONDS,
         }
-        .with_vouching_grace(grace)
     }
 
     fn grant(issued: i64, seed: [u8; 32], key_id: &str) -> (Value, Value) {
@@ -318,19 +312,38 @@ mod holder {
 
     #[test]
     fn the_holder_refuses_a_grant_of_a_key_past_its_horizon() {
-        // Issued by the old key 15 minutes ago, before its succession 10 minutes ago.
+        // Issued by the old key 15 minutes ago, before its succession 10 minutes ago: inside the
+        // grace, held.
         let (g, t) = grant(-15, OLD_SEED, "na-1");
-        // Inside the grace (an hour): held.
-        assert!(GrantHolder::new(g.clone(), t.clone(), recorder(), two_keys(10, 3600)).is_ok());
-        // Past the horizon (the hand-over and a one-minute grace have passed): refused.
-        let refused = GrantHolder::new(g, t, recorder(), two_keys(10, 60)).unwrap_err();
+        let holder = GrantHolder::new(g, t, recorder(), two_keys(10)).unwrap();
+        let request = json!({});
+        assert!(holder
+            .check("secret.rotate", &request, None, Utc::now())
+            .is_none());
+        // With a one-minute grace, the hand-over and the grace have passed: it has ended.
+        let shorter = holder.with_vouching_grace(60);
+        let ended = shorter
+            .check("secret.rotate", &request, None, Utc::now())
+            .unwrap();
+        assert_eq!(ended.code, "grant_expired");
+        // The grace only shortens.
+        let ended = shorter
+            .with_vouching_grace(3600)
+            .check("secret.rotate", &request, None, Utc::now())
+            .unwrap();
+        assert_eq!(ended.code, "grant_expired");
+        // A key that ended more than the day's grace ago: refused when the holder is built.
+        let (g, t) = grant(-(25 * 60 + 15), OLD_SEED, "na-1");
+        let refused = GrantHolder::new(g, t, recorder(), two_keys(25 * 60 + 10)).unwrap_err();
         assert!(refused.to_string().contains("outlives_key"), "{refused}");
     }
 
     #[test]
     fn a_held_grant_ends_as_expired_once_its_key_passes_the_horizon() {
         let (g, t) = grant(-15, OLD_SEED, "na-1");
-        let holder = GrantHolder::new(g, t, recorder(), two_keys(10, 3600)).unwrap();
+        let holder = GrantHolder::new(g, t, recorder(), two_keys(10))
+            .unwrap()
+            .with_vouching_grace(3600);
         let request = json!({});
         assert!(holder
             .check("secret.rotate", &request, None, Utc::now())
@@ -347,7 +360,9 @@ mod holder {
     #[test]
     fn the_holder_orders_feeds_by_their_signers_key_then_by_sequence() {
         let (g, t) = grant(-5, NEW_SEED, "na-2");
-        let mut holder = GrantHolder::new(g, t, recorder(), two_keys(10, 3600)).unwrap();
+        let mut holder = GrantHolder::new(g, t, recorder(), two_keys(10))
+            .unwrap()
+            .with_vouching_grace(3600);
         // A feed the old key signed inside its window, with a forged high sequence.
         holder
             .set_feed(feed(1_000_000, -11, OLD_SEED, "na-1"))

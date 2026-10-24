@@ -38,9 +38,11 @@ use crate::{
     },
     grant_client::GrantClient,
     grants::{envelope_problem, grant_digest, use_digest, use_secret_problem, GrantUseInput},
-    key_history::NaKeys,
+    key_history::{NaKeys, SUCCESSION_VOUCHING_GRACE_SECONDS},
     outbox::{OutboxState, RecordFlushReport, RecordKind, RecordOutbox, RecordOutboxEntry},
-    verify::{verify_record, verify_revocation_feed, VerifyRecordOptions},
+    verify::{
+        verify_record, verify_record_for_present, verify_revocation_feed, VerifyRecordOptions,
+    },
 };
 
 /// What a holder keeps of its grant (1.6.0), to persist between runs: the
@@ -287,6 +289,8 @@ pub struct GrantHolder {
     /// The NA's keys: a list valid at every time, or (1.8.0) its key history,
     /// read at each record's time and judged for the present.
     na_keys: NaKeys,
+    /// The vouching horizon's grace (1.8.0, seconds).
+    vouching_grace_seconds: i64,
     state: GrantHolderState,
     /// Of the uses made, those the NA quarantined after they continued the
     /// chain (1.7.0): read from the record outbox's dead letters.
@@ -319,7 +323,9 @@ impl GrantHolder {
     /// valid at its time and judged for the present. A grant of a key past
     /// its vouching horizon is refused here and ends as `grant_expired` when
     /// it passes the horizon later, and a revocation feed of a later key
-    /// replaces one of an earlier key whatever their `sequence`.
+    /// replaces one of an earlier key whatever their `sequence`. The grace is
+    /// [`SUCCESSION_VOUCHING_GRACE_SECONDS`](crate::key_history::SUCCESSION_VOUCHING_GRACE_SECONDS)
+    /// unless [`GrantHolder::with_vouching_grace`] shortens it.
     pub fn new(
         grant: Value,
         time_token: Value,
@@ -367,6 +373,7 @@ impl GrantHolder {
         let holder = Self {
             recorder,
             na_keys: na_keys.into(),
+            vouching_grace_seconds: SUCCESSION_VOUCHING_GRACE_SECONDS,
             state,
             quarantined: 0,
         };
@@ -385,6 +392,18 @@ impl GrantHolder {
         Ok(holder)
     }
 
+    /// This holder with a shorter vouching horizon grace (1.8.0, seconds):
+    /// the NA's published `vouching_grace_seconds`
+    /// ([`vouching_grace`](crate::key_history::vouching_grace)) or your own.
+    /// It only shortens: a negative grace is 0, and a longer one keeps the
+    /// current grace. From then on, a grant past its key's shorter horizon
+    /// ends as `grant_expired`. The grace is not part of
+    /// [`GrantHolder::state`]: set it again after [`GrantHolder::restore`].
+    pub fn with_vouching_grace(mut self, grace_seconds: i64) -> Self {
+        self.vouching_grace_seconds = grace_seconds.clamp(0, self.vouching_grace_seconds);
+        self
+    }
+
     fn options(&self) -> VerifyRecordOptions {
         VerifyRecordOptions {
             na_public_keys: self.na_keys.all(),
@@ -396,11 +415,13 @@ impl GrantHolder {
     fn check_grant(&self, now: DateTime<Utc>) -> Result<()> {
         let grant = &self.state.grant;
         // 1.8.0: judged for the present, so a grant of a key past its vouching horizon is refused.
-        let options = VerifyRecordOptions {
-            now: Some(now),
-            ..self.options()
-        };
-        let checked = verify_record("grant", grant, &options);
+        let checked = verify_record_for_present(
+            "grant",
+            grant,
+            &self.options(),
+            now,
+            self.vouching_grace_seconds,
+        );
         if !checked.verified {
             return Err(invalid(format!(
                 "the grant does not verify: {}",
@@ -461,9 +482,11 @@ impl GrantHolder {
 
     fn check_feed(&self, feed: &Value) -> Result<()> {
         // 1.8.0: by a key valid at the feed's time and still vouching now.
-        let keys = self
-            .na_keys
-            .vouching_at(micros_of(feed, "issued_at"), Utc::now().timestamp_micros());
+        let keys = self.na_keys.vouching_at(
+            micros_of(feed, "issued_at"),
+            Utc::now().timestamp_micros(),
+            self.vouching_grace_seconds,
+        );
         if !verify_revocation_feed(feed, &keys) {
             return Err(invalid(
                 "the revocation feed does not verify under the NA's keys",
@@ -725,7 +748,7 @@ impl GrantHolder {
             let held_signer = self.feed_signer(held);
             let stale = held_signer
                 .as_deref()
-                .is_none_or(|k| self.na_keys.outlives(k, now));
+                .is_none_or(|k| self.na_keys.outlives(k, now, self.vouching_grace_seconds));
             if !stale && rank(&feed, &self.feed_signer(&feed)) < rank(held, &held_signer) {
                 return Err(invalid("the revocation feed is older than the one held"));
             }

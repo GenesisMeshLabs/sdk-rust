@@ -3443,11 +3443,6 @@ pub struct VerifyRecordOptions {
     /// `issued_at`); another record read alone is accepted under any key of
     /// the history. A key succession must be one of its successions.
     pub key_history: Option<NaKeyHistory>,
-    /// Judge an attestation or a grant for the present (1.8.0): with the
-    /// key history, one signed by a key whose vouching horizon has passed by
-    /// `now` is refused as `outlives_key`. `None`, the default: judged at its
-    /// own time only.
-    pub now: Option<DateTime<Utc>>,
 }
 
 /// The time an NA-signed record read on its own is placed at in the key
@@ -3526,10 +3521,39 @@ fn payload_model(kind: &str) -> Option<&'static str> {
 /// export's. A decision is verified by [`verify_boundary_decision`], its
 /// expiry as of its own time unless [`VerifyRecordOptions::at`] says
 /// otherwise; a policy or an attestation by its signature and fields.
+///
+/// The record is judged at its own time, as an audit judges it; see
+/// [`verify_record_for_present`] for a record about to be relied on.
 pub fn verify_record(
     kind: &str,
     record: &Value,
     options: &VerifyRecordOptions,
+) -> RecordVerification {
+    verify_record_judged(kind, record, options, None)
+}
+
+/// [`verify_record`], then judged for the present (1.8.0): with
+/// [`VerifyRecordOptions::key_history`], an attestation or a grant signed by
+/// a key whose vouching horizon has passed at `now` is refused as
+/// `outlives_key`, though it verifies at its own time. The horizon is the
+/// key's end, the 300-second hand-over and `grace_seconds`
+/// ([`vouching_grace`](crate::key_history::vouching_grace)). Without the key
+/// history, as [`verify_record`].
+pub fn verify_record_for_present(
+    kind: &str,
+    record: &Value,
+    options: &VerifyRecordOptions,
+    now: DateTime<Utc>,
+    grace_seconds: i64,
+) -> RecordVerification {
+    verify_record_judged(kind, record, options, Some((now, grace_seconds)))
+}
+
+fn verify_record_judged(
+    kind: &str,
+    record: &Value,
+    options: &VerifyRecordOptions,
+    present: Option<(DateTime<Utc>, i64)>,
 ) -> RecordVerification {
     let mut out = RecordVerification {
         kind: kind.to_owned(),
@@ -3694,8 +3718,8 @@ pub fn verify_record(
     }
     // 1.8.0: judged for the present, an attestation or a grant of a key past its vouching horizon no
     // longer vouches, though it verifies at its own time.
-    if let (true, Some(now), Some(at)) = (out.verified, options.now, at) {
-        let vouching = na.vouching_at(Some(at), now.timestamp_micros());
+    if let (true, Some((now, grace)), Some(at)) = (out.verified, present, at) {
+        let vouching = na.vouching_at(Some(at), now.timestamp_micros(), grace);
         let still = match kind {
             "attestation" => any_signed(
                 crate::canonical::attestation_canonical(record),

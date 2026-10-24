@@ -151,12 +151,6 @@ pub struct GovernedVerification {
     /// the context and the attestation are still checked. Defaults to
     /// `false`.
     pub any_bound_policies: bool,
-    /// The NA's key history (1.8.0): when given, the decision must be signed
-    /// by the key valid at its `decision_made_at`, and a key that has ended
-    /// vouches for it only while it expires within that key's end, the
-    /// hand-over and the decision lifetime (`decision_outlives_key`). Without
-    /// it, `operator_public_keys` are taken as valid at every time.
-    pub key_history: Option<crate::key_history::NaKeyHistory>,
 }
 
 /// A governed action request.
@@ -333,7 +327,7 @@ fn check_decision(decision: &Value, params: &GovernedActionParams, context_id: &
                 .then(|| params.verify.expected_policies.clone()),
             expected_attestation: params.verify.expected_attestation.clone(),
             at_record_time: false,
-            key_history: params.verify.key_history.clone(),
+            key_history: None,
         },
     );
     if !check.accepted {
@@ -851,8 +845,7 @@ where
     ) {
         return Err(GenesisMeshError::Configuration(problem));
     }
-    // 1.8.0: the key history, when given, is the keys.
-    if params.verify.operator_public_keys.is_empty() && params.verify.key_history.is_none() {
+    if params.verify.operator_public_keys.is_empty() {
         return Err(GenesisMeshError::DecisionVerification(
             "verification_keys_required".into(),
         ));

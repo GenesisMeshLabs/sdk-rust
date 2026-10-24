@@ -92,13 +92,15 @@ pub fn model_times_accepted(model: &str, record: &Value) -> bool {
 /// `na_key_not_valid_at_time`, `invalid_signature`, `record_malformed`
 /// (signed, but refused by its kind's time rules, such as a grant that starts
 /// more than 24 hours after its issue), `outlives_key` (only with `now`,
-/// microseconds). `None` too for a model the horizon does not apply to is not
+/// microseconds; its horizon with `grace_seconds`, from
+/// [`vouching_grace`](crate::key_history::vouching_grace)). `None` too for a model the horizon does not apply to is not
 /// possible: such a model is `Err`.
 pub fn na_record_refusal(
     model: &str,
     record: &Value,
     history: &NaKeyHistory,
     now: Option<i64>,
+    grace_seconds: i64,
 ) -> Result<Option<&'static str>, String> {
     let Some((_, field)) = NA_VOUCHING_TIME_FIELDS.iter().find(|(m, _)| *m == model) else {
         return Err(format!(
@@ -133,7 +135,7 @@ pub fn na_record_refusal(
     if !model_times_accepted(model, record) {
         return Ok(Some("record_malformed"));
     }
-    if now.is_some_and(|now| history.record_outlives_key(&signer, now)) {
+    if now.is_some_and(|now| history.record_outlives_key(&signer, now, grace_seconds)) {
         return Ok(Some("outlives_key"));
     }
     Ok(None)
