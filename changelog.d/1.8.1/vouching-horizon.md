@@ -33,12 +33,15 @@
   requires since 1.8.0. The grant checks refuse a `valid_from` earlier than
   `issued_at` minus the 5-minute clock skew, or more than 24 hours and the
   skew after it. The NA never issued one outside that window.
-- **`NaKeyHistory` has a new public field, `vouching_grace_seconds`**
-  (beta: a struct literal must set it; `verify_key_history` sets the
-  default).
 
 ### Upgrading
 
 - **Upgrade the Network Authority to 1.8.0 first** and let it re-issue its
   records (`reissue_pending: false` on its `/readyz`) before judging records
   for the present with `now` or a key history in `GrantHolder`.
+- `VerifyRecordOptions` gains `now`, `GovernedVerification` gains
+  `key_history` and `NaKeyHistory` gains `vouching_grace_seconds`: code that
+  builds them field by field must name the new fields (`None`, `None` and
+  `SUCCESSION_VOUCHING_GRACE_SECONDS` keep the behaviour of 1.8.0), or use
+  `..Default::default()` for the first two. `verify_key_history` sets the
+  grace.

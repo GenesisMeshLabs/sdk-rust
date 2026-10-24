@@ -5,19 +5,16 @@
 //! then the horizon helpers, `verify_record` judged now and the grant holder
 //! given the NA's key history.
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use chrono::Utc;
 use genesis_mesh_sdk::{
-    canonical::{parse_timestamp, python_timestamp, received_canonical},
+    canonical::parse_timestamp,
     json,
     key_history::{
         verify_key_history, NaKey, NaKeyHistory, NaKeys, SUCCESSION_HANDOVER_SECONDS,
         SUCCESSION_VOUCHING_GRACE_SECONDS,
     },
-    load_signing_key, public_key_from_seed, sign_canonical,
     verify::{verify_record, VerifyRecordOptions},
     vouching::na_record_refusal,
-    ExecutionRecorder, GrantHolder, Value,
+    Value,
 };
 
 fn suite() -> Value {
@@ -186,180 +183,191 @@ fn a_grant_that_starts_more_than_24_hours_after_its_issue_is_refused() {
 
 // ── The grant holder, given the NA's key history ─────────────────────────────
 
-const OLD_SEED: [u8; 32] = [3; 32];
-const NEW_SEED: [u8; 32] = [9; 32];
-const BEARER_SEED: [u8; 32] = [5; 32];
+#[cfg(feature = "client")]
+mod holder {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use chrono::Utc;
+    use genesis_mesh_sdk::{
+        canonical::{python_timestamp, received_canonical},
+        load_signing_key, public_key_from_seed, sign_canonical, ExecutionRecorder, GrantHolder,
+    };
 
-fn key_of(seed: [u8; 32]) -> String {
-    public_key_from_seed(&STANDARD.encode(seed)).unwrap()
-}
+    const OLD_SEED: [u8; 32] = [3; 32];
+    const NEW_SEED: [u8; 32] = [9; 32];
+    const BEARER_SEED: [u8; 32] = [5; 32];
 
-fn recorder() -> ExecutionRecorder {
-    ExecutionRecorder::new("device-b", "executor-b", &STANDARD.encode(BEARER_SEED)).unwrap()
-}
-
-fn signed(model: &str, mut record: Value, seed: [u8; 32], key_id: &str) -> Value {
-    let canonical = received_canonical(model, &record).unwrap();
-    let key = load_signing_key(&STANDARD.encode(seed)).unwrap();
-    let signature = sign_canonical(&canonical, key_id, &key);
-    if model == "SovereignRevocationFeed" {
-        record["signatures"] = json!([signature]);
-    } else {
-        record["signature"] = signature;
+    fn key_of(seed: [u8; 32]) -> String {
+        public_key_from_seed(&STANDARD.encode(seed)).unwrap()
     }
-    record
-}
 
-fn at(minutes: i64) -> String {
-    python_timestamp(Utc::now() + chrono::Duration::minutes(minutes))
-}
-
-/// The old key succeeded `succeeded_minutes_ago`, with a grace of `grace` seconds.
-fn two_keys(succeeded_minutes_ago: i64, grace: i64) -> NaKeyHistory {
-    let succeeded =
-        (Utc::now() - chrono::Duration::minutes(succeeded_minutes_ago)).timestamp_micros();
-    NaKeyHistory {
-        sovereign_id: "sovereign-c".into(),
-        root_public_key: None,
-        keys: vec![
-            NaKey {
-                key_sequence: 1,
-                public_key: key_of(OLD_SEED),
-                key_id: Some("na-1".into()),
-                valid_from: None,
-                succeeded_at: Some(succeeded),
-                valid_to: None,
-                valid_to_enforced: false,
-            },
-            NaKey {
-                key_sequence: 2,
-                public_key: key_of(NEW_SEED),
-                key_id: Some("na-2".into()),
-                valid_from: Some(succeeded),
-                succeeded_at: None,
-                valid_to: Some(succeeded + 365 * 86_400_000_000),
-                valid_to_enforced: true,
-            },
-        ],
-        succession_digests: vec![],
-        vouching_grace_seconds: SUCCESSION_VOUCHING_GRACE_SECONDS,
+    fn recorder() -> ExecutionRecorder {
+        ExecutionRecorder::new("device-b", "executor-b", &STANDARD.encode(BEARER_SEED)).unwrap()
     }
-    .with_vouching_grace(grace)
-}
 
-fn grant(issued: i64, seed: [u8; 32], key_id: &str) -> (Value, Value) {
-    let grant = signed(
-        "CapabilityGrant",
-        json!({
-            "grant_id": "00000000-0000-4000-8000-000000000010",
-            "bearer_key_id": "executor-b",
-            "bearer_public_key": recorder().public_key(),
-            "bearer_sovereign_id": "device-b",
-            "capabilities": ["secret.rotate"],
-            "basis_kind": "attestation",
-            "basis_id": "00000000-0000-4000-8000-000000000001",
-            "basis_digest": "e".repeat(64),
-            "requester_sovereign_id": "vendor-acme",
-            "provider_sovereign_id": "sovereign-c",
-            "valid_from": at(issued),
-            "valid_until": at(issued + 20 * 60),
-            "max_uses": 3,
-            "max_uses_per_time_token": 2,
-            "parameter_envelope": {},
-            "basis_checks": [],
-            "policy_binding": {"policies": [], "policy_set_digest": "p", "gate_outcomes": [],
-                               "registry_gate_types": []},
-            "issued_at": at(issued),
-            "issuer_sovereign_id": "sovereign-c",
-            "issued_by": key_id,
-        }),
-        seed,
-        key_id,
-    );
-    let token = signed(
-        "TimeToken",
-        json!({
-            "time_token_id": "00000000-0000-4000-8000-000000000030",
-            "grant_id": "00000000-0000-4000-8000-000000000010",
-            "use_sequence": 0,
-            "issued_at": at(issued),
-            "issuer_sovereign_id": "sovereign-c",
-            "issued_by": key_id,
-        }),
-        seed,
-        key_id,
-    );
-    (grant, token)
-}
+    fn signed(model: &str, mut record: Value, seed: [u8; 32], key_id: &str) -> Value {
+        let canonical = received_canonical(model, &record).unwrap();
+        let key = load_signing_key(&STANDARD.encode(seed)).unwrap();
+        let signature = sign_canonical(&canonical, key_id, &key);
+        if model == "SovereignRevocationFeed" {
+            record["signatures"] = json!([signature]);
+        } else {
+            record["signature"] = signature;
+        }
+        record
+    }
 
-fn feed(sequence: u64, issued: i64, seed: [u8; 32], key_id: &str) -> Value {
-    signed(
-        "SovereignRevocationFeed",
-        json!({
-            "feed_id": format!("feed-{key_id}-{sequence}"),
-            "issuer_sovereign_id": "sovereign-c",
-            "sequence": sequence,
-            "issued_at": at(issued),
-            "revoked_attestation_ids": [],
-            "revocation_reasons": {},
-            "issued_by": key_id,
-        }),
-        seed,
-        key_id,
-    )
-}
+    fn at(minutes: i64) -> String {
+        python_timestamp(Utc::now() + chrono::Duration::minutes(minutes))
+    }
 
-#[test]
-fn the_holder_refuses_a_grant_of_a_key_past_its_horizon() {
-    // Issued by the old key 15 minutes ago, before its succession 10 minutes ago.
-    let (g, t) = grant(-15, OLD_SEED, "na-1");
-    // Inside the grace (an hour): held.
-    assert!(GrantHolder::new(g.clone(), t.clone(), recorder(), two_keys(10, 3600)).is_ok());
-    // Past the horizon (the hand-over and a one-minute grace have passed): refused.
-    let refused = GrantHolder::new(g, t, recorder(), two_keys(10, 60)).unwrap_err();
-    assert!(refused.to_string().contains("outlives_key"), "{refused}");
-}
+    /// The old key succeeded `succeeded_minutes_ago`, with a grace of `grace` seconds.
+    fn two_keys(succeeded_minutes_ago: i64, grace: i64) -> NaKeyHistory {
+        let succeeded =
+            (Utc::now() - chrono::Duration::minutes(succeeded_minutes_ago)).timestamp_micros();
+        NaKeyHistory {
+            sovereign_id: "sovereign-c".into(),
+            root_public_key: None,
+            keys: vec![
+                NaKey {
+                    key_sequence: 1,
+                    public_key: key_of(OLD_SEED),
+                    key_id: Some("na-1".into()),
+                    valid_from: None,
+                    succeeded_at: Some(succeeded),
+                    valid_to: None,
+                    valid_to_enforced: false,
+                },
+                NaKey {
+                    key_sequence: 2,
+                    public_key: key_of(NEW_SEED),
+                    key_id: Some("na-2".into()),
+                    valid_from: Some(succeeded),
+                    succeeded_at: None,
+                    valid_to: Some(succeeded + 365 * 86_400_000_000),
+                    valid_to_enforced: true,
+                },
+            ],
+            succession_digests: vec![],
+            vouching_grace_seconds: SUCCESSION_VOUCHING_GRACE_SECONDS,
+        }
+        .with_vouching_grace(grace)
+    }
 
-#[test]
-fn a_held_grant_ends_as_expired_once_its_key_passes_the_horizon() {
-    let (g, t) = grant(-15, OLD_SEED, "na-1");
-    let holder = GrantHolder::new(g, t, recorder(), two_keys(10, 3600)).unwrap();
-    let request = json!({});
-    assert!(holder
-        .check("secret.rotate", &request, None, Utc::now())
-        .is_none());
-    // Fifty minutes from now the hand-over and the hour's grace have passed; the grant itself
-    // (valid for 20 hours) has not ended.
-    let later = Utc::now() + chrono::Duration::minutes(56);
-    let ended = holder
-        .check("secret.rotate", &request, None, later)
-        .unwrap();
-    assert_eq!(ended.code, "grant_expired");
-}
+    fn grant(issued: i64, seed: [u8; 32], key_id: &str) -> (Value, Value) {
+        let grant = signed(
+            "CapabilityGrant",
+            json!({
+                "grant_id": "00000000-0000-4000-8000-000000000010",
+                "bearer_key_id": "executor-b",
+                "bearer_public_key": recorder().public_key(),
+                "bearer_sovereign_id": "device-b",
+                "capabilities": ["secret.rotate"],
+                "basis_kind": "attestation",
+                "basis_id": "00000000-0000-4000-8000-000000000001",
+                "basis_digest": "e".repeat(64),
+                "requester_sovereign_id": "vendor-acme",
+                "provider_sovereign_id": "sovereign-c",
+                "valid_from": at(issued),
+                "valid_until": at(issued + 20 * 60),
+                "max_uses": 3,
+                "max_uses_per_time_token": 2,
+                "parameter_envelope": {},
+                "basis_checks": [],
+                "policy_binding": {"policies": [], "policy_set_digest": "p", "gate_outcomes": [],
+                                   "registry_gate_types": []},
+                "issued_at": at(issued),
+                "issuer_sovereign_id": "sovereign-c",
+                "issued_by": key_id,
+            }),
+            seed,
+            key_id,
+        );
+        let token = signed(
+            "TimeToken",
+            json!({
+                "time_token_id": "00000000-0000-4000-8000-000000000030",
+                "grant_id": "00000000-0000-4000-8000-000000000010",
+                "use_sequence": 0,
+                "issued_at": at(issued),
+                "issuer_sovereign_id": "sovereign-c",
+                "issued_by": key_id,
+            }),
+            seed,
+            key_id,
+        );
+        (grant, token)
+    }
 
-#[test]
-fn the_holder_orders_feeds_by_their_signers_key_then_by_sequence() {
-    let (g, t) = grant(-5, NEW_SEED, "na-2");
-    let mut holder = GrantHolder::new(g, t, recorder(), two_keys(10, 3600)).unwrap();
-    // A feed the old key signed inside its window, with a forged high sequence.
-    holder
-        .set_feed(feed(1_000_000, -11, OLD_SEED, "na-1"))
-        .unwrap();
-    // The new key's feed replaces it although its sequence is lower...
-    holder.set_feed(feed(12, -4, NEW_SEED, "na-2")).unwrap();
-    assert_eq!(holder.state().feed.as_ref().unwrap()["sequence"], 12);
-    // ...and an old-key feed no longer replaces a new-key one, whatever its sequence.
-    assert!(holder
-        .set_feed(feed(2_000_000, -12, OLD_SEED, "na-1"))
-        .is_err());
-    // Within one key, a lower sequence never replaces a higher one.
-    assert!(holder.set_feed(feed(11, -3, NEW_SEED, "na-2")).is_err());
-    holder.set_feed(feed(13, -2, NEW_SEED, "na-2")).unwrap();
-    // Keys valid at every time keep the old order, by sequence alone.
-    let (g, t) = grant(-5, NEW_SEED, "na-2");
-    let mut flat =
-        GrantHolder::new(g, t, recorder(), vec![key_of(OLD_SEED), key_of(NEW_SEED)]).unwrap();
-    flat.set_feed(feed(1_000_000, -11, OLD_SEED, "na-1"))
-        .unwrap();
-    assert!(flat.set_feed(feed(12, -4, NEW_SEED, "na-2")).is_err());
+    fn feed(sequence: u64, issued: i64, seed: [u8; 32], key_id: &str) -> Value {
+        signed(
+            "SovereignRevocationFeed",
+            json!({
+                "feed_id": format!("feed-{key_id}-{sequence}"),
+                "issuer_sovereign_id": "sovereign-c",
+                "sequence": sequence,
+                "issued_at": at(issued),
+                "revoked_attestation_ids": [],
+                "revocation_reasons": {},
+                "issued_by": key_id,
+            }),
+            seed,
+            key_id,
+        )
+    }
+
+    #[test]
+    fn the_holder_refuses_a_grant_of_a_key_past_its_horizon() {
+        // Issued by the old key 15 minutes ago, before its succession 10 minutes ago.
+        let (g, t) = grant(-15, OLD_SEED, "na-1");
+        // Inside the grace (an hour): held.
+        assert!(GrantHolder::new(g.clone(), t.clone(), recorder(), two_keys(10, 3600)).is_ok());
+        // Past the horizon (the hand-over and a one-minute grace have passed): refused.
+        let refused = GrantHolder::new(g, t, recorder(), two_keys(10, 60)).unwrap_err();
+        assert!(refused.to_string().contains("outlives_key"), "{refused}");
+    }
+
+    #[test]
+    fn a_held_grant_ends_as_expired_once_its_key_passes_the_horizon() {
+        let (g, t) = grant(-15, OLD_SEED, "na-1");
+        let holder = GrantHolder::new(g, t, recorder(), two_keys(10, 3600)).unwrap();
+        let request = json!({});
+        assert!(holder
+            .check("secret.rotate", &request, None, Utc::now())
+            .is_none());
+        // Fifty minutes from now the hand-over and the hour's grace have passed; the grant itself
+        // (valid for 20 hours) has not ended.
+        let later = Utc::now() + chrono::Duration::minutes(56);
+        let ended = holder
+            .check("secret.rotate", &request, None, later)
+            .unwrap();
+        assert_eq!(ended.code, "grant_expired");
+    }
+
+    #[test]
+    fn the_holder_orders_feeds_by_their_signers_key_then_by_sequence() {
+        let (g, t) = grant(-5, NEW_SEED, "na-2");
+        let mut holder = GrantHolder::new(g, t, recorder(), two_keys(10, 3600)).unwrap();
+        // A feed the old key signed inside its window, with a forged high sequence.
+        holder
+            .set_feed(feed(1_000_000, -11, OLD_SEED, "na-1"))
+            .unwrap();
+        // The new key's feed replaces it although its sequence is lower...
+        holder.set_feed(feed(12, -4, NEW_SEED, "na-2")).unwrap();
+        assert_eq!(holder.state().feed.as_ref().unwrap()["sequence"], 12);
+        // ...and an old-key feed no longer replaces a new-key one, whatever its sequence.
+        assert!(holder
+            .set_feed(feed(2_000_000, -12, OLD_SEED, "na-1"))
+            .is_err());
+        // Within one key, a lower sequence never replaces a higher one.
+        assert!(holder.set_feed(feed(11, -3, NEW_SEED, "na-2")).is_err());
+        holder.set_feed(feed(13, -2, NEW_SEED, "na-2")).unwrap();
+        // Keys valid at every time keep the old order, by sequence alone.
+        let (g, t) = grant(-5, NEW_SEED, "na-2");
+        let mut flat =
+            GrantHolder::new(g, t, recorder(), vec![key_of(OLD_SEED), key_of(NEW_SEED)]).unwrap();
+        flat.set_feed(feed(1_000_000, -11, OLD_SEED, "na-1"))
+            .unwrap();
+        assert!(flat.set_feed(feed(12, -4, NEW_SEED, "na-2")).is_err());
+    }
 }
