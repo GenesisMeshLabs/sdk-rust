@@ -317,7 +317,7 @@ before the operator revokes.
 | Activity | When |
 |---|---|
 | Heartbeat | Every `heartbeat_interval_seconds`, with the agent's version, snapshot age, pending uploads and dead letters; also with a certificate the device's clock takes as expired: while the NA accepts it, the agent stays `active` (the clock is ahead, the NA decides) |
-| Renewal | When the certificate expires within `renew_before_seconds`, and again at every heartbeat once it has expired; the new certificate is saved before it is used |
+| Renewal | When the certificate expires within `renew_before_seconds`, and again at every heartbeat once it has expired; the new certificate is saved before it is used. Also once a key succession has taken effect, for a certificate the succeeded key signed (1.8.1): each agent at its own share of the 10 minutes after the succession, and within half the grace |
 | Sync | Every `sync_interval_seconds` while connected and at once on reconnecting; every `retry_interval_seconds`, doubling up to 60, while not |
 | Stop | On SIGTERM it takes no new authorization (queued ones are refused, never decided), waits up to 10 s for an open one, records it as not reported, and exits 0 |
 
@@ -336,6 +336,16 @@ reconnecting; a decision uploads a few pages first, so its evidence follows
 the records before it. The agent moves to `revoked` when the CRL lists its
 certificate, the NA refuses it as revoked (`certificate_revoked`,
 `edge_node_retired`), or `/node/state` shows its executor key retired.
+
+**Across a key succession** (1.8.1), what the agent relies on must be
+signed by an NA key valid at the record's own time that still vouches now:
+the CRL and each attestation are refused once their key's vouching horizon
+has passed (its end, the 300-second hand-over and the grace, which the NA's
+`vouching_grace_seconds` may only shorten). Grant holders get the key
+history: a grant past its key's horizon ends as `grant_expired`, and a
+revocation feed of a later key replaces one of an earlier key. A sync that
+brings a new succession, or a new grace, rebuilds every holder with the
+NA's keys, so time tokens and feeds the new key signs are accepted.
 
 The **snapshot** is fresh while `now − min(synced_at, feed.issued_at)` is at
 most `max_snapshot_age_seconds`. A stale snapshot stops all grant use. The
