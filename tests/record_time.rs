@@ -8,6 +8,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{Duration, Utc};
 use genesis_mesh_sdk::{
+    audit_pack::received_signature_reason,
     canonical::{anchor_canonical, attestation_canonical, policy_canonical, python_timestamp},
     json,
     key_history::{NaKey, NaKeyHistory, NaKeys},
@@ -222,6 +223,23 @@ fn at_record_gives_an_undated_record_no_key_of_a_history() {
     let any = NaKeys::Any(vec![key_of(OLD_SEED)]);
     assert_eq!(any.at_record(None), vec![key_of(OLD_SEED)]);
     assert_eq!(any.vouching_at(None, now, 0), vec![key_of(OLD_SEED)]);
+}
+
+#[test]
+fn an_audit_pack_record_without_its_time_has_an_invalid_signature() {
+    let keys = NaKeys::History(history());
+    let record = attestation(json!(null), OLD_SEED, "na-1");
+    assert_eq!(
+        received_signature_reason("MembershipAttestation", &record, &keys, None),
+        Some("invalid_signature")
+    );
+    // Dated after the succession it is the other key's, named as such.
+    let late = attestation(days_ago(1), OLD_SEED, "na-1");
+    let at = Utc::now().timestamp_micros() - 86_400_000_000;
+    assert_eq!(
+        received_signature_reason("MembershipAttestation", &late, &keys, Some(at)),
+        Some("na_key_not_valid_at_time")
+    );
 }
 
 #[test]
