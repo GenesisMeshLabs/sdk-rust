@@ -428,7 +428,8 @@ fn form_refusal(model: &str, raw: &Value) -> Option<&'static str> {
 /// `non_canonical_form` for a record its signer signed in another form,
 /// `na_key_not_valid_at_time` for one signed by another key of the history,
 /// `invalid_signature` otherwise (the reference's
-/// `received_signature_reason`).
+/// `received_signature_reason`). A record without its time (`at` `None`) is
+/// signed by no key of a history: `invalid_signature` (1.9.1).
 pub fn received_signature_reason(
     model: &str,
     raw: &Value,
@@ -438,15 +439,18 @@ pub fn received_signature_reason(
     if !raw.is_object() {
         return Some("invalid_signature");
     }
-    let valid = keys.at(at);
+    let valid = keys.at_record(at);
     if signed_as_received(model, raw, &valid) {
         return form_refusal(model, raw);
     }
-    let others: Vec<String> = keys
-        .all()
-        .into_iter()
-        .filter(|k| !valid.contains(k))
-        .collect();
+    let others: Vec<String> = match at {
+        Some(_) => keys
+            .all()
+            .into_iter()
+            .filter(|k| !valid.contains(k))
+            .collect(),
+        None => Vec::new(),
+    };
     if !others.is_empty() && signed_as_received(model, raw, &others) {
         return Some("na_key_not_valid_at_time");
     }

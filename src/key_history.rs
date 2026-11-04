@@ -672,6 +672,19 @@ impl NaKeys {
         }
     }
 
+    /// The keys a record whose own time is `at` may be signed with (1.9.1):
+    /// as [`NaKeys::at`], but a record without its time (`None`: absent,
+    /// null or unreadable) is dated nowhere, so no key of a history signs
+    /// it, as the reference judges it (its models require the time). Taking
+    /// every key let a succeeded key sign an undated record that verified
+    /// forever. Keys valid at every time still sign it.
+    pub fn at_record(&self, at: Option<i64>) -> Vec<String> {
+        match (self, at) {
+            (NaKeys::History(_), None) => Vec::new(),
+            _ => self.at(at),
+        }
+    }
+
     /// Every key.
     pub fn all(&self) -> Vec<String> {
         self.at(None)
@@ -696,11 +709,11 @@ impl NaKeys {
     }
 
     /// The keys a record dated `at` may be signed with and that still vouch
-    /// at `now` (1.8.0, microseconds): [`NaKeys::at`] without the keys of
-    /// the history whose horizon has passed. Keys valid at every time have no
-    /// horizon.
+    /// at `now` (1.8.0, microseconds): [`NaKeys::at_record`] without the keys
+    /// of the history whose horizon has passed (1.9.1: an undated record gets
+    /// no key of a history). Keys valid at every time have no horizon.
     pub fn vouching_at(&self, at: Option<i64>, now: i64, grace_seconds: i64) -> Vec<String> {
-        self.at(at)
+        self.at_record(at)
             .into_iter()
             .filter(|k| !self.outlives(k, now, grace_seconds))
             .collect()
