@@ -438,7 +438,7 @@ pub fn received_signature_reason(
     if !raw.is_object() {
         return Some("invalid_signature");
     }
-    let valid = keys.at(at);
+    let valid = keys.at_record(at);
     if signed_as_received(model, raw, &valid) {
         return form_refusal(model, raw);
     }

@@ -2881,7 +2881,8 @@ pub fn verify_evidence_events<'a>(
                     chains.admitted.entry(grant_id.to_owned()).or_insert(0);
                 }
                 let token = &payload["time_token"];
-                let token_keys = na.at(str_field(token, "issued_at").and_then(|t| micros(t).ok()));
+                let token_keys =
+                    na.at_record(str_field(token, "issued_at").and_then(|t| micros(t).ok()));
                 if chained {
                     let token_sequence = token["use_sequence"].as_u64().unwrap_or_default();
                     let named = chains
@@ -3569,7 +3570,7 @@ fn verify_record_judged(
         None => NaKeys::Any(options.na_public_keys.clone()),
     };
     let at = own_time(kind, record);
-    let keys = &na.at(at);
+    let keys = &na.at_record(at);
     let other = at.map(|at| na.not_at(at)).unwrap_or_default();
     match kind {
         "decision" => {
@@ -3703,7 +3704,7 @@ fn verify_record_judged(
                 "grant_execution" => {
                     let token = &payload["time_token"];
                     let issued = str_field(token, "issued_at").and_then(|t| micros(t).ok());
-                    let token_keys = na.at(issued);
+                    let token_keys = na.at_record(issued);
                     let context = UseContext {
                         token_keys: &token_keys,
                         ..UseContext::default()
@@ -3907,7 +3908,7 @@ pub fn verify_store_anchors(
             let signed = |keys: &[String]| {
                 signed_by(anchor_canonical(anchor), anchor.get("signature"), keys)
             };
-            if !signed(&keys.at(at(anchor))) {
+            if !signed(&keys.at_record(at(anchor))) {
                 let late = at(anchor).is_some_and(|at| signed(&keys.not_at(at)));
                 let reason = if late {
                     "na_key_not_valid_at_time"

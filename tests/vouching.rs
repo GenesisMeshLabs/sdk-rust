@@ -385,4 +385,33 @@ mod holder {
             .unwrap();
         assert!(flat.set_feed(feed(12, -4, NEW_SEED, "na-2")).is_err());
     }
+
+    #[test]
+    fn an_undated_feed_is_signed_by_no_key_of_the_history() {
+        let (g, t) = grant(-5, NEW_SEED, "na-2");
+        let mut holder = GrantHolder::new(g, t, recorder(), two_keys(10))
+            .unwrap()
+            .with_vouching_grace(3600);
+        holder.set_feed(feed(12, -4, NEW_SEED, "na-2")).unwrap();
+        // A feed without its time, by the old key inside its grace or by the new key, is refused
+        // with its forged high sequence, and the holder keeps its feed.
+        for (seed, key_id) in [(OLD_SEED, "na-1"), (NEW_SEED, "na-2")] {
+            let undated = signed(
+                "SovereignRevocationFeed",
+                json!({
+                    "feed_id": format!("feed-{key_id}-undated"),
+                    "issuer_sovereign_id": "sovereign-c",
+                    "sequence": 2_000_000,
+                    "issued_at": null,
+                    "revoked_attestation_ids": [],
+                    "revocation_reasons": {},
+                    "issued_by": key_id,
+                }),
+                seed,
+                key_id,
+            );
+            assert!(holder.set_feed(undated).is_err(), "{key_id}");
+            assert_eq!(holder.state().feed.as_ref().unwrap()["sequence"], 12);
+        }
+    }
 }

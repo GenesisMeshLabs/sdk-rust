@@ -475,7 +475,7 @@ impl GrantHolder {
     /// `issued_at` (1.8.0).
     fn feed_signer(&self, feed: &Value) -> Option<String> {
         self.na_keys
-            .at(micros_of(feed, "issued_at"))
+            .at_record(micros_of(feed, "issued_at"))
             .into_iter()
             .find(|k| verify_revocation_feed(feed, std::slice::from_ref(k)))
     }
