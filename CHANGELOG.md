@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.9.0 - 2026-11-04
+
+### Changed
+
+- Released with Genesis Mesh 1.9.0. Nothing changes in this SDK, the verifier or the edge agent.
+
 ## 1.8.1 - 2026-10-24
 
 ### Added
