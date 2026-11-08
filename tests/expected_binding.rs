@@ -1,5 +1,6 @@
 //! 1.9.2: `verify_boundary_decision_expecting` checks an expected attestation
-//! ID or subject ID without the attestation itself.
+//! ID or subject ID without the attestation itself; 1.10.0 adds the operator
+//! key that asked (`requester_key_id`).
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::SigningKey;
@@ -17,6 +18,16 @@ fn vectors() -> Value {
 /// The reference's allowed or denied decision, re-signed now with a test NA
 /// key (the vectors' decisions expire within minutes of generation).
 fn decision(allowed: bool, with_binding: bool) -> (Value, VerifyDecisionOptions) {
+    decision_asked_by(allowed, with_binding, None)
+}
+
+/// As [`decision`], with the binding naming `requester` as the operator key
+/// that asked (1.10.0) before it is signed.
+fn decision_asked_by(
+    allowed: bool,
+    with_binding: bool,
+    requester: Option<&str>,
+) -> (Value, VerifyDecisionOptions) {
     let na = SigningKey::from_bytes(&[7; 32]);
     let mut decision = vectors()[if allowed { "allowed" } else { "denied" }]["decision"].clone();
     if !with_binding {
@@ -24,6 +35,8 @@ fn decision(allowed: bool, with_binding: bool) -> (Value, VerifyDecisionOptions)
             .as_object_mut()
             .unwrap()
             .remove("attestation_binding");
+    } else if let Some(requester) = requester {
+        decision["attestation_binding"]["requester_key_id"] = json!(requester);
     }
     let now = chrono::Utc::now();
     decision["decision_made_at"] = json!(python_timestamp(now));
@@ -140,4 +153,66 @@ fn an_earlier_refusal_wins() {
         &ExpectedBinding::new().subject_id("vendor-other"),
     );
     assert_eq!(r.reason, "invalid_signature");
+}
+
+#[test]
+fn an_expected_requester_passes_only_for_the_key_that_asked() {
+    let (decision, options) = decision_asked_by(true, true, Some("b-ops"));
+    let cases = [
+        (ExpectedBinding::new(), true, "authorized"),
+        (
+            ExpectedBinding::new().requester_key_id("b-ops"),
+            true,
+            "authorized",
+        ),
+        (
+            ExpectedBinding::new().requester_key_id("c-ops"),
+            false,
+            "attestation_binding_mismatch",
+        ),
+        (
+            ExpectedBinding::new()
+                .subject_id(bound("subject_id"))
+                .requester_key_id("c-ops"),
+            false,
+            "attestation_binding_mismatch",
+        ),
+    ];
+    for (expected, accepted, reason) in cases {
+        let r = verify_boundary_decision_expecting(&decision, &options, &expected);
+        assert_eq!(
+            (r.accepted, r.reason.as_str()),
+            (accepted, reason),
+            "{expected:?}"
+        );
+    }
+}
+
+#[test]
+fn the_requester_is_under_the_signature() {
+    let (mut decision, options) = decision_asked_by(true, true, Some("b-ops"));
+    decision["attestation_binding"]["requester_key_id"] = json!("c-ops");
+    let r = verify_boundary_decision_expecting(&decision, &options, &ExpectedBinding::new());
+    assert_eq!(r.reason, "invalid_signature");
+}
+
+#[test]
+fn a_decision_without_a_requester_fails_only_when_one_is_expected() {
+    for with_binding in [true, false] {
+        let (decision, options) = decision(true, with_binding);
+        assert!(
+            verify_boundary_decision_expecting(&decision, &options, &ExpectedBinding::new())
+                .accepted
+        );
+        let r = verify_boundary_decision_expecting(
+            &decision,
+            &options,
+            &ExpectedBinding::new().requester_key_id("b-ops"),
+        );
+        assert_eq!(
+            (r.accepted, r.reason.as_str()),
+            (false, "attestation_binding_missing"),
+            "with_binding={with_binding}"
+        );
+    }
 }
