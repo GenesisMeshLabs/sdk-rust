@@ -1131,6 +1131,83 @@ pub struct DecisionVerification {
     pub authorized: bool,
 }
 
+/// What a decision's attestation binding must name (1.9.2), for a relying
+/// party that knows which attestation or subject it expects but does not hold
+/// the attestation. Build it with [`ExpectedBinding::new`] and its setters;
+/// later releases may add expectations, so it cannot be built as a literal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExpectedBinding {
+    /// The attestation ID the binding must name.
+    pub attestation_id: Option<String>,
+    /// The subject ID the binding must name.
+    pub subject_id: Option<String>,
+}
+
+impl ExpectedBinding {
+    /// No expectation: [`verify_boundary_decision_expecting`] then answers as
+    /// [`verify_boundary_decision`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The binding must name this attestation ID.
+    #[must_use]
+    pub fn attestation_id(mut self, attestation_id: impl Into<String>) -> Self {
+        self.attestation_id = Some(attestation_id.into());
+        self
+    }
+
+    /// The binding must name this subject ID.
+    #[must_use]
+    pub fn subject_id(mut self, subject_id: impl Into<String>) -> Self {
+        self.subject_id = Some(subject_id.into());
+        self
+    }
+}
+
+/// [`verify_boundary_decision`], and then the decision's signed
+/// `attestation_binding` must name the attestation and subject `expected`
+/// gives (1.9.2; the reference's `expected_attestation_id` and
+/// `expected_subject_id`). Another attestation or subject is
+/// `attestation_binding_mismatch`, a decision without an attestation binding
+/// `attestation_binding_missing`. From 1.9.2 the Network Authority makes
+/// attestation-basis decisions only for the attestation's subject.
+pub fn verify_boundary_decision_expecting(
+    decision: &Value,
+    options: &VerifyDecisionOptions,
+    expected: &ExpectedBinding,
+) -> DecisionVerification {
+    let verdict = verify_boundary_decision(decision, options);
+    if !verdict.accepted || (expected.attestation_id.is_none() && expected.subject_id.is_none()) {
+        return verdict;
+    }
+    let authorized = decision.get("authorized").and_then(Value::as_bool) == Some(true);
+    let reject = |reason: &str| DecisionVerification {
+        accepted: false,
+        reason: reason.to_owned(),
+        authorized,
+        ..verdict.clone()
+    };
+    let Some(binding) = decision
+        .get("attestation_binding")
+        .filter(|b| b.is_object())
+    else {
+        return reject("attestation_binding_missing");
+    };
+    let names = |field: &str, want: &Option<String>| {
+        want.as_deref()
+            .is_none_or(|want| str_field(binding, field) == Some(want))
+    };
+    if names("attestation_id", &expected.attestation_id)
+        && names("subject_id", &expected.subject_id)
+    {
+        verdict
+    } else {
+        reject("attestation_binding_mismatch")
+    }
+}
+
 /// Verify a decision's signature, expiry and bindings offline.
 pub fn verify_boundary_decision(
     decision: &Value,

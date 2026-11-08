@@ -176,6 +176,26 @@ deep (`MetadataRefused`). `verify::verify_evidence_events` checks an export
 offline with the same reason codes as the Python reference, and
 `verify::verify_boundary_decision` checks one decision.
 
+From 1.9.2 a relying party that does not hold the attestation checks that a
+decision was made for the attestation or subject it expects with
+`verify::verify_boundary_decision_expecting` and an `ExpectedBinding`:
+
+```rust
+use genesis_mesh_sdk::verify::{
+    verify_boundary_decision_expecting, ExpectedBinding, VerifyDecisionOptions,
+};
+use genesis_mesh_sdk::Value;
+
+fn made_for_vendor(decision: &Value, options: &VerifyDecisionOptions, attestation_id: &str) -> bool {
+    let expected = ExpectedBinding::new()
+        .attestation_id(attestation_id)
+        .subject_id("vendor-acme");
+    // Another attestation or subject: "attestation_binding_mismatch";
+    // no binding: "attestation_binding_missing".
+    verify_boundary_decision_expecting(decision, options, &expected).accepted
+}
+```
+
 ### Evidence outbox
 
 Since 1.2.0 a client can keep signed evidence in an outbox: `governed_action`
