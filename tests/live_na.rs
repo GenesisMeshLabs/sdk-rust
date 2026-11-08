@@ -48,6 +48,9 @@ struct LiveNa {
     client: GenesisMeshClient,
     options: ClientOptions,
     na_public_key: String,
+    /// 1.9.2: the NA decides under an attestation only for the key it binds,
+    /// so the tests' attestations bind the operator's public key.
+    operator_public_key: String,
     /// The NA records changes outside the controlled path (1.3.0).
     out_of_band: bool,
     /// With remediation and reviews (1.4.0): a privileged key of another
@@ -118,6 +121,7 @@ fn live_na() -> Option<LiveNa> {
         client,
         options,
         na_public_key: config["naPublicKey"].as_str().unwrap().to_owned(),
+        operator_public_key: public_key_from_seed(config["signingKeyBase64"].as_str().unwrap()).unwrap(),
         out_of_band: config["outOfBand"].as_bool().unwrap_or(false),
         reviewer,
         grants: config["grants"].as_bool().unwrap_or(false),
@@ -198,7 +202,7 @@ async fn remediate_review_and_verify_offline(na: &LiveNa) {
     let resource = format!("kv:rem-{id}/secret");
     let attestation = gm
         .attestation
-        .issue(json!({"subject_id": id, "roles": ["role:client"],
+        .issue(json!({"subject_id": id, "subject_public_key": na.operator_public_key, "roles": ["role:client"],
                       "claims": {"capabilities": [capability, emergency]}}))
         .await
         .unwrap();
@@ -507,7 +511,7 @@ async fn record_and_judge_changes_outside_the_controlled_path(na: &LiveNa) {
     let resource = format!("kv:oob-{id}/secret");
     let attestation = gm
         .attestation
-        .issue(json!({"subject_id": id, "roles": ["role:client"], "claims": {"capabilities": [capability]}}))
+        .issue(json!({"subject_id": id, "subject_public_key": na.operator_public_key, "roles": ["role:client"], "claims": {"capabilities": [capability]}}))
         .await
         .unwrap();
     let (valid_from, valid_until) = window();
@@ -692,7 +696,7 @@ async fn keep_evidence_while_the_na_is_unreachable_and_admit_it_in_order(na: &Li
     let id = Uuid::new_v4().to_string();
     let attestation = gm
         .attestation
-        .issue(json!({"subject_id": id, "roles": ["role:client"], "claims": {"capabilities": ["sdk.outbox"]}}))
+        .issue(json!({"subject_id": id, "subject_public_key": na.operator_public_key, "roles": ["role:client"], "claims": {"capabilities": ["sdk.outbox"]}}))
         .await
         .unwrap();
     let (recorder, executor_key) = executor(&id);
@@ -806,7 +810,7 @@ async fn admit_decide_record_audit_and_offboard(na: &LiveNa) {
     let attestation = gm
         .attestation
         .issue(json!({
-            "subject_id": vendor, "roles": ["role:client"],
+            "subject_id": vendor, "subject_public_key": na.operator_public_key, "roles": ["role:client"],
             "claims": {"capabilities": ["sp-secret.create", "sp-secret.rotate", "sp-secret.revoke"],
                        "apps": [format!("app-{id}")], "note": "Zoë 😀", "\u{E000}": 1, "😀": 2},
         }))
@@ -1047,7 +1051,7 @@ async fn observe_enforce_rollback_failures_conflicts_and_retired_keys(na: &LiveN
     let id = Uuid::new_v4().to_string();
     let attestation = gm
         .attestation
-        .issue(json!({"subject_id": id, "roles": ["role:client"], "claims": {"capabilities": ["sdk.run"]}}))
+        .issue(json!({"subject_id": id, "subject_public_key": na.operator_public_key, "roles": ["role:client"], "claims": {"capabilities": ["sdk.run"]}}))
         .await
         .unwrap();
     let (valid_from, valid_until) = window();
@@ -1189,7 +1193,7 @@ async fn act_within_grants_offline_and_upload_on_reconnect(na: &LiveNa) {
     let resource = format!("kv:grant-{id}/api-key");
     let attestation = gm
         .attestation
-        .issue(json!({"subject_id": id, "roles": ["role:client"],
+        .issue(json!({"subject_id": id, "subject_public_key": na.operator_public_key, "roles": ["role:client"],
                       "claims": {"capabilities": [capability]}}))
         .await
         .unwrap();
