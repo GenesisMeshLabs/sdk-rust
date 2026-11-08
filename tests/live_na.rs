@@ -121,7 +121,8 @@ fn live_na() -> Option<LiveNa> {
         client,
         options,
         na_public_key: config["naPublicKey"].as_str().unwrap().to_owned(),
-        operator_public_key: public_key_from_seed(config["signingKeyBase64"].as_str().unwrap()).unwrap(),
+        operator_public_key: public_key_from_seed(config["signingKeyBase64"].as_str().unwrap())
+            .unwrap(),
         out_of_band: config["outOfBand"].as_bool().unwrap_or(false),
         reviewer,
         grants: config["grants"].as_bool().unwrap_or(false),
