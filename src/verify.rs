@@ -153,6 +153,8 @@ validator!(
                         ("issuer_sovereign_id", absent(string())),
                         ("attestation_digest", absent(string())),
                         ("revocation_seq_checked", nonnegative()),
+                        // 1.10.0: the operator key that asked; left out when absent.
+                        ("requester_key_id", optional(string())),
                     ],
                     false
                 )))
@@ -1133,7 +1135,7 @@ pub struct DecisionVerification {
 
 /// What a decision's attestation binding must name (1.9.2), for a relying
 /// party that knows which attestation or subject it expects but does not hold
-/// the attestation. Build it with [`ExpectedBinding::new`] and its setters;
+/// the attestation, and from 1.10.0 which operator key asked for it. Build it with [`ExpectedBinding::new`] and its setters;
 /// later releases may add expectations, so it cannot be built as a literal.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1142,6 +1144,9 @@ pub struct ExpectedBinding {
     pub attestation_id: Option<String>,
     /// The subject ID the binding must name.
     pub subject_id: Option<String>,
+    /// The operator key the binding must name as the one that asked
+    /// (`requester_key_id`, 1.10.0).
+    pub requester_key_id: Option<String>,
 }
 
 impl ExpectedBinding {
@@ -1164,6 +1169,15 @@ impl ExpectedBinding {
         self.subject_id = Some(subject_id.into());
         self
     }
+
+    /// The binding must name this operator key as the one that asked
+    /// (1.10.0). A decision without `requester_key_id`, such as one of a
+    /// 1.9.x Network Authority, is then `attestation_binding_missing`.
+    #[must_use]
+    pub fn requester_key_id(mut self, requester_key_id: impl Into<String>) -> Self {
+        self.requester_key_id = Some(requester_key_id.into());
+        self
+    }
 }
 
 /// [`verify_boundary_decision`], and then the decision's signed
@@ -1172,14 +1186,21 @@ impl ExpectedBinding {
 /// `expected_subject_id`). Another attestation or subject is
 /// `attestation_binding_mismatch`, a decision without an attestation binding
 /// `attestation_binding_missing`. From 1.9.2 the Network Authority makes
-/// attestation-basis decisions only for the attestation's subject.
+/// attestation-basis decisions only for the attestation's subject. From
+/// 1.10.0 it names the operator key that asked (`requester_key_id`); another
+/// key is `attestation_binding_mismatch`, and a binding without the field is
+/// `attestation_binding_missing` only when a requester is expected.
 pub fn verify_boundary_decision_expecting(
     decision: &Value,
     options: &VerifyDecisionOptions,
     expected: &ExpectedBinding,
 ) -> DecisionVerification {
     let verdict = verify_boundary_decision(decision, options);
-    if !verdict.accepted || (expected.attestation_id.is_none() && expected.subject_id.is_none()) {
+    if !verdict.accepted
+        || (expected.attestation_id.is_none()
+            && expected.subject_id.is_none()
+            && expected.requester_key_id.is_none())
+    {
         return verdict;
     }
     let authorized = decision.get("authorized").and_then(Value::as_bool) == Some(true);
@@ -1199,8 +1220,12 @@ pub fn verify_boundary_decision_expecting(
         want.as_deref()
             .is_none_or(|want| str_field(binding, field) == Some(want))
     };
+    if expected.requester_key_id.is_some() && str_field(binding, "requester_key_id").is_none() {
+        return reject("attestation_binding_missing");
+    }
     if names("attestation_id", &expected.attestation_id)
         && names("subject_id", &expected.subject_id)
+        && names("requester_key_id", &expected.requester_key_id)
     {
         verdict
     } else {

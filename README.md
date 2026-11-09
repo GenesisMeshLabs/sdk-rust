@@ -196,6 +196,23 @@ fn made_for_vendor(decision: &Value, options: &VerifyDecisionOptions, attestatio
 }
 ```
 
+From 1.10.0 the Network Authority also names the operator key that asked for
+the decision (`requester_key_id`, signed). `ExpectedBinding::requester_key_id`
+accepts only a decision that key asked for; a decision without the field, such
+as one of a 1.9.x NA, is `attestation_binding_missing` only when it is set:
+
+```rust
+use genesis_mesh_sdk::verify::{
+    verify_boundary_decision_expecting, ExpectedBinding, VerifyDecisionOptions,
+};
+use genesis_mesh_sdk::Value;
+
+fn asked_by_vendor(decision: &Value, options: &VerifyDecisionOptions) -> bool {
+    let expected = ExpectedBinding::new().requester_key_id("vendor-acme-ops");
+    verify_boundary_decision_expecting(decision, options, &expected).accepted
+}
+```
+
 ### Evidence outbox
 
 Since 1.2.0 a client can keep signed evidence in an outbox: `governed_action`
