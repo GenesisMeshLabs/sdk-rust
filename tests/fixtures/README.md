@@ -34,3 +34,7 @@ records' signed forms, envelopes, the issuance check, the use rules and stores
 holding grants), copied unchanged. `tests/grants.rs` runs every vector but
 those of its `na_only_kinds` (the 59 issuance vectors: only the NA issues
 grants).
+
+`interop.json` (1.10.0) is the core's `interop` conformance suite, copied unchanged;
+`tests/decision_vectors.rs` runs its boundary decision vectors (`bd-001` to
+`bd-017`), the expected policy IDs among them.
