@@ -1147,6 +1147,14 @@ pub struct ExpectedBinding {
     /// The operator key the binding must name as the one that asked
     /// (`requester_key_id`, 1.10.0).
     pub requester_key_id: Option<String>,
+    /// The policies an ALLOW must rest on, by ID, at whatever version the NA
+    /// signed (1.10.0; the reference's `expected_policy_ids`). Each must be in
+    /// the decision's `policy_binding` with at least one enforce-mode gate of
+    /// that version evaluated (`policy_binding_mismatch`;
+    /// `policy_binding_missing` without a binding), so an ALLOW left when a
+    /// policy was deactivated or its selector stopped matching is refused. A
+    /// DENY is reported as it is.
+    pub policy_ids: Vec<String>,
 }
 
 impl ExpectedBinding {
@@ -1178,6 +1186,53 @@ impl ExpectedBinding {
         self.requester_key_id = Some(requester_key_id.into());
         self
     }
+
+    /// An ALLOW must rest on this policy, at any version the NA signed, with
+    /// at least one of its enforce-mode gates evaluated (1.10.0). Call it once
+    /// per policy.
+    #[must_use]
+    pub fn policy_id(mut self, policy_id: impl Into<String>) -> Self {
+        self.policy_ids.push(policy_id.into());
+        self
+    }
+}
+
+/// Whether an authorized decision rests on each of `policy_ids` (1.10.0): the
+/// reason to refuse it with, or `None`. A DENY needs none of them.
+fn policy_ids_problem(decision: &Value, policy_ids: &[String]) -> Option<&'static str> {
+    if policy_ids.is_empty() || decision.get("authorized").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let Some(binding) = decision.get("policy_binding").filter(|b| b.is_object()) else {
+        return Some("policy_binding_missing");
+    };
+    let applied = binding["policies"].as_array().cloned().unwrap_or_default();
+    let set_matches = policy_set_digest(&applied)
+        .is_ok_and(|digest| Some(digest.as_str()) == str_field(binding, "policy_set_digest"));
+    if !set_matches {
+        return Some("policy_binding_mismatch");
+    }
+    let evaluations = binding["gate_evaluations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let covered = |policy_id: &str| {
+        applied
+            .iter()
+            .find(|a| str_field(a, "policy_id") == Some(policy_id))
+            .is_some_and(|a| {
+                evaluations.iter().any(|e| {
+                    str_field(e, "policy_id") == Some(policy_id)
+                        && e.get("policy_version") == a.get("version")
+                        && str_field(e, "mode") == Some("enforce")
+                })
+            })
+    };
+    if policy_ids.iter().all(|id| covered(id)) {
+        None
+    } else {
+        Some("policy_binding_mismatch")
+    }
 }
 
 /// [`verify_boundary_decision`], and then the decision's signed
@@ -1190,17 +1245,18 @@ impl ExpectedBinding {
 /// 1.10.0 it names the operator key that asked (`requester_key_id`); another
 /// key is `attestation_binding_mismatch`, and a binding without the field is
 /// `attestation_binding_missing` only when a requester is expected.
+///
+/// With [`ExpectedBinding::policy_id`] (1.10.0) an ALLOW must also rest on
+/// each named policy, checked before the attestation fields; a governed
+/// action's callback can run this on the decision it is given before it
+/// changes anything.
 pub fn verify_boundary_decision_expecting(
     decision: &Value,
     options: &VerifyDecisionOptions,
     expected: &ExpectedBinding,
 ) -> DecisionVerification {
     let verdict = verify_boundary_decision(decision, options);
-    if !verdict.accepted
-        || (expected.attestation_id.is_none()
-            && expected.subject_id.is_none()
-            && expected.requester_key_id.is_none())
-    {
+    if !verdict.accepted {
         return verdict;
     }
     let authorized = decision.get("authorized").and_then(Value::as_bool) == Some(true);
@@ -1210,6 +1266,16 @@ pub fn verify_boundary_decision_expecting(
         authorized,
         ..verdict.clone()
     };
+    // 1.10.0: checked where the reference checks expected_policy_ids, after the policy binding.
+    if let Some(problem) = policy_ids_problem(decision, &expected.policy_ids) {
+        return reject(problem);
+    }
+    if expected.attestation_id.is_none()
+        && expected.subject_id.is_none()
+        && expected.requester_key_id.is_none()
+    {
+        return verdict;
+    }
     let Some(binding) = decision
         .get("attestation_binding")
         .filter(|b| b.is_object())
