@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.10.0 - 2026-11-10
+
+### Security
+
+- **The edge agent's SQLite is updated (RUSTSEC-2026-0459).** The edge
+  agent bundles SQLite through `rusqlite`. `rusqlite` 0.37 pulled
+  `libsqlite3-sys` 0.35, whose bundled SQLite has CVE-2026-119375. The edge
+  agent now uses `rusqlite` 0.41 with `libsqlite3-sys` 0.39.1. The SDK crate
+  itself does not use SQLite and is unaffected. The edge agent still needs
+  Rust 1.89.
+
+### Added
+
+- **Expected policy IDs (1.10.0).** `ExpectedBinding::policy_id` names a
+  policy an ALLOW must rest on, at whatever version the NA signed, for
+  `verify_boundary_decision_expecting`. Each must be in the decision's policy
+  binding with at least one enforce-mode gate of that version evaluated, so
+  an ALLOW left when a policy was deactivated or its selector stopped
+  matching is refused (`policy_binding_mismatch`; `policy_binding_missing`
+  without a binding). A DENY is reported as it is. A governed action's
+  callback can run the check on the decision it is given before it changes
+  anything; `GovernedVerification` is unchanged. A 1.10.0 Network Authority
+  can also deny such requests itself (`BOUNDARY_POLICY_COVERAGE=required`);
+  the denial arrives as `unauthorized_policy_resolution_failed`.
+- **The shared decision vectors run here too.** `tests/fixtures/interop.json`
+  is the core's `interop` suite, and `tests/decision_vectors.rs` checks every
+  boundary decision vector (`bd-001` to `bd-017`) against the reference's
+  answer.
+- **The operator key that asked is checked offline (1.10.0).** A Network
+  Authority 1.10.0 names the key that asked for an attestation-basis decision
+  in `attestation_binding.requester_key_id`, under the decision's signature.
+  `ExpectedBinding::requester_key_id` makes
+  `verify_boundary_decision_expecting` accept only a decision that key asked
+  for: another key is `attestation_binding_mismatch`, and a decision without
+  the field (a 1.9.x NA) is `attestation_binding_missing` only when it is set.
+  The decision shape and the canonical registry read the field, omitted when
+  absent.
+
+### Upgrading
+
+- **Upgrade this crate before, or with, a 1.10.0 Network Authority.** Earlier
+  releases refuse a decision that names its requester as `unknown_field`.
+
 ## 1.9.2 - 2026-11-08
 
 ### Added
