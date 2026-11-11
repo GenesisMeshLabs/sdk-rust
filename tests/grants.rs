@@ -3,6 +3,8 @@
 //! (genesismesh/conformance/grants_vectors.py) and copied unchanged, and this
 //! crate's grant records and checks.
 
+mod receipts;
+
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
@@ -149,6 +151,11 @@ fn every_vector_gives_the_reference_outcome() {
     // engine): an SDK skips them.
     let na_only = &suite["na_only_kinds"];
     assert_eq!(*na_only, json!(["issuance"]));
+    let mut receipt = receipts::Receipt::start(
+        "grants",
+        file!(),
+        "every_vector_gives_the_reference_outcome",
+    );
     let (mut ran, mut skipped) = (0, 0);
     for v in vectors {
         if na_only.as_array().unwrap().contains(&v["kind"]) {
@@ -156,9 +163,11 @@ fn every_vector_gives_the_reference_outcome() {
             continue;
         }
         assert_eq!(evaluate(v), v["expected"], "{}", v["id"]);
+        receipt.ran(v);
         ran += 1;
     }
     assert_eq!((ran, skipped), (99, 59));
+    receipt.finish(&suite);
 }
 
 fn vector(id: &str) -> Value {

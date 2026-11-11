@@ -3,6 +3,8 @@
 //! unchanged: input every implementation reads alike or refuses by reason, and
 //! the canonical form of records.
 
+mod receipts;
+
 use chrono::{DateTime, Utc};
 use genesis_mesh_sdk::{
     canonical_json, parse_strict_json,
@@ -30,6 +32,11 @@ fn every_vector_gives_the_reference_outcome() {
     let suite = suite();
     let vectors = suite["vectors"].as_array().unwrap();
     assert!(vectors.len() >= 70);
+    let mut receipt = receipts::Receipt::start(
+        "canonical",
+        file!(),
+        "every_vector_gives_the_reference_outcome",
+    );
     for v in vectors {
         let input = &v["input"];
         let got = match v["kind"].as_str().unwrap() {
@@ -54,7 +61,9 @@ fn every_vector_gives_the_reference_outcome() {
             other => panic!("unknown vector kind {other}"),
         };
         assert_eq!(got, v["expected"], "{}", v["id"]);
+        receipt.ran(v);
     }
+    receipt.finish(&suite);
 }
 
 #[test]

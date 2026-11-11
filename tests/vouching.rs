@@ -5,6 +5,8 @@
 //! then the horizon helpers, `verify_record` judged now and the grant holder
 //! given the NA's key history.
 
+mod receipts;
+
 use genesis_mesh_sdk::{
     canonical::parse_timestamp,
     json,
@@ -58,6 +60,11 @@ fn every_vouching_vector_matches_the_reference() {
     assert_eq!(suite["suite"], "vouching");
     let vectors = suite["vectors"].as_array().unwrap();
     assert!(vectors.len() >= 32);
+    let mut receipt = receipts::Receipt::start(
+        "vouching",
+        file!(),
+        "every_vouching_vector_matches_the_reference",
+    );
     for v in vectors {
         assert_eq!(v["kind"], "record_vouching", "{}", v["id"]);
         let input = &v["input"];
@@ -70,7 +77,9 @@ fn every_vouching_vector_matches_the_reference() {
             "now": na_record_refusal(model, record, &h, now, g).unwrap(),
         });
         assert_eq!(got, v["expected"], "{}: {}", v["id"], v["description"]);
+        receipt.ran(v);
     }
+    receipt.finish(&suite);
 }
 
 #[test]

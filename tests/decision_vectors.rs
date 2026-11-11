@@ -3,6 +3,8 @@
 //! decision, verified with the expectations the vector gives, must be accepted
 //! or refused for the reason the Python reference gives (1.10.0).
 
+mod receipts;
+
 use chrono::{DateTime, Utc};
 use genesis_mesh_sdk::verify::{
     verify_boundary_decision_expecting, ExpectedBinding, VerifyDecisionOptions,
@@ -65,6 +67,11 @@ fn verify(vector: &Value) -> (bool, String, bool) {
 fn every_decision_vector_gets_the_references_answer() {
     let vectors = decision_vectors();
     assert!(vectors.len() >= 17, "the suite has its decision vectors");
+    let mut receipt = receipts::Receipt::start(
+        "interop",
+        file!(),
+        "every_decision_vector_gets_the_references_answer",
+    );
     for vector in &vectors {
         let want = &vector["expected"];
         let want = (
@@ -79,7 +86,9 @@ fn every_decision_vector_gets_the_references_answer() {
             vector["id"],
             vector["description"]
         );
+        receipt.ran(vector);
     }
+    receipt.finish(&serde_json::from_str(include_str!("fixtures/interop.json")).unwrap());
 }
 
 #[test]
