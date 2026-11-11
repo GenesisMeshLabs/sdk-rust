@@ -2,6 +2,8 @@
 //! edge join co-signature, join certificates and CRLs. Ed25519 is
 //! deterministic, so every payload and signature is reproduced exactly.
 
+mod receipts;
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::SigningKey;
 use genesis_mesh_sdk::{
@@ -46,6 +48,7 @@ fn text<'a>(value: &'a Value, field: &str) -> &'a str {
 
 #[test]
 fn reproduces_every_node_vector() {
+    let mut receipt = receipts::Receipt::start("node", file!(), "reproduces_every_node_vector");
     let mut seen = std::collections::BTreeSet::new();
     for case in vectors() {
         let id = text(&case, "id");
@@ -166,6 +169,7 @@ fn reproduces_every_node_vector() {
             }
             other => panic!("{id}: unknown kind {other}"),
         }
+        receipt.ran(&case);
         seen.insert(id.to_owned());
     }
     for id in [
@@ -174,6 +178,7 @@ fn reproduces_every_node_vector() {
     ] {
         assert!(seen.contains(id), "{id} is missing from node.json");
     }
+    receipt.finish(&serde_json::from_str(include_str!("fixtures/node.json")).unwrap());
 }
 
 #[test]

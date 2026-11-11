@@ -3,6 +3,8 @@
 //! copied unchanged: the field registry of signed records and the fields
 //! every verifier refuses.
 
+mod receipts;
+
 use chrono::{DateTime, Utc};
 use genesis_mesh_sdk::canonical::{
     CHECKPOINT_OMITTED_WHEN_ABSENT, DECISION_OMITTED_WHEN_ABSENT, ENVELOPE_OMITTED_WHEN_ABSENT,
@@ -77,6 +79,11 @@ fn every_vector_gives_the_reference_outcome() {
     let suite = suite();
     let vectors = suite["vectors"].as_array().unwrap();
     assert!(vectors.len() >= 70);
+    let mut receipt = receipts::Receipt::start(
+        "field_registry",
+        file!(),
+        "every_vector_gives_the_reference_outcome",
+    );
     for v in vectors {
         let input = &v["input"];
         let got = match v["kind"].as_str().unwrap() {
@@ -116,7 +123,9 @@ fn every_vector_gives_the_reference_outcome() {
             other => panic!("unknown vector kind {other}"),
         };
         assert_eq!(got, v["expected"], "{}", v["id"]);
+        receipt.ran(v);
     }
+    receipt.finish(&suite);
 }
 
 #[test]

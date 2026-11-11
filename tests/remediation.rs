@@ -3,6 +3,8 @@
 //! (genesismesh/conformance/generate_vectors.py) and copied unchanged, and the
 //! remediation records this crate signs.
 
+mod receipts;
+
 use std::collections::BTreeSet;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -233,6 +235,11 @@ fn every_vector_gives_the_reference_outcome() {
     let suite = suite();
     assert_eq!(suite["suite"], "remediation");
     let vectors = suite["vectors"].as_array().unwrap();
+    let mut receipt = receipts::Receipt::start(
+        "remediation",
+        file!(),
+        "every_vector_gives_the_reference_outcome",
+    );
     let mut failed = Vec::new();
     for v in vectors {
         let got = run(v);
@@ -241,10 +248,13 @@ fn every_vector_gives_the_reference_outcome() {
                 "{}: expected {}, got {got}",
                 v["id"], v["expected"]
             ));
+        } else {
+            receipt.ran(v);
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
     assert_eq!(vectors.len(), 340);
+    receipt.finish(&suite);
 }
 
 fn vector(id: &str) -> Value {

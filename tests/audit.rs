@@ -3,6 +3,8 @@
 //! reference (genesismesh/conformance/generate_vectors.py) and copied
 //! unchanged, run as the reference's `audit_vectors.evaluate` runs it.
 
+mod receipts;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::Digest;
@@ -276,6 +278,8 @@ fn every_vector_gives_the_reference_outcome() {
     let suite = suite();
     assert_eq!(suite["suite"], "audit");
     let vectors = suite["vectors"].as_array().unwrap();
+    let mut receipt =
+        receipts::Receipt::start("audit", file!(), "every_vector_gives_the_reference_outcome");
     let mut failed = Vec::new();
     for v in vectors {
         let got = evaluate(v);
@@ -284,9 +288,12 @@ fn every_vector_gives_the_reference_outcome() {
                 "{}:\n  expected {}\n  got      {got}",
                 v["id"], v["expected"]
             ));
+        } else {
+            receipt.ran(v);
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
     // 1.6.0: three record-time vectors (a grant, a revocation, a time token).
     assert_eq!(vectors.len(), 108);
+    receipt.finish(&suite);
 }

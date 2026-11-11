@@ -3,6 +3,8 @@
 //! (genesismesh/conformance/generate_vectors.py) and copied unchanged, and
 //! the records this crate signs.
 
+mod receipts;
+
 use std::collections::BTreeSet;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -45,6 +47,11 @@ const COUNTS: [&str; 4] = ["observations", "break_glass", "judgements", "quarant
 fn every_vector_gives_the_reference_outcome() {
     let suite = suite();
     assert_eq!(suite["suite"], "out_of_band");
+    let mut receipt = receipts::Receipt::start(
+        "out_of_band",
+        file!(),
+        "every_vector_gives_the_reference_outcome",
+    );
     let mut ran = 0;
     for v in suite["vectors"].as_array().unwrap() {
         let got = match v["kind"].as_str().unwrap() {
@@ -100,9 +107,11 @@ fn every_vector_gives_the_reference_outcome() {
             other => panic!("unknown vector kind {other}"),
         };
         assert_eq!(got, v["expected"], "{}", v["id"]);
+        receipt.ran(v);
         ran += 1;
     }
     assert_eq!(ran, 68);
+    receipt.finish(&suite);
 }
 
 #[test]

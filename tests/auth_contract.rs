@@ -1,3 +1,5 @@
+mod receipts;
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signature, Signer};
 use genesis_mesh_sdk::{
@@ -123,6 +125,11 @@ fn seed_loading_accepts_padding_and_rejects_invalid_input() {
 #[test]
 fn matches_admin_signature_conformance_vectors() {
     let suite: Value = serde_json::from_str(include_str!("fixtures/admin_auth.json")).unwrap();
+    let mut receipt = receipts::Receipt::start(
+        "admin_auth",
+        file!(),
+        "matches_admin_signature_conformance_vectors",
+    );
     let key =
         load_signing_key(&STANDARD.encode(std::array::from_fn::<_, 32, _>(|i| i as u8))).unwrap();
     for vector in suite["vectors"].as_array().unwrap() {
@@ -157,5 +164,7 @@ fn matches_admin_signature_conformance_vectors() {
             "{}",
             vector["id"]
         );
+        receipt.ran(vector);
     }
+    receipt.finish(&suite);
 }
